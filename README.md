@@ -17,9 +17,20 @@ index.add(more_vectors)
 
 scores, indices = index.search(query, k=10)
 
-index.save("my_index.tq")
-loaded = TurboQuantIndex.from_bin("my_index.tq")
+index.write("my_index.tq")
+loaded = TurboQuantIndex.load("my_index.tq")
 ```
+
+### Memory control
+
+The `chunk_size` parameter controls peak memory during search. Larger chunks are faster (BLAS gets bigger matrices) but use more RAM. The default is 256.
+
+```python
+index = TurboQuantIndex(dim=1536, bit_width=2, chunk_size=512)  # faster, ~200 MB peak
+index = TurboQuantIndex(dim=1536, bit_width=2, chunk_size=128)  # slower, ~50 MB peak
+```
+
+Peak memory per chunk ≈ `n_vectors × chunk_size × 5 bytes` (1 byte codes + 4 bytes float32). The index itself stores only the bit-packed codes and norms.
 
 ## How it works
 

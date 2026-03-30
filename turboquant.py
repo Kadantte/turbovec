@@ -179,7 +179,7 @@ class TurboQuantIndex:
         top_scores = np.take_along_axis(top_scores, order, axis=-1)
         return top_scores, top_idx
 
-    def save(self, path):
+    def write(self, path):
         header = struct.pack(HEADER_FORMAT, self.bit_width, self.dim, self.n_vectors)
         with open(path, "wb") as f:
             f.write(header)
@@ -187,7 +187,7 @@ class TurboQuantIndex:
             f.write(self.norms.tobytes())
 
     @classmethod
-    def from_bin(cls, path):
+    def load(cls, path):
         with open(path, "rb") as f:
             header = struct.unpack(HEADER_FORMAT, f.read(HEADER_SIZE))
             bit_width, dim, n_vectors = header
