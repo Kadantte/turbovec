@@ -4,3 +4,4 @@ __pycache__/
 *.tq
 *.npy
 codebooks.npz
+target/

@@ -105,6 +105,32 @@ Reproducing Section 4.4 of the paper. recall@1@k = probability that the true nea
 | 2-bit     | 73.6 MB    | 15.9x               | 3.1ms/query    | 11.2ms/vec |
 | 4-bit     | 146.9 MB   | 8.0x                | 3.8ms/query    | 16.7ms/vec |
 
+## FAISS comparison
+
+TurboQuant vs FAISS IndexPQFastScan on OpenAI DBpedia d=1536 (100K vectors, 1K queries). Benchmarked on Apple M3 Max. FAISS uses trained Product Quantization; TurboQuant is data-oblivious (zero training time).
+
+The Rust NEON extension (`py_turboquant`) provides SIMD-accelerated search for 2-bit, 3-bit, and 4-bit. FAISS entries are sized to match TurboQuant for direct comparison.
+
+```
+Method                  Disk     1-thread     Multi-thread   recall@1  recall@10
+==================================================================================
+FAISS FS m=768        36.7MB     1.240ms/q     0.118ms/q      0.882      1.000
+TQ 2-bit              36.6MB     0.981ms/q     0.115ms/q      0.863      1.000
+
+TQ 3-bit              54.9MB     2.016ms/q     0.239ms/q      0.918      1.000
+
+FAISS FS m=1536       73.3MB     2.466ms/q     0.236ms/q      0.956      1.000
+TQ 4-bit              73.2MB     2.002ms/q     0.236ms/q      0.964      1.000
+```
+
+Building the Rust extension:
+```bash
+pip install maturin
+cd py-turboquant
+RUSTFLAGS="-C target-cpu=native" maturin build --release
+pip install target/wheels/*.whl
+```
+
 ## Running benchmarks
 
 Download datasets:
