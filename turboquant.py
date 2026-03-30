@@ -5,7 +5,8 @@ py-turboquant — TurboQuant_mse vector search (arXiv:2504.19874)
 import struct
 
 import numpy as np
-from scipy.stats import norm
+from scipy.integrate import quad
+from scipy.stats import beta as beta_dist
 
 from cache import disk_cache
 
@@ -19,35 +20,41 @@ HEADER_SIZE = struct.calcsize(HEADER_FORMAT)
 # =============================================================================
 
 
-class Codebook:
-    def __init__(self, bits, max_iter=200, tol=1e-12):
-        self.bits = bits
-        n_levels = 1 << bits
-        centroids = np.linspace(-3, 3, n_levels)
+def _make_beta(dim):
+    """Beta((d-1)/2, (d-1)/2) on [-1, 1] — the exact coordinate distribution
+    of a uniformly random point on S^{d-1} after orthogonal rotation."""
+    a = (dim - 1) / 2.0
+    return beta_dist(a, a, loc=-1, scale=2)
 
-        for _ in range(max_iter):
-            boundaries = (centroids[:-1] + centroids[1:]) / 2.0
-            edges = np.concatenate([[-np.inf], boundaries, [np.inf]])
-            new_centroids = np.zeros(n_levels)
 
-            for i in range(n_levels):
-                lo, hi = edges[i], edges[i + 1]
-                prob = norm.cdf(hi) - norm.cdf(lo)
-                if prob < 1e-15:
-                    new_centroids[i] = centroids[i]
-                else:
-                    new_centroids[i] = (norm.pdf(lo) - norm.pdf(hi)) / prob
+@disk_cache
+def make_codebook(bits, dim, max_iter=200, tol=1e-12):
+    rv = _make_beta(dim)
+    n_levels = 1 << bits
+    # Initialize centroids within ±3 std devs of the distribution
+    spread = 3.0 * rv.std()
+    centroids = np.linspace(-spread, spread, n_levels)
 
-            if np.max(np.abs(new_centroids - centroids)) < tol:
-                break
-            centroids = new_centroids
+    for _ in range(max_iter):
+        boundaries = (centroids[:-1] + centroids[1:]) / 2.0
+        edges = np.concatenate([[-1.0], boundaries, [1.0]])
+        new_centroids = np.zeros(n_levels)
 
-        self.boundaries = (centroids[:-1] + centroids[1:]) / 2.0
-        self.centroids = centroids
+        for i in range(n_levels):
+            lo, hi = edges[i], edges[i + 1]
+            prob = rv.cdf(hi) - rv.cdf(lo)
+            if prob < 1e-15:
+                new_centroids[i] = centroids[i]
+            else:
+                mean, _ = quad(lambda x: x * rv.pdf(x), lo, hi)
+                new_centroids[i] = mean / prob
 
-    def scaled(self, dim):
-        scale = 1.0 / np.sqrt(dim)
-        return self.boundaries * scale, self.centroids * scale
+        if np.max(np.abs(new_centroids - centroids)) < tol:
+            break
+        centroids = new_centroids
+
+    boundaries = (centroids[:-1] + centroids[1:]) / 2.0
+    return boundaries, centroids
 
 
 # =============================================================================
@@ -101,9 +108,9 @@ class TurboQuantIndex:
         self.dim = dim
         self.bit_width = bit_width
         self.n_vectors = n_vectors
-        self.codebook = Codebook(bit_width)
-        self._packed_codes = packed_codes
-        self._norms = norms
+        self.packed_codes = packed_codes
+        self.norms = norms
+        self.codes = None  # lazily unpacked, invalidated on add_vectors
 
     def _encode(self, vectors):
         vectors = np.asarray(vectors, dtype=np.float32)
@@ -117,7 +124,7 @@ class TurboQuantIndex:
         rotated = unit_vectors @ Q.T
 
         # 3. Quantize each coordinate to a small integer bucket
-        boundaries, _ = self.codebook.scaled(self.dim)
+        boundaries, _ = make_codebook(self.bit_width, self.dim)
         codes = np.searchsorted(boundaries, rotated).astype(np.uint8)
 
         # 4. Bit-pack the bucket indices for storage
@@ -140,25 +147,39 @@ class TurboQuantIndex:
         packed, norms = self._encode(vectors)
 
         if self.n_vectors == 0:
-            self._packed_codes = packed
-            self._norms = norms
+            self.packed_codes = packed
+            self.norms = norms
         else:
-            self._packed_codes = np.concatenate([self._packed_codes, packed], axis=0)
-            self._norms = np.concatenate([self._norms, norms])
+            self.packed_codes = np.concatenate([self.packed_codes, packed], axis=0)
+            self.norms = np.concatenate([self.norms, norms])
 
         self.n_vectors += len(vectors)
+        self.codes = None
 
     def search(self, queries, k=10):
         queries = np.asarray(queries, dtype=np.float32)
-        _, centroids = self.codebook.scaled(self.dim)
-        codes = unpack_codes(self._packed_codes, self.bit_width, self.dim)
+        _, centroids = make_codebook(self.bit_width, self.dim)
+        centroids = np.asarray(centroids, dtype=np.float32)
+
+        if self.codes is None:
+            self.codes = unpack_codes(self.packed_codes, self.bit_width, self.dim)
+        codes = self.codes
 
         Q = make_rotation_matrix(self.dim)
         q_rot = queries @ Q.T
 
-        centroid_vals = centroids[codes]
-        scores = q_rot @ centroid_vals.T
-        scores *= self._norms[None, :]
+        # LUT-based scoring: chunk along d to avoid materializing
+        # the full (n_vectors, dim) float array of centroid values.
+        # Each chunk expands only a slice of codes to floats, then
+        # accumulates via BLAS matmul.
+        scores = np.zeros((len(queries), self.n_vectors), dtype=np.float32)
+        CHUNK = 256
+        for j0 in range(0, self.dim, CHUNK):
+            j1 = min(j0 + CHUNK, self.dim)
+            chunk_vals = centroids[codes[:, j0:j1]]
+            scores += q_rot[:, j0:j1] @ chunk_vals.T
+
+        scores *= self.norms[None, :]
 
         k = min(k, self.n_vectors)
         top_idx = np.argpartition(-scores, k, axis=-1)[:, :k]
@@ -172,8 +193,8 @@ class TurboQuantIndex:
         header = struct.pack(HEADER_FORMAT, self.bit_width, self.dim, self.n_vectors)
         with open(path, "wb") as f:
             f.write(header)
-            f.write(self._packed_codes.tobytes())
-            f.write(self._norms.tobytes())
+            f.write(self.packed_codes.tobytes())
+            f.write(self.norms.tobytes())
 
     @classmethod
     def from_bin(cls, path):
