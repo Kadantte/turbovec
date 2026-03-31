@@ -992,10 +992,9 @@ mod py_turboquant {
         let k = k.min(n_vectors);
         let n_byte_groups = dim / (8 / bits);
 
-        // Rotation: q_rot = queries @ rotation.T
+        // Rotation: q_rot = queries @ rotation.T, then parallel LUT build
         let q_rot = queries.dot(&rotation.t());
 
-        // Prebuild LUTs
         let query_luts: Vec<QueryNeonLut> = (0..nq)
             .into_par_iter()
             .map(|qi| build_query_neon_lut(q_rot.view(), qi, centroids, bits, dim))
