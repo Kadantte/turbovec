@@ -10,7 +10,7 @@ from scipy.stats import beta as beta_dist
 
 from cache import disk_cache
 
-from py_turboquant import repack as _rust_repack, score as _rust_score
+from py_turboquant import repack as _rust_repack, score as _rust_score, score_topk as _rust_score_topk
 
 ROTATION_SEED = 42
 HEADER_FORMAT = "<BII"  # bit_width(u8), dim(u32), n_vectors(u32) = 9 bytes
@@ -171,19 +171,10 @@ class TurboQuantIndex:
             self._blocked, self._n_blocks = _rust_repack(
                 self.packed_codes, self.bit_width, self.dim)
 
-        # Scoring in Rust
-        scores = _rust_score(q_rot, self._blocked, centroids, self.norms,
-                             self.bit_width, self.dim, self.n_vectors,
-                             self._n_blocks)
-
-        # Top-k in NumPy
-        k = min(k, self.n_vectors)
-        top_idx = np.argpartition(-scores, k, axis=-1)[:, :k]
-        top_scores = np.take_along_axis(scores, top_idx, axis=-1)
-        order = np.argsort(-top_scores, axis=-1)
-        top_idx = np.take_along_axis(top_idx, order, axis=-1)
-        top_scores = np.take_along_axis(top_scores, order, axis=-1)
-        return top_scores, top_idx
+        # Fused scoring + heap top-k in Rust (no 381MB scores matrix)
+        return _rust_score_topk(q_rot, self._blocked, centroids, self.norms,
+                                self.bit_width, self.dim, self.n_vectors,
+                                self._n_blocks, k)
 
     def write(self, path):
         header = struct.pack(HEADER_FORMAT, self.bit_width, self.dim, self.n_vectors)

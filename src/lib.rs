@@ -800,4 +800,131 @@ mod py_turboquant {
 
         result.into_pyarray(py)
     }
+
+    /// Fused scoring + heap top-k. No full scores matrix allocated.
+    #[pyfunction]
+    fn score_topk<'py>(
+        py: Python<'py>,
+        q_rot: PyReadonlyArray2<f32>,
+        blocked_codes: PyReadonlyArray1<u8>,
+        centroids: PyReadonlyArray1<f32>,
+        norms: PyReadonlyArray1<f32>,
+        bits: usize,
+        dim: usize,
+        n_vectors: usize,
+        n_blocks: usize,
+        k: usize,
+    ) -> (Bound<'py, PyArray2<f32>>, Bound<'py, PyArray2<i64>>) {
+        let q_rot = q_rot.as_array();
+        let blocked_codes = blocked_codes.as_array();
+        let centroids = centroids.as_array();
+        let norms = norms.as_array();
+        let codes_slice = blocked_codes.as_slice().unwrap();
+        let norms_slice = norms.as_slice().unwrap();
+        let nq = q_rot.nrows();
+        let k = k.min(n_vectors);
+        let codes_per_byte = 8 / bits;
+        let n_byte_groups = dim / codes_per_byte;
+
+        // Per-query: score all blocks, maintain a k-element min-heap.
+        // Never allocates the full (nq, n_vectors) scores matrix.
+        let results: Vec<(Vec<f32>, Vec<i64>)> = (0..nq)
+            .into_par_iter()
+            .map(|qi| {
+                let qlut = build_query_neon_lut(q_rot, qi, centroids, bits, dim);
+
+                // Min-heap: track worst score in top-k for fast rejection
+                let mut heap_scores = vec![f32::NEG_INFINITY; k];
+                let mut heap_indices = vec![0u32; k];
+                let mut heap_size = 0usize;
+                let mut heap_min = f32::NEG_INFINITY;
+                let mut heap_min_idx = 0usize;
+
+                // Per-query row buffer for NEON function output
+                let mut row = vec![0.0f32; n_vectors];
+
+                for block_idx in 0..n_blocks {
+                    let base_vec = block_idx * BLOCK;
+                    let block_offset = block_idx * n_byte_groups * BLOCK;
+
+                    #[cfg(target_arch = "aarch64")]
+                    unsafe {
+                        score_4bit_block_neon(
+                            codes_slice,
+                            &qlut.uint8_luts,
+                            block_offset,
+                            n_byte_groups,
+                            qlut.scale,
+                            qlut.bias,
+                            norms_slice,
+                            base_vec,
+                            n_vectors,
+                            &mut row,
+                        );
+                    }
+
+                    // Insert block scores into heap
+                    let end = (base_vec + BLOCK).min(n_vectors);
+                    for lane in 0..(end - base_vec) {
+                        let score = row[base_vec + lane];
+                        if heap_size < k {
+                            // Fill heap
+                            heap_scores[heap_size] = score;
+                            heap_indices[heap_size] = (base_vec + lane) as u32;
+                            heap_size += 1;
+                            if heap_size == k {
+                                // Find min
+                                heap_min = heap_scores[0];
+                                heap_min_idx = 0;
+                                for h in 1..k {
+                                    if heap_scores[h] < heap_min {
+                                        heap_min = heap_scores[h];
+                                        heap_min_idx = h;
+                                    }
+                                }
+                            }
+                        } else if score > heap_min {
+                            // Replace min
+                            heap_scores[heap_min_idx] = score;
+                            heap_indices[heap_min_idx] = (base_vec + lane) as u32;
+                            // Recompute min
+                            heap_min = heap_scores[0];
+                            heap_min_idx = 0;
+                            for h in 1..k {
+                                if heap_scores[h] < heap_min {
+                                    heap_min = heap_scores[h];
+                                    heap_min_idx = h;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Sort by descending score
+                let mut pairs: Vec<(f32, u32)> = heap_scores[..heap_size]
+                    .iter()
+                    .zip(heap_indices[..heap_size].iter())
+                    .map(|(&s, &i)| (s, i))
+                    .collect();
+                pairs.sort_unstable_by(|a, b| {
+                    b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal)
+                });
+
+                let s: Vec<f32> = pairs.iter().map(|p| p.0).collect();
+                let i: Vec<i64> = pairs.iter().map(|p| p.1 as i64).collect();
+                (s, i)
+            })
+            .collect();
+
+        let mut top_scores = Array2::<f32>::zeros((nq, k));
+        let mut top_indices = Array2::<i64>::zeros((nq, k));
+        for (qi, (s, i)) in results.into_iter().enumerate() {
+            for j in 0..s.len().min(k) {
+                top_scores[[qi, j]] = s[j];
+                top_indices[[qi, j]] = i[j];
+            }
+        }
+
+        (top_scores.into_pyarray(py), top_indices.into_pyarray(py))
+    }
 }
