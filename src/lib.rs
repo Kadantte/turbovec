@@ -82,6 +82,7 @@ fn repack_inner(
 // 4-bit NEON scoring with periodic uint16→float flushing
 // =============================================================================
 
+// EVOLVE-BLOCK-START
 #[cfg(target_arch = "aarch64")]
 unsafe fn score_4bit_block_neon(
     blocked_codes: &[u8],
@@ -100,10 +101,7 @@ unsafe fn score_4bit_block_neon(
     let mask = vdupq_n_u8(0x0F);
     let v_scale = vdupq_n_f32(scale);
     let n_batches = (n_byte_groups + FLUSH_EVERY - 1) / FLUSH_EVERY;
-
-    // Float accumulators in NEON registers (8 × float32x4 = 32 floats)
     let mut fa = [vdupq_n_f32(0.0); 8];
-
     let codes_base = blocked_codes.as_ptr().add(block_offset);
     let luts_base = uint8_luts.as_ptr();
 
@@ -111,137 +109,43 @@ unsafe fn score_4bit_block_neon(
         let g_start = batch * FLUSH_EVERY;
         let g_end = (g_start + FLUSH_EVERY).min(n_byte_groups);
         let n_groups = g_end - g_start;
-
         let mut accum = [vdupq_n_u16(0); 4];
 
-        // 4-group unrolled inner loop. Interleaves loads from groups g..g+3
-        // with compute, letting the CPU pipeline memory accesses.
-        let mut g = g_start;
-        while g + 3 < g_end {
-            // Load all 4 groups' LUTs and codes
-            let lp0 = luts_base.add(g * 32);
-            let lp1 = luts_base.add((g + 1) * 32);
-            let lp2 = luts_base.add((g + 2) * 32);
-            let lp3 = luts_base.add((g + 3) * 32);
-
-            let lut_hi_0 = vld1q_u8(lp0);
-            let lut_lo_0 = vld1q_u8(lp0.add(16));
-            let lut_hi_1 = vld1q_u8(lp1);
-            let lut_lo_1 = vld1q_u8(lp1.add(16));
-            let lut_hi_2 = vld1q_u8(lp2);
-            let lut_lo_2 = vld1q_u8(lp2.add(16));
-            let lut_hi_3 = vld1q_u8(lp3);
-            let lut_lo_3 = vld1q_u8(lp3.add(16));
-
-            let cp0 = codes_base.add(g * BLOCK);
-            let cp1 = codes_base.add((g + 1) * BLOCK);
-            let cp2 = codes_base.add((g + 2) * BLOCK);
-            let cp3 = codes_base.add((g + 3) * BLOCK);
-
-            // Group 0
-            let c0 = vld1q_u8(cp0);
-            let c1 = vld1q_u8(cp0.add(16));
-            let s0 = vaddq_u8(vqtbl1q_u8(lut_lo_0, vandq_u8(c0, mask)),
-                              vqtbl1q_u8(lut_hi_0, vshrq_n_u8(c0, 4)));
-            let s1 = vaddq_u8(vqtbl1q_u8(lut_lo_0, vandq_u8(c1, mask)),
-                              vqtbl1q_u8(lut_hi_0, vshrq_n_u8(c1, 4)));
-            accum[0] = vaddw_u8(accum[0], vget_low_u8(s0));
-            accum[1] = vaddw_u8(accum[1], vget_high_u8(s0));
-            accum[2] = vaddw_u8(accum[2], vget_low_u8(s1));
-            accum[3] = vaddw_u8(accum[3], vget_high_u8(s1));
-
-            // Group 1
-            let c0 = vld1q_u8(cp1);
-            let c1 = vld1q_u8(cp1.add(16));
-            let s0 = vaddq_u8(vqtbl1q_u8(lut_lo_1, vandq_u8(c0, mask)),
-                              vqtbl1q_u8(lut_hi_1, vshrq_n_u8(c0, 4)));
-            let s1 = vaddq_u8(vqtbl1q_u8(lut_lo_1, vandq_u8(c1, mask)),
-                              vqtbl1q_u8(lut_hi_1, vshrq_n_u8(c1, 4)));
-            accum[0] = vaddw_u8(accum[0], vget_low_u8(s0));
-            accum[1] = vaddw_u8(accum[1], vget_high_u8(s0));
-            accum[2] = vaddw_u8(accum[2], vget_low_u8(s1));
-            accum[3] = vaddw_u8(accum[3], vget_high_u8(s1));
-
-            // Group 2
-            let c0 = vld1q_u8(cp2);
-            let c1 = vld1q_u8(cp2.add(16));
-            let s0 = vaddq_u8(vqtbl1q_u8(lut_lo_2, vandq_u8(c0, mask)),
-                              vqtbl1q_u8(lut_hi_2, vshrq_n_u8(c0, 4)));
-            let s1 = vaddq_u8(vqtbl1q_u8(lut_lo_2, vandq_u8(c1, mask)),
-                              vqtbl1q_u8(lut_hi_2, vshrq_n_u8(c1, 4)));
-            accum[0] = vaddw_u8(accum[0], vget_low_u8(s0));
-            accum[1] = vaddw_u8(accum[1], vget_high_u8(s0));
-            accum[2] = vaddw_u8(accum[2], vget_low_u8(s1));
-            accum[3] = vaddw_u8(accum[3], vget_high_u8(s1));
-
-            // Group 3
-            let c0 = vld1q_u8(cp3);
-            let c1 = vld1q_u8(cp3.add(16));
-            let s0 = vaddq_u8(vqtbl1q_u8(lut_lo_3, vandq_u8(c0, mask)),
-                              vqtbl1q_u8(lut_hi_3, vshrq_n_u8(c0, 4)));
-            let s1 = vaddq_u8(vqtbl1q_u8(lut_lo_3, vandq_u8(c1, mask)),
-                              vqtbl1q_u8(lut_hi_3, vshrq_n_u8(c1, 4)));
-            accum[0] = vaddw_u8(accum[0], vget_low_u8(s0));
-            accum[1] = vaddw_u8(accum[1], vget_high_u8(s0));
-            accum[2] = vaddw_u8(accum[2], vget_low_u8(s1));
-            accum[3] = vaddw_u8(accum[3], vget_high_u8(s1));
-
-            g += 4;
-        }
-
-        // Handle remaining groups (0-3)
-        while g < g_end {
+        for g in g_start..g_end {
             let lp = luts_base.add(g * 32);
+            let cp = codes_base.add(g * BLOCK);
             let lut_hi = vld1q_u8(lp);
             let lut_lo = vld1q_u8(lp.add(16));
-            let cp = codes_base.add(g * BLOCK);
+
             let c0 = vld1q_u8(cp);
             let c1 = vld1q_u8(cp.add(16));
-            let s0 = vaddq_u8(vqtbl1q_u8(lut_lo, vandq_u8(c0, mask)),
-                              vqtbl1q_u8(lut_hi, vshrq_n_u8(c0, 4)));
-            let s1 = vaddq_u8(vqtbl1q_u8(lut_lo, vandq_u8(c1, mask)),
-                              vqtbl1q_u8(lut_hi, vshrq_n_u8(c1, 4)));
+            let s0 = vaddq_u8(vqtbl1q_u8(lut_lo, vandq_u8(c0, mask)), vqtbl1q_u8(lut_hi, vshrq_n_u8(c0, 4)));
+            let s1 = vaddq_u8(vqtbl1q_u8(lut_lo, vandq_u8(c1, mask)), vqtbl1q_u8(lut_hi, vshrq_n_u8(c1, 4)));
+
             accum[0] = vaddw_u8(accum[0], vget_low_u8(s0));
             accum[1] = vaddw_u8(accum[1], vget_high_u8(s0));
             accum[2] = vaddw_u8(accum[2], vget_low_u8(s1));
             accum[3] = vaddw_u8(accum[3], vget_high_u8(s1));
-            g += 1;
         }
 
-        // Flush: uint16 → float via NEON widening + fused multiply-add
         let v_bias = vdupq_n_f32(n_groups as f32 * 2.0 * bias);
         for i in 0..4 {
-            // Split uint16x8 into two uint32x4, convert to float32x4
             let lo = vcvtq_f32_u32(vmovl_u16(vget_low_u16(accum[i])));
             let hi = vcvtq_f32_u32(vmovl_u16(vget_high_u16(accum[i])));
-            // fa += scale * val + bias
             fa[i * 2] = vaddq_f32(fa[i * 2], vfmaq_f32(v_bias, v_scale, lo));
             fa[i * 2 + 1] = vaddq_f32(fa[i * 2 + 1], vfmaq_f32(v_bias, v_scale, hi));
         }
     }
 
-    // Write scores with norms (NEON multiply + store)
     let end = (base_vec + BLOCK).min(n_vectors);
     let row_ptr = row.as_mut_ptr().add(base_vec);
     let norms_ptr = norms.as_ptr().add(base_vec);
-
-    if end - base_vec == BLOCK {
-        // Full block: vectorized norm multiply
-        for i in 0..8 {
-            let n = vld1q_f32(norms_ptr.add(i * 4));
-            vst1q_f32(row_ptr.add(i * 4), vmulq_f32(fa[i], n));
-        }
-    } else {
-        // Partial block: scalar fallback
-        let mut float_accum = [0.0f32; BLOCK];
-        for i in 0..8 {
-            vst1q_f32(float_accum.as_mut_ptr().add(i * 4), fa[i]);
-        }
-        for lane in 0..(end - base_vec) {
-            *row_ptr.add(lane) = float_accum[lane] * *norms_ptr.add(lane);
-        }
+    for i in 0..8 {
+        let n = vld1q_f32(norms_ptr.add(i * 4));
+        vst1q_f32(row_ptr.add(i * 4), vmulq_f32(fa[i], n));
     }
 }
+// EVOLVE-BLOCK-END
 
 /// Repack 3-bit codes into two blocked arrays:
 /// - sub_codes: 2-bit nibble format from planes 0,1
