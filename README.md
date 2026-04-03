@@ -131,6 +131,8 @@ Results are saved as JSON to `benchmarks/results/`. Regenerate charts:
 python3 benchmarks/create_diagrams.py
 ```
 
+## Star History
+
 [![Star History Chart](https://api.star-history.com/svg?repos=RyanCodrai/turbovec&type=Date)](https://star-history.com/#RyanCodrai/turbovec&Date)
 
 ## References
