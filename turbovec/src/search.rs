@@ -468,6 +468,7 @@ unsafe fn search_multi_query_avx2(
 
 /// Repack 3-bit codes into two blocked arrays:
 /// - sub_codes: 2-bit nibble format from planes 0,1
+#[cfg(target_arch = "aarch64")]
 unsafe fn score_2query_block_neon(
     blocked_codes: &[u8],
     luts_a: &[u8],

@@ -2,9 +2,13 @@
 
 Rust implementation of TurboQuant for vector search, with Python bindings via PyO3.
 
-Compresses high-dimensional vectors to 2-4 bits per coordinate with near-optimal distortion. Data-oblivious (no training), zero indexing time.
+Compresses high-dimensional vectors to 2-4 bits per coordinate with near-optimal distortion. Unofficial implementation of [TurboQuant](https://arxiv.org/abs/2504.19874) (Google Research, ICLR 2026).
 
-Unofficial implementation of [TurboQuant](https://arxiv.org/abs/2504.19874) (Google Research, ICLR 2026).
+Compared to trained quantization methods like FAISS PQ:
+
+- **Faster index creation** -- no training step required. Codebook and rotation are derived from math, not from the data.
+- **Online** -- new vectors can be added at any time without rebuilding or re-optimizing the index. No codebook retraining when data changes, leading to simplified infrastructure with no index maintenance.
+- **Comparable or higher recall** -- matches FAISS at 4-bit, exceeds FAISS at 2-bit on high-dimensional data (0.912 vs 0.903 at d=3072).
 
 ## Usage
 
@@ -35,128 +39,35 @@ index.write("index.tv").unwrap();
 let loaded = TurboQuantIndex::load("index.tv").unwrap();
 ```
 
-## Performance vs FAISS
+## Recall
 
-TurboQuant vs FAISS IndexPQFastScan on OpenAI DBpedia d=1536 (100K vectors, 1K queries, k=64). FAISS PQ configurations sized to match TurboQuant compression ratios.
+TurboQuant vs FAISS IndexPQFastScan (100K vectors, k=64). FAISS PQ configurations sized to match TurboQuant compression ratios.
 
-**TurboQuant requires zero training.** FAISS PQ needs a training step (4-10 seconds). TurboQuant index build is 3-4x faster.
+![Recall](docs/recall.png)
 
-### ARM (Apple Silicon M3 Max)
+Both converge to 1.0 by k=4-8. At d=3072 2-bit, TurboQuant recall exceeds FAISS (0.912 vs 0.903). At d=1536 2-bit, FAISS is slightly ahead (0.882 vs 0.870). The recall discrepancy between TQ and FAISS varies by dimension and bit width — this requires further investigation. Full results: [d=1536 2-bit](benchmarks/results/recall_d1536_2bit.json), [d=1536 4-bit](benchmarks/results/recall_d1536_4bit.json), [d=3072 2-bit](benchmarks/results/recall_d3072_2bit.json), [d=3072 4-bit](benchmarks/results/recall_d3072_4bit.json), [GloVe 2-bit](benchmarks/results/recall_glove_2bit.json), [GloVe 4-bit](benchmarks/results/recall_glove_4bit.json).
 
-| | TQ speed | FAISS speed | Ratio | TQ recall@1 | FAISS recall@1 |
-|---|---|---|---|---|---|
-| **2-bit MT** | 0.125ms/q | 0.128ms/q | **0.97x** | 0.870 | 0.882 |
-| **2-bit ST** | 1.272ms/q | 1.247ms/q | 1.02x | 0.870 | 0.882 |
-| **4-bit MT** | 0.232ms/q | 0.246ms/q | **0.94x** | **0.955** | 0.930 |
-| **4-bit ST** | 2.474ms/q | 2.485ms/q | **1.00x** | **0.955** | 0.930 |
+No FAISS FastScan comparison for GloVe d=200 (dimension not compatible with FastScan's m%32 requirement).
 
-On ARM, TurboQuant **matches or beats FAISS** on speed while requiring no training step. At 4-bit, TurboQuant recall is **higher than FAISS** (0.955 vs 0.930).
+## Compression
+
+![Compression](docs/compression.png)
+
+## Search Speed
+
+All benchmarks: 100K vectors, 1K queries, k=64, median of 5 runs.
+
+### ARM (Apple M3 Max)
+
+![ARM Speed](docs/arm_speed.png)
+
+On ARM, TurboQuant is within 2-25% of FAISS. Optimization is ongoing.
 
 ### x86 (Intel Sapphire Rapids, 4 vCPUs)
 
-| | TQ speed | FAISS speed | Ratio | TQ recall@1 | FAISS recall@1 |
-|---|---|---|---|---|---|
-| **2-bit MT** | 0.733ms/q | 0.590ms/q | 1.24x | 0.870 | 0.882 |
-| **2-bit ST** | 1.443ms/q | 1.208ms/q | 1.19x | 0.870 | 0.882 |
-| **4-bit MT** | 1.391ms/q | 1.181ms/q | 1.18x | **0.955** | 0.930 |
-| **4-bit ST** | 2.998ms/q | 2.477ms/q | 1.21x | **0.955** | 0.930 |
+![x86 Speed](docs/x86_speed.png)
 
-On x86, TurboQuant is within 18-25% of FAISS on speed. At 4-bit, TurboQuant recall is **higher than FAISS** (0.955 vs 0.930). The speed gap is primarily from TurboQuant's rotation step (~5% of total time) and differences in AVX2 code generation vs FAISS's template-instantiated C++ kernels.
-
-### Compression
-
-| Bit width | Index size (100K x 1536) | Compression vs FP32 |
-|:----------|:------------------------|:--------------------|
-| 2-bit     | 37.0 MB                  | 15.8x               |
-| 4-bit     | 73.6 MB                  | 8.0x                |
-
-## Benchmark results
-
-Reproducing Section 4.4 of the paper. recall@1@k = probability that the true nearest neighbor appears in the top-k results. Benchmarked on Apple M3 Max.
-
-### GloVe d=200 (100K database vectors, 10K queries)
-
-**Recall:**
-
-| k    | 2-bit | 4-bit |
-|:-----|:------|:------|
-| 1    | 0.505 | 0.812 |
-| 2    | 0.658 | 0.932 |
-| 4    | 0.789 | 0.986 |
-| 8    | 0.879 | 0.998 |
-| 16   | 0.943 | 1.000 |
-| 32   | 0.976 | 1.000 |
-| 64   | 0.992 | 1.000 |
-
-**Search latency:**
-
-| | 2-bit | 4-bit |
-|---|---|---|
-| MT | 0.029ms/q | 0.040ms/q |
-| ST | 0.275ms/q | 0.429ms/q |
-
-**Compression:**
-
-| Bit width | Index size | Compression vs FP32 |
-|:----------|:-----------|:--------------------|
-| 2-bit     | 5.1 MB     | 14.8x               |
-| 4-bit     | 9.9 MB     | 7.7x                |
-
-### OpenAI DBpedia d=1536 (100K database vectors, 1K queries)
-
-**Recall:**
-
-| k    | 2-bit | 4-bit |
-|:-----|:------|:------|
-| 1    | 0.870 | 0.955 |
-| 2    | 0.961 | 0.996 |
-| 4    | 0.998 | 1.000 |
-| 8    | 1.000 | 1.000 |
-| 16   | 1.000 | 1.000 |
-| 32   | 1.000 | 1.000 |
-| 64   | 1.000 | 1.000 |
-
-**Search latency:**
-
-| | 2-bit | 4-bit |
-|---|---|---|
-| MT | 0.138ms/q | 0.256ms/q |
-| ST | 1.448ms/q | 2.784ms/q |
-
-**Compression:**
-
-| Bit width | Index size | Compression vs FP32 |
-|:----------|:-----------|:--------------------|
-| 2-bit     | 37.0 MB    | 15.8x               |
-| 4-bit     | 73.6 MB    | 8.0x                |
-
-### OpenAI DBpedia d=3072 (100K database vectors, 1K queries)
-
-**Recall:**
-
-| k    | 2-bit | 4-bit |
-|:-----|:------|:------|
-| 1    | 0.912 | 0.967 |
-| 2    | 0.986 | 0.997 |
-| 4    | 1.000 | 1.000 |
-| 8    | 1.000 | 1.000 |
-| 16   | 1.000 | 1.000 |
-| 32   | 1.000 | 1.000 |
-| 64   | 1.000 | 1.000 |
-
-**Search latency:**
-
-| | 2-bit | 4-bit |
-|---|---|---|
-| MT | 0.395ms/q | 0.604ms/q |
-| ST | 3.240ms/q | 5.711ms/q |
-
-**Compression:**
-
-| Bit width | Index size | Compression vs FP32 |
-|:----------|:-----------|:--------------------|
-| 2-bit     | 73.6 MB    | 15.9x               |
-| 4-bit     | 146.9 MB   | 8.0x                |
+On x86, TurboQuant is 1.4-3.7x behind FAISS. Optimization is ongoing.
 
 ## How it works
 
@@ -209,13 +120,31 @@ cargo build --release
 ## Running benchmarks
 
 Download datasets:
-```
-python3 benchmarks/benchmark.py download glove openai-1536 openai-3072
+```bash
+python3 benchmarks/download_data.py all            # all datasets
+python3 benchmarks/download_data.py glove          # GloVe d=200
+python3 benchmarks/download_data.py openai-1536    # OpenAI DBpedia d=1536
+python3 benchmarks/download_data.py openai-3072    # OpenAI DBpedia d=3072
 ```
 
-Run benchmarks:
+Each benchmark is a self-contained script in `benchmarks/suite/`. Run any one individually:
+```bash
+python3 benchmarks/suite/speed_d1536_2bit_arm_mt.py
+python3 benchmarks/suite/recall_d1536_2bit.py
+python3 benchmarks/suite/compression.py
 ```
-python3 benchmarks/benchmark.py glove openai-1536 openai-3072
+
+Run all benchmarks for a category:
+```bash
+for f in benchmarks/suite/speed_*arm*.py; do python3 "$f"; done    # all ARM speed
+for f in benchmarks/suite/speed_*x86*.py; do python3 "$f"; done    # all x86 speed
+for f in benchmarks/suite/recall_*.py; do python3 "$f"; done       # all recall
+python3 benchmarks/suite/compression.py                            # compression
+```
+
+Results are saved as JSON to `benchmarks/results/`. Regenerate charts:
+```bash
+python3 benchmarks/create_diagrams.py
 ```
 
 ## References
