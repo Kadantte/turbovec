@@ -3,8 +3,13 @@ name = "turbovec"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.70"
-description = "TurboQuant implementation for vector search"
+description = "Fast vector quantization with 2-4 bit compression and SIMD search"
 license = "MIT"
+repository = "https://github.com/RyanCodrai/turbovec"
+homepage = "https://github.com/RyanCodrai/turbovec"
+readme = "../README.md"
+keywords = ["vector-search", "quantization", "nearest-neighbor", "ann", "simd"]
+categories = ["algorithms", "science", "compression"]
 
 [dependencies]
 ndarray = "0.17"
