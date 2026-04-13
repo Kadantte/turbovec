@@ -458,24 +458,17 @@ unsafe fn search_multi_query_avx2(
                         if score > *hmin {
                             hs[*hmi] = score;
                             hi[*hmi] = (base_vec + lane) as u32;
-                            // SIMD min-find over k=64 heap entries (8 chunks of 8)
-                            let hp = hs.as_ptr();
-                            let mut vmin = _mm256_loadu_ps(hp);
-                            for c in 1..(k / 8) {
-                                vmin = _mm256_min_ps(vmin, _mm256_loadu_ps(hp.add(c * 8)));
-                            }
-                            // Horizontal min of 8 floats
-                            let lo = _mm256_castps256_ps128(vmin);
-                            let hi128 = _mm256_extractf128_ps(vmin, 1);
-                            let m4 = _mm_min_ps(lo, hi128);
-                            let m2 = _mm_min_ps(m4, _mm_movehl_ps(m4, m4));
-                            let m1 = _mm_min_ps(m2, _mm_shuffle_ps(m2, m2, 1));
-                            *hmin = _mm_cvtss_f32(m1);
-                            // Find index of min (scalar scan, but only after SIMD found the value)
+                            // Rescan the heap to find the new minimum.
+                            // Scalar because `hs` has length exactly `k`:
+                            // a wide SIMD load would read past the end
+                            // when `k < 8`, and a `for c in 1..(k/8)` loop
+                            // silently misses the tail when `k` is not a
+                            // multiple of 8. Matches the NEON path.
                             *hmi = 0;
                             for h in 1..k {
                                 if hs[h] < hs[*hmi] { *hmi = h; }
                             }
+                            *hmin = hs[*hmi];
                         }
                     }
                 }
