@@ -25,6 +25,10 @@ loaded = TurboQuantIndex.load("my_index.tq")
 
 ## Rust
 
+```bash
+cargo add turbovec
+```
+
 ```rust
 use turbovec::TurboQuantIndex;
 
