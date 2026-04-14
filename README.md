@@ -1,6 +1,6 @@
 # turbovec
 
-Fast vector quantization in Rust with Python bindings. Compresses vectors to 2-4 bits per dimension with near-optimal distortion. Implementation of [TurboQuant](https://arxiv.org/abs/2504.19874) (Google Research, ICLR 2026).
+Fast vector index in Rust with Python bindings. Compresses vectors to 2-4 bits per dimension using [TurboQuant](https://arxiv.org/abs/2504.19874) (Google Research, ICLR 2026) with near-optimal distortion.
 
 Unlike trained methods like FAISS PQ, TurboQuant is **data-oblivious** — no training step, no codebook retraining when data changes, and new vectors can be added at any time. This means faster index creation, simpler infrastructure, and comparable or higher recall.
 
