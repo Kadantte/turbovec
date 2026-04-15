@@ -88,7 +88,7 @@ On ARM, TurboQuant beats FAISS FastScan by 12–20% across every config.
 
 ![x86 Speed — Multi-threaded](docs/x86_speed_mt.svg)
 
-On x86, TurboQuant wins every 4-bit config by 1–6% and runs within ~1% of FAISS on 2-bit ST. The 2-bit MT rows (d=1536 and d=3072) are the last configs sitting slightly behind FAISS (2–4%), where the inner accumulate loop is too short for unrolling amortization to catch up with FAISS's AVX-512 VBMI path. See the [Performance build](#performance-build-x86) section below for an opt-in PGO recipe that flips every config to a win.
+On x86, TurboQuant wins every 4-bit config by 1–6% and runs within ~1% of FAISS on 2-bit ST. The 2-bit MT rows (d=1536 and d=3072) are the only configs sitting slightly behind FAISS (2–4%), where the inner accumulate loop is too short for unrolling amortization to match FAISS's AVX-512 VBMI path.
 
 ## How it works
 
@@ -124,29 +124,6 @@ cargo build --release
 ```
 
 All x86_64 builds target `x86-64-v3` (AVX2 baseline, Haswell 2013+) via `.cargo/config.toml`. Any CPU that can run the AVX2 fallback kernel can run the whole crate — the AVX-512 kernel is gated at runtime via `is_x86_feature_detected!` and only kicks in on hardware that supports it.
-
-### Performance build (x86)
-
-The shipped Cargo config already gives most of the x86 win out of the box. For an additional ~5–10% on modern servers (Ice Lake / Sapphire Rapids / Zen 4+), you can opt into a profile-guided build with host-specific codegen. This flips every x86 config from parity-or-slight-win to a clear win across the board.
-
-```bash
-cd turbovec-python
-
-# 1. Instrumented build
-RUSTFLAGS="-C profile-generate=/tmp/pgo -C target-cpu=native" maturin build --release
-pip install --force-reinstall target/wheels/*.whl
-
-# 2. Collect a profile by running representative benchmarks
-python3 ../benchmarks/suite/speed_d3072_4bit_x86_st.py
-python3 ../benchmarks/suite/speed_d1536_4bit_x86_st.py
-
-# 3. Merge and rebuild with the profile
-llvm-profdata merge -o /tmp/merged.profdata /tmp/pgo
-RUSTFLAGS="-C profile-use=/tmp/merged.profdata -C target-cpu=native" maturin build --release
-pip install --force-reinstall target/wheels/*.whl
-```
-
-`target-cpu=native` is machine-specific — only use it when building on the same host (family) you'll run on. `llvm-profdata` ships with `rustup component add llvm-tools-preview`.
 
 ## Running benchmarks
 
