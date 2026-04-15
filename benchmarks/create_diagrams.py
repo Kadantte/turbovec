@@ -391,10 +391,10 @@ if __name__ == "__main__":
     write_speed_panel("arm", "ARM (Apple M3 Max)", "mt", "Multi-threaded",
                       tick_fmt=lambda v: f"{v:.2f}", value_fmt=lambda v: f"{v:.3f}",
                       filename="arm_speed_mt.svg")
-    write_speed_panel("x86", "x86 (Intel Sapphire Rapids, 4 vCPU)", "st", "Single-threaded",
+    write_speed_panel("x86", "x86 (Intel Sapphire Rapids, 8 vCPUs)", "st", "Single-threaded",
                       tick_fmt=lambda v: f"{v:.1f}", value_fmt=lambda v: f"{v:.2f}",
                       filename="x86_speed_st.svg")
-    write_speed_panel("x86", "x86 (Intel Sapphire Rapids, 4 vCPU)", "mt", "Multi-threaded",
+    write_speed_panel("x86", "x86 (Intel Sapphire Rapids, 8 vCPUs)", "mt", "Multi-threaded",
                       tick_fmt=lambda v: f"{v:.2f}", value_fmt=lambda v: f"{v:.3f}",
                       filename="x86_speed_mt.svg")
     write_recall_panel("d1536", "d=1536", "recall_d1536.svg")
