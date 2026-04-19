@@ -15,7 +15,7 @@
 
 turbovec is a Rust vector index with Python bindings, built on Google Research's [**TurboQuant**](https://arxiv.org/abs/2504.19874) algorithm - a data-oblivious quantizer that matches the Shannon lower bound on distortion with zero training and zero data passes.
 
-- **No codebook training.** Add vectors, they're indexed. No k-means pass.
+- **No codebook training.** Add vectors, they're indexed. No data-dependent calibration, no rebuilds as the corpus grows.
 - **Faster than FAISS.** Hand-written NEON (ARM) and AVX-512BW (x86) kernels beat FAISS IndexPQFastScan by 12–20% on ARM and match-or-beat it on x86.
 - **Pure local.** No managed service, no data leaving your machine or VPC. Pair with any open-source embedding model for a fully air-gapped RAG stack.
 
