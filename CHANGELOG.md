@@ -11,7 +11,9 @@ appears under each surface it touches.
 
 ## [Unreleased]
 
-### turbovec — Python package
+## turbovec 0.4.1 (Python package) — 2026-05-17
+
+### turbovec — Python package (current: 0.4.0 → next: 0.4.1)
 
 #### Added
 
@@ -227,4 +229,5 @@ appears under each surface it touches.
   `schema_version` field; loaders reject unknown versions instead of
   silently misinterpreting bytes.
 
-[Unreleased]: https://github.com/RyanCodrai/turbovec/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/RyanCodrai/turbovec/compare/py-v0.4.1...HEAD
+[py-v0.4.1]: https://github.com/RyanCodrai/turbovec/compare/py-v0.4.0...py-v0.4.1
