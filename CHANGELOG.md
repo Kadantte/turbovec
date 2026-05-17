@@ -11,6 +11,10 @@ appears under each surface it touches.
 
 ## [Unreleased]
 
+(Nothing in flight — `next` lines below describe published versions.)
+
+## turbovec 0.3.0 (Rust crate) — 2026-05-17
+
 ### turbovec — Rust crate (current: 0.2.0 → next: 0.3.0)
 
 #### Added
@@ -60,6 +64,8 @@ appears under each surface it touches.
 - `search`, `search_with_mask`, and `prepare` on `TurboQuantIndex`
   return empty results / are no-ops when called on a lazy
   uncommitted index, rather than panicking.
+
+## turbovec 0.4.0 (Python package) — 2026-05-17
 
 ### turbovec — Python package (current: 0.3.0 → next: 0.4.0)
 
@@ -192,4 +198,4 @@ appears under each surface it touches.
   `schema_version` field; loaders reject unknown versions instead of
   silently misinterpreting bytes.
 
-[Unreleased]: https://github.com/RyanCodrai/turbovec/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/RyanCodrai/turbovec/compare/v0.3.0...HEAD
