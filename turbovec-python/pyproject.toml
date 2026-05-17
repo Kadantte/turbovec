@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "turbovec"
-version = "0.4.1"
+version = "0.4.2"
 description = "Fast vector quantization with 2-4 bit compression and SIMD search"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -38,6 +38,10 @@ classifiers = [
     "Programming Language :: Rust",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
     "Topic :: Database",
+]
+
+dependencies = [
+    "numpy>=1.20",
 ]
 
 [project.urls]

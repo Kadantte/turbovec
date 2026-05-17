@@ -11,6 +11,22 @@ appears under each surface it touches.
 
 ## [Unreleased]
 
+## turbovec 0.4.2 (Python package) — 2026-05-17
+
+### turbovec — Python package (current: 0.4.1 → next: 0.4.2)
+
+#### Fixed
+
+- **`numpy` is now a declared runtime dependency.** The Python package
+  and every integration module imports `numpy` unconditionally, and the
+  Rust extension's Python surface expects NumPy arrays as input. Prior
+  releases relied on `numpy` being pulled in transitively via the
+  framework extras (`langchain-core`, `llama-index-core`, `haystack-ai`).
+  This broke `pip install turbovec[agno]` in clean environments because
+  `agno` doesn't depend on `numpy`. `numpy>=1.20` is now declared in
+  `[project].dependencies`, so it's installed regardless of which extra
+  (or none) is selected.
+
 ## turbovec 0.4.1 (Python package) — 2026-05-17
 
 ### turbovec — Python package (current: 0.4.0 → next: 0.4.1)
@@ -229,5 +245,6 @@ appears under each surface it touches.
   `schema_version` field; loaders reject unknown versions instead of
   silently misinterpreting bytes.
 
-[Unreleased]: https://github.com/RyanCodrai/turbovec/compare/py-v0.4.1...HEAD
+[Unreleased]: https://github.com/RyanCodrai/turbovec/compare/py-v0.4.2...HEAD
+[py-v0.4.2]: https://github.com/RyanCodrai/turbovec/compare/py-v0.4.1...py-v0.4.2
 [py-v0.4.1]: https://github.com/RyanCodrai/turbovec/compare/py-v0.4.0...py-v0.4.1
