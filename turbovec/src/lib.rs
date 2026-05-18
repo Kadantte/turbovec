@@ -70,14 +70,14 @@ pub struct TurboQuantIndex {
     bit_width: usize,
     n_vectors: usize,
     packed_codes: Vec<u8>,
-    norms: Vec<f32>,
+    scales: Vec<f32>,
 
     // Thread-safe lazy caches. These are initialised from `&self` via
     // `OnceLock::get_or_init`, which allows `search` to take `&self`
     // and run concurrently from multiple threads without external
     // locking. `add` resets `blocked` by replacing its `OnceLock` (it
     // already has `&mut self` for the underlying extend on
-    // `packed_codes` and `norms`).
+    // `packed_codes` and `scales`).
     //
     // `rotation` and `centroids` are deterministic functions of `(dim,
     // ROTATION_SEED)` and `(bit_width, dim)` respectively, so they
@@ -117,7 +117,7 @@ impl TurboQuantIndex {
             bit_width,
             n_vectors: 0,
             packed_codes: Vec::new(),
-            norms: Vec::new(),
+            scales: Vec::new(),
             rotation: OnceLock::new(),
             centroids: OnceLock::new(),
             blocked: OnceLock::new(),
@@ -134,7 +134,7 @@ impl TurboQuantIndex {
             bit_width,
             n_vectors: 0,
             packed_codes: Vec::new(),
-            norms: Vec::new(),
+            scales: Vec::new(),
             rotation: OnceLock::new(),
             centroids: OnceLock::new(),
             blocked: OnceLock::new(),
@@ -158,16 +158,23 @@ impl TurboQuantIndex {
         let rotation = self
             .rotation
             .get_or_init(|| rotation::make_rotation_matrix(dim));
-        let (boundaries, _) = codebook::codebook(self.bit_width, dim);
-        let (packed, norms) =
-            encode::encode(vectors, n, dim, rotation, &boundaries, self.bit_width);
+        let (boundaries, centroids) = codebook::codebook(self.bit_width, dim);
+        let (packed, scales) = encode::encode(
+            vectors,
+            n,
+            dim,
+            rotation,
+            &boundaries,
+            &centroids,
+            self.bit_width,
+        );
 
         if self.n_vectors == 0 {
             self.packed_codes = packed;
-            self.norms = norms;
+            self.scales = scales;
         } else {
             self.packed_codes.extend_from_slice(&packed);
-            self.norms.extend_from_slice(&norms);
+            self.scales.extend_from_slice(&scales);
         }
         self.n_vectors += n;
 
@@ -285,7 +292,7 @@ impl TurboQuantIndex {
             rotation,
             &blocked.data,
             centroids,
-            &self.norms,
+            &self.scales,
             self.bit_width,
             dim,
             self.n_vectors,
@@ -340,14 +347,14 @@ impl TurboQuantIndex {
             self.dim.unwrap_or(0),
             self.n_vectors,
             &self.packed_codes,
-            &self.norms,
+            &self.scales,
         )
     }
 
     pub fn load(path: impl AsRef<Path>) -> std::io::Result<Self> {
-        let (bit_width, dim, n_vectors, packed_codes, norms) = io::load(path)?;
+        let (bit_width, dim, n_vectors, packed_codes, scales) = io::load(path)?;
         let dim_opt = if dim == 0 { None } else { Some(dim) };
-        Ok(Self::from_parts(dim_opt, bit_width, n_vectors, packed_codes, norms))
+        Ok(Self::from_parts(dim_opt, bit_width, n_vectors, packed_codes, scales))
     }
 
     pub(crate) fn from_parts(
@@ -355,14 +362,14 @@ impl TurboQuantIndex {
         bit_width: usize,
         n_vectors: usize,
         packed_codes: Vec<u8>,
-        norms: Vec<f32>,
+        scales: Vec<f32>,
     ) -> Self {
         Self {
             dim,
             bit_width,
             n_vectors,
             packed_codes,
-            norms,
+            scales,
             rotation: OnceLock::new(),
             centroids: OnceLock::new(),
             blocked: OnceLock::new(),
@@ -373,8 +380,8 @@ impl TurboQuantIndex {
         &self.packed_codes
     }
 
-    pub(crate) fn norms(&self) -> &[f32] {
-        &self.norms
+    pub(crate) fn scales(&self) -> &[f32] {
+        &self.scales
     }
 
     /// Remove the vector at `idx` in O(1) by swapping with the last vector.
@@ -408,12 +415,12 @@ impl TurboQuantIndex {
             self.packed_codes.copy_within(src..src + bytes_per_vec, dst);
 
             // Move last norm into slot `idx`.
-            self.norms[idx] = self.norms[last];
+            self.scales[idx] = self.scales[last];
         }
 
         // Truncate both arrays.
         self.packed_codes.truncate(last * bytes_per_vec);
-        self.norms.truncate(last);
+        self.scales.truncate(last);
         self.n_vectors -= 1;
 
         // Invalidate the blocked cache since it was derived from the old layout.
