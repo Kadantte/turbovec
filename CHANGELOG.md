@@ -11,6 +11,30 @@ appears under each surface it touches.
 
 ## [Unreleased]
 
+## turbovec 0.4.3 (Python package) — 2026-05-18
+
+### turbovec — Python package (current: 0.4.2 → next: 0.4.3)
+
+#### Added
+
+- **Windows x64 wheel** (closes [#31](https://github.com/RyanCodrai/turbovec/issues/31)).
+  Prior releases shipped only Linux x86_64/aarch64, macOS aarch64, and an
+  sdist — Windows users running `pip install turbovec` fell through to
+  the sdist and hit a `link.exe` build failure unless they had Rust + MSVC
+  installed locally. The release workflow now also builds a
+  `cp39-abi3-win_amd64` wheel and validates it by installing and running
+  the core pytest suite (`test_index.py`, `test_id_map.py`,
+  `test_filtering.py`) on the build runner before upload. Implementation
+  in [#33](https://github.com/RyanCodrai/turbovec/pull/33).
+
+  Intel Mac (macOS x86_64) was considered alongside Windows but blocked
+  by GitHub's December 2025 deprecation of free-tier `macos-13` runners;
+  tracked separately in [#34](https://github.com/RyanCodrai/turbovec/issues/34).
+
+  No library changes in this release — same Python API, same on-disk
+  format, same recall and throughput as 0.4.2. Pure platform-coverage
+  patch.
+
 ## turbovec 0.4.2 (Python package) — 2026-05-17
 
 ### turbovec — Python package (current: 0.4.1 → next: 0.4.2)
