@@ -11,7 +11,9 @@ appears under each surface it touches.
 
 ## [Unreleased]
 
-### turbovec — Rust crate
+## turbovec 0.5.2 (Python package) + turbovec 0.5.0 (Rust crate) — 2026-05-21
+
+### turbovec — Rust crate (current: 0.4.1 → next: 0.5.0)
 
 #### Changed
 
@@ -28,7 +30,7 @@ appears under each surface it touches.
   calls. Match on `AddError` if you need to recover from specific
   failure modes.
 
-### turbovec — Python package
+### turbovec — Python package (current: 0.5.1 → next: 0.5.2)
 
 #### Changed
 
