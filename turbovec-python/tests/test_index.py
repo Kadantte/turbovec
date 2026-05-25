@@ -26,7 +26,7 @@ def test_new_reports_dim_and_bit_width():
     assert len(idx) == 0
 
 
-@pytest.mark.parametrize("bit_width", [2, 4])
+@pytest.mark.parametrize("bit_width", [2, 3, 4])
 def test_bit_width_options(bit_width):
     idx = TurboQuantIndex(dim=128, bit_width=bit_width)
     assert idx.bit_width == bit_width
@@ -170,3 +170,23 @@ def test_add_with_mismatched_dim_raises_value_error():
     idx = TurboQuantIndex(dim=128, bit_width=4)
     with pytest.raises(ValueError, match="dim mismatch"):
         idx.add(unit_vectors(3, 256))
+
+
+@pytest.mark.parametrize("bad_bit_width", [0, 1, 5, 8])
+def test_constructor_rejects_bad_bit_width(bad_bit_width):
+    with pytest.raises(ValueError, match="bit_width"):
+        TurboQuantIndex(dim=128, bit_width=bad_bit_width)
+
+
+@pytest.mark.parametrize("bad_dim", [0, 1, 4, 7, 9])
+def test_constructor_rejects_bad_dim(bad_dim):
+    with pytest.raises(ValueError, match="dim"):
+        TurboQuantIndex(dim=bad_dim, bit_width=4)
+
+
+def test_search_on_empty_eager_index_returns_zero_effective_k():
+    idx = TurboQuantIndex(dim=128, bit_width=4)
+    q = unit_vectors(1, 128)
+    scores, indices = idx.search(q, k=3)
+    assert scores.shape == (1, 0)
+    assert indices.shape == (1, 0)
