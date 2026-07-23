@@ -52,6 +52,12 @@ const TQPLUS_MIN_SAMPLES: usize = 1000;
 /// fresh calibration from this batch's empirical quantiles.
 ///
 /// Returns (packed_codes, scales, shift_used, scale_tq_used).
+///
+/// # Panics
+///
+/// Panics if `dim` is zero or not a multiple of 8 — the packed layout
+/// allocates `dim / 8` bytes per bit-plane, so no other dim has a valid
+/// layout. (`TurboQuantIndex` enforces the same rule at construction.)
 pub fn encode(
     vectors: &[f32],
     n: usize,
@@ -62,6 +68,16 @@ pub fn encode(
     bit_width: usize,
     existing_calibration: Option<(&[f32], &[f32])>,
 ) -> (Vec<u8>, Vec<f32>, Vec<f32>, Vec<f32>) {
+    // The packed layout allocates `dim / 8` bytes per bit-plane, so a dim
+    // that is not a multiple of 8 has no valid layout: the tail
+    // coordinates would write past the end of each plane (top plane
+    // panics, lower planes silently corrupt the next plane's bytes —
+    // #117). TurboQuantIndex enforces this at construction; enforce it
+    // here too for direct callers of the public function.
+    assert!(
+        dim != 0 && dim % 8 == 0,
+        "encode requires dim to be a nonzero multiple of 8, got {dim}",
+    );
     let mut norms = vec![0.0f32; n];
     let mut unit_flat = vec![0.0f32; n * dim];
 
@@ -326,30 +342,57 @@ fn fused_quantize_scale_pack(
                 packed_row[p * bytes_per_plane + offset / 8] = vaddv_u8(vand_u8(hit, wv));
             }
         }
-
-        // Tail elements when dim isn't a multiple of 8 (kept for parity even
-        // though TurboQuantIndex::new rejects non-multiples-of-8 today).
-        for j in (chunks * 8)..dim {
-            let mut code = 0u8;
-            for &b in boundaries {
-                if rot_calib[j] > b { code += 1; }
-            }
-            let centroid_in_orig =
-                (centroids[code as usize] as f64) * (inv_scale_tq[j] as f64)
-                    - (shift[j] as f64);
-            inner += (rot_orig[j] as f64) * centroid_in_orig;
-            let byte_pos = j / 8;
-            let bit_pos = 7 - (j % 8);
-            for p in 0..bits {
-                if code & (1 << p) != 0 {
-                    packed_row[p * bytes_per_plane + byte_pos] |= 1 << bit_pos;
-                }
-            }
-        }
+        // No tail loop: `encode` asserts dim % 8 == 0, so `chunks * 8 == dim`.
+        // (The old tail branch could never work — `bytes_per_plane = dim / 8`
+        // truncates, so tail coordinates have no bytes to land in; see #117.)
     }
 
-    let inner = inner.max(1e-10) as f32;
-    norm / inner
+    scale_from_inner(inner, norm)
+}
+
+/// Degeneracy threshold for the reconstruction inner product.
+///
+/// `inner = <u_rot, x_hat>` is computed against the *unit-normalized*
+/// rotated vector, so it is already norm-relative (cosine-like, ≈ 1 for a
+/// healthy reconstruction regardless of the vector's magnitude). Measured
+/// healthy minima stay above ~0.56 (dim 8 at 2 bits, the coarsest
+/// supported config; every other measured config is ≥ 0.70, and
+/// in-distribution data under fitted calibration sits at ≈ 1.0). By
+/// contrast, reconstructions of vectors a frozen calibration cannot
+/// represent collapse below ~0.06 on their way to the sign flip (#116).
+/// 0.1 splits that gap: healthy vectors are untouched (their encode
+/// output stays bit-identical), while every stored scale is bounded by
+/// `norm / EPS`, capping score inflation at 10× the vector's true
+/// magnitude instead of the old ~1e10 blowup.
+const DEGENERATE_INNER_EPS: f64 = 0.1;
+
+/// Convert the reconstruction inner product `<u_rot, x_hat>` into the stored
+/// per-vector correction scale `||v|| / inner`.
+///
+/// A small or negative `inner` means the quantized reconstruction points
+/// away from (or nearly orthogonal to) the vector — the codebook cannot
+/// represent it under the current (possibly frozen) calibration, and any
+/// finite scale would inflate its scores by `1 / inner`. The old
+/// `inner.max(1e-10)` clamp turned a negative `inner` into a ~1e10 scale
+/// with a flipped sign, letting a single out-of-distribution vector falsely
+/// dominate every top-k (#116); a purely non-positive test would have left
+/// the same explosion reachable through the open window just above zero.
+/// Degenerate reconstructions (`inner <= DEGENERATE_INNER_EPS`) store scale
+/// 0 instead so the vector scores ~0 and ranks last; this also preserves
+/// the zero-vector behavior the clamp originally guarded (`norm == 0` ⇒
+/// `inner == 0` ⇒ scale 0). The comparison is written positively so a NaN
+/// `inner` (reachable only via direct `encode` calls with non-finite input,
+/// which the index-level API rejects) lands in the degenerate branch rather
+/// than poisoning the stored scale. Both the SIMD path and the scalar
+/// fallback route through this helper, so the two stay in agreement; for
+/// `inner > EPS` the result is bit-identical to the previous code.
+#[inline(always)]
+fn scale_from_inner(inner: f64, norm: f32) -> f32 {
+    if inner > DEGENERATE_INNER_EPS {
+        norm / inner as f32
+    } else {
+        0.0
+    }
 }
 
 // ─── Fused quantize + scale + pack (fallback) ───────────────────────────────
@@ -390,6 +433,5 @@ fn fused_quantize_scale_pack(
         }
     }
 
-    let inner = inner.max(1e-10) as f32;
-    norm / inner
+    scale_from_inner(inner, norm)
 }
