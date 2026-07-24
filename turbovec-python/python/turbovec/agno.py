@@ -180,6 +180,14 @@ class TurboQuantVectorDb(VectorDb):
         """Drop the underlying index. After this call ``exists()`` returns
         ``False`` until ``create()`` is called again — matches LanceDb's
         contract where ``drop()`` removes the table entirely."""
+        # Remove the persisted artifacts too, so a later create() starts
+        # fresh instead of reloading — and resurrecting — the dropped
+        # data (issue #169). Matches LanceDb's drop_table, which deletes
+        # the on-disk table.
+        if self.path is not None:
+            folder = Path(self.path)
+            for filename in (_INDEX_FILENAME, _STORE_FILENAME):
+                (folder / filename).unlink(missing_ok=True)
         self._index = None
         self._str_to_u64.clear()
         self._u64_to_doc.clear()
@@ -328,7 +336,13 @@ class TurboQuantVectorDb(VectorDb):
 
         # Raise on any document that still lacks an embedding rather than
         # silently dropping — silent drops mask data-pipeline bugs.
-        missing = [doc for doc in documents if not doc.embedding]
+        # None/len check instead of truthiness: `not <ndarray>` raises the
+        # numpy truth-value-ambiguous ValueError (issue #135).
+        missing = [
+            doc
+            for doc in documents
+            if doc.embedding is None or len(doc.embedding) == 0
+        ]
         if missing:
             ids = [doc.id or "<no id>" for doc in missing]
             raise ValueError(
@@ -417,10 +431,16 @@ class TurboQuantVectorDb(VectorDb):
         documents: List[Document],
         filters: Optional[Dict[str, Any]] = None,
     ) -> None:
-        old_handles = self._handles_for_content_hash(content_hash)
-        await self.async_insert(content_hash, documents, filters)
-        for handle in old_handles:
-            self._remove_handle(handle)
+        # Await ONLY the embedding step, then delegate to the sync upsert
+        # so no suspension point splits the old-handle capture from the
+        # insert+remove. Capturing before an await let concurrent upserts
+        # of the same content_hash all snapshot the same pre-insert
+        # handle set, so no task removed a sibling's rows and stale
+        # generations accumulated (issue #146). Delegating preserves the
+        # insert-before-delete ordering (issue #89) and makes concurrent
+        # async upserts last-writer-wins — identical to sync semantics.
+        await self._embed_missing_async(documents)
+        self.upsert(content_hash, documents, filters)
 
     def _handles_for_content_hash(self, content_hash: str) -> List[int]:
         """Internal handles of every document currently stored under this
@@ -475,6 +495,19 @@ class TurboQuantVectorDb(VectorDb):
 
     # ---- VectorDb protocol: search ----------------------------------------
 
+    @staticmethod
+    def _meta_matches(data: Dict[str, Any], items: List[Any]) -> bool:
+        """True iff the stored payload's ``meta_data`` has every filter key
+        PRESENT and equal to the filter value (AND). Key presence matters:
+        ``.get(k) == v`` coerces absence to ``None``, so a ``None``-valued
+        filter would match every doc *missing* the key — leaking (or
+        deleting) the whole collection (issue #144). LanceDb requires the
+        key to be present, and skips docs whose ``meta_data`` is ``None``."""
+        md = data.get("meta_data")
+        if md is None:
+            return False
+        return all(k in md and md[k] == v for k, v in items)
+
     def _resolve_filter_to_handles(
         self, filters: Optional[Union[Dict[str, Any], List[Any]]]
     ) -> Optional[List[int]]:
@@ -501,7 +534,7 @@ class TurboQuantVectorDb(VectorDb):
         return [
             handle
             for handle, data in self._u64_to_doc.items()
-            if all((data.get("meta_data") or {}).get(k) == v for k, v in items)
+            if self._meta_matches(data, items)
         ]
 
     def _scaled_similarity(self, raw: float) -> float:
@@ -643,6 +676,11 @@ class TurboQuantVectorDb(VectorDb):
     def delete_by_name(self, name: str) -> bool:
         if self._index is None:
             return False
+        # Docs stored without a name keep it as None, so a None argument
+        # (off-contract, param typed str) would delete every unnamed doc.
+        # Same guard as delete_by_content_id — no-op instead.
+        if name is None:
+            return False
         # Remove exactly the handles whose stored name matches. Delegating to
         # delete_by_id would key on the derived doc_id, which excludes `name`,
         # so it would also delete a differently-named doc that happens to
@@ -653,7 +691,16 @@ class TurboQuantVectorDb(VectorDb):
         return bool(handles)
 
     def delete_by_metadata(self, metadata: Dict[str, Any]) -> bool:
+        """Delete every document whose ``meta_data`` has all of
+        ``metadata``'s keys present and equal (AND). An empty dict is a
+        vacuous AND and therefore matches — and deletes — every document,
+        matching LanceDb's behavior for the same input."""
         if self._index is None:
+            return False
+        # None is off-contract (param typed dict); LanceDb returns False
+        # rather than raising. Same guard family as delete_by_name /
+        # delete_by_content_id.
+        if metadata is None:
             return False
         items = list(metadata.items())
         # Remove the matching handles directly (see delete_by_name): the
@@ -662,7 +709,7 @@ class TurboQuantVectorDb(VectorDb):
         handles = [
             h
             for h, data in self._u64_to_doc.items()
-            if all((data.get("meta_data") or {}).get(k) == v for k, v in items)
+            if self._meta_matches(data, items)
         ]
         for handle in handles:
             self._remove_handle(handle)
@@ -670,6 +717,11 @@ class TurboQuantVectorDb(VectorDb):
 
     def delete_by_content_id(self, content_id: str) -> bool:
         if self._index is None:
+            return False
+        # Docs stored without a content_id keep it as None, so a None
+        # argument (off-contract, param typed str) would match — and
+        # delete — every such doc. Treat it as a no-op (issue #169).
+        if content_id is None:
             return False
         # Remove the matching handles directly (see delete_by_name): the
         # derived doc_id ignores content_id, so delete_by_id would over-delete
@@ -690,6 +742,10 @@ class TurboQuantVectorDb(VectorDb):
         fields (used by callers that pass filter-style restrictions at
         retrieval time)."""
         if self._index is None:
+            return
+        # See delete_by_content_id: a None content_id would match every
+        # doc stored without one — no-op instead (issue #169).
+        if content_id is None:
             return
         for data in self._u64_to_doc.values():
             if data.get("content_id") == content_id:

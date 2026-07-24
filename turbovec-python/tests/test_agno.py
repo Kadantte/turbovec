@@ -182,6 +182,30 @@ def test_insert_reembeds_document_with_empty_list_embedding():
     assert db.get_count() == 1
 
 
+def test_insert_accepts_numpy_array_embedding():
+    # Regression test for issue #135: a numpy-array embedding hit
+    # `if not doc.embedding`, raising the numpy truth-value-ambiguous
+    # ValueError. LanceDb tolerates array embeddings; so must we.
+    embedder = StubEmbedder(DIM)
+    db = TurboQuantVectorDb(embedder=embedder)
+    db.create()
+    vec = np.asarray(embedder.get_embedding("x"), dtype=np.float32)
+    db.insert("h-np", [Document(id="d1", content="x", embedding=vec)])
+    assert db.get_count() == 1
+    [hit] = db.search("x", limit=1)
+    assert hit.content == "x"
+
+
+def test_upsert_accepts_numpy_array_embedding():
+    # Same ndarray-tolerance for the upsert path (issue #135).
+    embedder = StubEmbedder(DIM)
+    db = TurboQuantVectorDb(embedder=embedder)
+    db.create()
+    vec = np.asarray(embedder.get_embedding("y"), dtype=np.float32)
+    db.upsert("h-np", [Document(id="d1", content="y", embedding=vec)])
+    assert db.get_count() == 1
+
+
 def test_insert_empty_document_list_is_noop():
     # Drop-in safety: callers passing an empty list (e.g. a Knowledge
     # batch where every doc was filtered out upstream) must not raise
@@ -363,6 +387,29 @@ def test_drop_returns_to_uncreated_state():
     assert db.get_count() == 0
 
 
+def test_drop_with_path_removes_persisted_artifacts(tmp_path):
+    # Regression test for issue #169: drop() on a store with a
+    # persistence path cleared memory but left index.tvim/docstore.json
+    # on disk, so the next create() reloaded — resurrecting — the
+    # "dropped" data. drop() must remove the persisted table entirely,
+    # matching its docstring and LanceDb's drop_table.
+    path = str(tmp_path / "store")
+    db = TurboQuantVectorDb(embedder=StubEmbedder(), path=path)
+    db.create()
+    db.insert("h", [_doc("secret")])
+    db.save()
+    assert (tmp_path / "store" / "index.tvim").exists()
+    assert (tmp_path / "store" / "docstore.json").exists()
+
+    db.drop()
+    assert db.exists() is False
+    assert not (tmp_path / "store" / "index.tvim").exists()
+    assert not (tmp_path / "store" / "docstore.json").exists()
+    # Re-create starts empty instead of reloading the dropped data.
+    db.create()
+    assert db.get_count() == 0
+
+
 def test_delete_returns_false_per_lancedb_contract():
     # LanceDb's delete() unconditionally returns False — actual removal
     # is via drop(). Mirror that exactly.
@@ -533,6 +580,24 @@ def test_search_with_no_matching_filter_returns_empty():
     assert results == []
 
 
+def test_search_filter_none_value_requires_key_present():
+    # Regression test for issue #144: `{"k": None}` must match only docs
+    # where the key is PRESENT and equal to None (LanceDb semantics).
+    # `.get(k) == v` coerced key-absence to None, so filtering on an
+    # unset field leaked the entire collection.
+    db = TurboQuantVectorDb(embedder=StubEmbedder())
+    db.create()
+    db.insert("h", [
+        _doc("a", meta_data={"x": "v"}),
+        _doc("b", meta_data={}),
+        _doc("d", meta_data={"x": None}),
+    ])
+    hits = db.search("a", limit=10, filters={"x": None})
+    assert sorted(h.content for h in hits) == ["d"]
+    # Filtering on a key no document has must match nothing, not everything.
+    assert db.search("a", limit=10, filters={"missing": None}) == []
+
+
 def test_search_list_filter_silently_ignored():
     # Match LanceDb behavior: list-of-FilterExpr filters are ignored.
     db = TurboQuantVectorDb(embedder=StubEmbedder())
@@ -625,6 +690,58 @@ def test_delete_by_metadata_uses_and_semantics():
     ])
     assert db.delete_by_metadata({"tag": "x", "src": "web"}) is True
     assert len(db._index) == 2
+
+
+def test_delete_by_metadata_empty_dict_deletes_all():
+    # Pin the documented behavior: an empty dict is a vacuous AND, so it
+    # matches — and deletes — every document. This is exact LanceDb
+    # parity (its match loop over zero conditions also matches all).
+    db = TurboQuantVectorDb(embedder=StubEmbedder())
+    db.create()
+    db.insert("h", [_doc("a"), _doc("b"), _doc("c")])
+    assert db.delete_by_metadata({}) is True
+    assert db.get_count() == 0
+
+
+def test_delete_by_metadata_none_returns_false():
+    # None is off-contract (param typed dict). LanceDb's except-all
+    # swallows the resulting AttributeError and returns False; guard
+    # explicitly instead of raising.
+    db = TurboQuantVectorDb(embedder=StubEmbedder())
+    db.create()
+    db.insert("h", [_doc("a")])
+    assert db.delete_by_metadata(None) is False
+    assert db.get_count() == 1
+
+
+def test_delete_by_name_none_is_noop():
+    # Same footgun class as delete_by_content_id(None): docs stored
+    # without a name keep it as None, so a None argument would delete
+    # every unnamed doc. Deliberate divergence from LanceDb's idiom —
+    # no-op instead.
+    db = TurboQuantVectorDb(embedder=StubEmbedder())
+    db.create()
+    db.insert("h", [_doc("a"), _doc("b")])  # no name on either
+    assert db.delete_by_name(None) is False
+    assert db.get_count() == 2
+
+
+def test_delete_by_metadata_none_value_requires_key_present():
+    # Regression test for issue #144 (delete sibling): a None-valued
+    # delete filter must delete only docs where the key is present and
+    # None — not every doc missing the key (which over-deleted the
+    # whole collection via `.get(k) == v`).
+    db = TurboQuantVectorDb(embedder=StubEmbedder())
+    db.create()
+    db.insert("h", [
+        _doc("a", meta_data={"x": "v"}),
+        _doc("b", meta_data={}),
+        _doc("d", meta_data={"x": None}),
+    ])
+    assert db.delete_by_metadata({"x": None}) is True
+    assert len(db._index) == 2  # only "d" removed
+    assert db.delete_by_metadata({"missing": None}) is False
+    assert len(db._index) == 2  # nothing else removed
 
 
 def test_delete_by_content_id():
@@ -961,6 +1078,57 @@ def test_async_upsert_replaces_by_content_hash():
     asyncio.run(runner())
 
 
+def test_async_upsert_concurrent_same_content_hash_is_last_writer_wins():
+    # Regression test for issue #146: async_upsert captured old_handles
+    # BEFORE the awaited embed, so concurrent upserts of the same
+    # content_hash all snapshotted the same pre-insert handle set and no
+    # task removed a sibling's rows — stale generations accumulated.
+    # Deterministic: the embedder suspends both tasks at an asyncio.Event
+    # gate, guaranteeing both are in flight before either inserts.
+    import asyncio
+
+    class GatedEmbedder(StubEmbedder):
+        enable_batch = True
+        gate: asyncio.Event
+
+        def get_embeddings_batch_and_usage(self, texts):
+            return [self._embed(t) for t in texts], [None] * len(texts)
+
+        async def async_get_embeddings_batch_and_usage(self, texts):
+            # Controlled suspension: park here until the test releases
+            # the gate, so both upsert tasks interleave deterministically.
+            await self.gate.wait()
+            return [self._embed(t) for t in texts], [None] * len(texts)
+
+    embedder = GatedEmbedder(DIM)
+    db = TurboQuantVectorDb(embedder=embedder)
+    db.create()
+
+    async def runner():
+        embedder.gate = asyncio.Event()
+        # Seed an existing generation so stale-generation removal is
+        # exercised too, not just sibling-batch removal.
+        db.upsert("ch", [_doc("gen 0", doc_id="d")])
+        assert db.get_count() == 1
+        t1 = asyncio.create_task(
+            db.async_upsert("ch", [Document(id="d", content="gen A")])
+        )
+        t2 = asyncio.create_task(
+            db.async_upsert("ch", [Document(id="d", content="gen B")])
+        )
+        # Let both tasks run up to the gate (both suspended mid-embed).
+        await asyncio.sleep(0)
+        embedder.gate.set()
+        await asyncio.gather(t1, t2)
+
+    asyncio.run(runner())
+    # Replace-all contract: exactly one generation survives, and it's the
+    # last writer's (t2 resumes after t1, matching sync semantics).
+    assert db.get_count() == 1
+    [survivor] = db._u64_to_doc.values()
+    assert survivor["content"] == "gen B"
+
+
 # ---- Batch embedder paths -------------------------------------------------
 
 
@@ -1024,6 +1192,21 @@ def test_update_metadata_unknown_content_id_is_noop():
     # Nothing changed on the known doc.
     docs = list(db._u64_to_doc.values())
     assert docs[0]["meta_data"] == {"k": 1}
+
+
+def test_none_content_id_does_not_match_docs_without_content_id():
+    # Secondary part of issue #169: docs stored without a content_id keep
+    # it as None, so `.get("content_id") == content_id` made
+    # delete_by_content_id(None) / update_metadata(None, ...) match every
+    # such doc. None is off-contract (param typed str) — treat it as a
+    # no-op instead of a whole-collection match.
+    db = TurboQuantVectorDb(embedder=StubEmbedder())
+    db.create()
+    db.insert("h", [_doc("a"), _doc("b")])  # no content_id on either
+    assert db.delete_by_content_id(None) is False
+    assert db.get_count() == 2
+    db.update_metadata(None, {"tag": "oops"})
+    assert all(d["meta_data"] == {} for d in db._u64_to_doc.values())
 
 
 # ---- Tier-2 field-completeness tests. Each pins behaviour around

@@ -87,7 +87,6 @@ appears under each surface it touches.
   and `avx2_post_flush_heap_update`; the dead copy's logic had drifted
   from them, so keeping it invited confusion in future kernel edits. No
   behavior change. (#134)
-
 ### turbovec — Python package
 
 #### Fixed
@@ -116,7 +115,7 @@ appears under each surface it touches.
   ambiguous-truth-value errors. `delete` / `adelete` get the same
   treatment: a multi-element numpy array of ids previously crashed on the
   `if not ids:` emptiness test. (#157)
-### Fixed
+
 
 - **LlamaIndex: `NE` / `NIN` metadata filters now match nodes missing the
   filtered key**, mirroring llama-index-core's `build_metadata_filter_fn`.
@@ -131,6 +130,31 @@ appears under each surface it touches.
   and crashed with a misleading "expected 2D embedding batch, got 1D";
   it is now materialized once up front, as `async_add` already did.
   (#157, LlamaIndex case)
+- **Haystack: `embedding_retrieval(filters={})` no longer raises
+  `FilterError`.** An empty filter dict is now treated as "no filter",
+  matching the reference `InMemoryDocumentStore` and the store's own
+  `filter_documents`. (#131)
+- **Haystack: `write_documents` no longer crashes on a `Document` whose
+  `meta` is `None`** (off-contract, but `Document(..., meta=None)` keeps
+  the `None` as-is); it is coerced to `{}`. (#139)
+- **agno: `insert()` / `upsert()` accept numpy-array embeddings** instead
+  of raising numpy's truth-value-ambiguous `ValueError`, matching
+  LanceDb's tolerance. (#135)
+- **agno: a `None`-valued metadata filter no longer matches documents
+  missing the key.** `search(filters={"k": None})` returned — and
+  `delete_by_metadata({"k": None})` deleted — the entire collection;
+  both now require the key to be present and equal, matching LanceDb. (#144)
+- **agno: concurrent `async_upsert` calls of the same `content_hash` no
+  longer retain stale generations.** The previous generation's handles
+  were captured before the awaited embed, so sibling tasks never removed
+  each other's rows; `async_upsert` now awaits only the embedding and
+  delegates to the sync `upsert` (last-writer-wins, same as sync). (#146)
+- **agno: `drop()` on a store with a persistence `path` deletes the
+  on-disk artifacts** (`index.tvim` / `docstore.json`), so a later
+  `create()` starts empty instead of resurrecting the dropped data.
+  Also, `delete_by_content_id(None)` / `update_metadata(None, ...)` are
+  now no-ops instead of matching every document stored without a
+  `content_id`. (#169)
 
 ### Docs
 
