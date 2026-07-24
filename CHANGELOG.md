@@ -91,6 +91,23 @@ appears under each surface it touches.
 
 #### Fixed
 
+- **The bindings release the GIL around compute-bound core calls.**
+  `TurboQuantIndex` / `IdMapIndex` `search`, `add` / `add_with_ids`,
+  `prepare`, `write`, and `load` previously held the GIL for their full
+  duration, stalling every other Python thread and serializing
+  concurrent searches that the core index explicitly supports. The
+  concurrency contract per index object is: reads (`search`, `prepare`,
+  `write`, `contains`, `len`) may run in parallel with each other; a
+  write (`add`, `add_with_ids`, `remove`, `swap_remove`) blocks until it
+  has the index to itself and then succeeds — the same
+  serialize-then-succeed outcome writes always had, now enforced by an
+  internal reader-writer lock instead of the GIL. Inputs borrowed from
+  numpy arrays (queries, vectors, ids, masks, allowlists) are
+  snapshotted into owned buffers before the GIL is released, so a
+  Python thread mutating an input array mid-call cannot corrupt or
+  perturb the running operation. Long calls still cannot be interrupted
+  with Ctrl-C mid-operation (signal polling is a separate concern).
+  (#121)
 - Added the `Operating System :: Microsoft :: Windows` classifier to the
   PyPI metadata — Windows x64 wheels have shipped since 0.4.3 but the OS
   classifiers listed only Linux and macOS. (#143)
