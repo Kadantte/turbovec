@@ -136,6 +136,10 @@ class TurboQuantVectorStore(BasePydanticVectorStore):
         return self._index
 
     def add(self, nodes: list[BaseNode], **_: Any) -> list[str]:
+        # Materialize once up front: the input is iterated multiple times
+        # below, so a generator / one-shot iterable would silently drain on
+        # the first pass (async_add already does this via list(nodes)).
+        nodes = list(nodes)
         if not nodes:
             return []
 
@@ -287,11 +291,17 @@ class TurboQuantVectorStore(BasePydanticVectorStore):
         here because it doesn't store nodes), turbovec keeps node text
         and metadata in a side-car so this can return populated
         ``TextNode`` objects directly.
+
+        When ``node_ids`` is given, results come back in the requested-id
+        order (matching the LangChain integration's ``get_by_ids``);
+        otherwise in storage order.
         """
-        candidates = list(self._nodes.items())
         if node_ids is not None:
-            node_id_set = set(node_ids)
-            candidates = [(nid, data) for nid, data in candidates if nid in node_id_set]
+            candidates = [
+                (nid, self._nodes[nid]) for nid in node_ids if nid in self._nodes
+            ]
+        else:
+            candidates = list(self._nodes.items())
         if filters is not None:
             candidates = [
                 (nid, data)
@@ -407,11 +417,12 @@ class TurboQuantVectorStore(BasePydanticVectorStore):
         if op == FilterOperator.IS_EMPTY:
             return value is None or value == "" or value == []
 
-        # Every other operator returns False when the key is absent — this
-        # matches the reference implementation (notably NE returns False on
-        # missing, not True).
+        # Missing key: the reference (`build_metadata_filter_fn`,
+        # `utils.py`) treats an absent value as a MATCH for the negative
+        # operators NE / NIN ("not equal to X" is trivially true when the
+        # key isn't there) and a non-match for every other operator.
         if value is None:
-            return False
+            return op in (FilterOperator.NE, FilterOperator.NIN)
 
         if op == FilterOperator.EQ:
             return value == target

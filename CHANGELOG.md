@@ -116,6 +116,21 @@ appears under each surface it touches.
   ambiguous-truth-value errors. `delete` / `adelete` get the same
   treatment: a multi-element numpy array of ids previously crashed on the
   `if not ids:` emptiness test. (#157)
+### Fixed
+
+- **LlamaIndex: `NE` / `NIN` metadata filters now match nodes missing the
+  filtered key**, mirroring llama-index-core's `build_metadata_filter_fn`.
+  Previously such nodes were silently dropped from filtered `query`,
+  `get_nodes`, and `delete_nodes` results. (#132)
+- **LlamaIndex: `get_nodes(node_ids=...)` returns nodes in requested-id
+  order** (previously storage/insertion order), consistent with the
+  LangChain integration's `get_by_ids`. The filters-only path keeps
+  storage order. (#150)
+- **LlamaIndex: `add()` accepts generators and other one-shot iterables.**
+  The input was iterated twice, so a generator drained on the first pass
+  and crashed with a misleading "expected 2D embedding batch, got 1D";
+  it is now materialized once up front, as `async_add` already did.
+  (#157, LlamaIndex case)
 
 ### Docs
 
