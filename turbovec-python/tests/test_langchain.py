@@ -781,3 +781,185 @@ def test_load_rejects_side_car_desynced_from_index(tmp_path):
 
     with pytest.raises(ValueError):
         TurboQuantVectorStore.load(tmp_path, emb)
+
+
+def test_add_texts_none_id_replaced_with_uuid(tmp_path):
+    # A None inside an explicit ids list must be replaced per-entry with a
+    # generated UUID (reference InMemoryVectorStore behavior) — never stored
+    # as None, which would round-trip through the JSON side-car as the
+    # string "null" and silently change document identity (issue #124).
+    emb = StubEmbeddings(dim=64)
+    store = TurboQuantVectorStore(embedding=emb)
+    out = store.add_texts(["a", "b"], ids=["x", None])
+    assert out[0] == "x"
+    assert isinstance(out[1], str) and out[1] != "x"
+    assert None not in store._docs
+    assert set(store._docs) == set(out)
+
+    store.dump(tmp_path)
+    reloaded = TurboQuantVectorStore.load(tmp_path, emb)
+    assert set(reloaded._docs) == set(out)
+    assert "null" not in reloaded._docs
+    assert [d.id for d in reloaded.get_by_ids(out)] == out
+
+
+def test_aadd_texts_none_id_replaced_with_uuid():
+    import asyncio
+
+    emb = StubEmbeddings(dim=64)
+    store = TurboQuantVectorStore(embedding=emb)
+    out = asyncio.run(store.aadd_texts(["a"], ids=[None]))
+    assert len(out) == 1 and isinstance(out[0], str)
+    assert None not in store._docs
+
+
+def test_add_texts_tuple_ids_returns_list():
+    # add_texts documents a list[str] return; a tuple of ids must come back
+    # as a fresh list, not the caller's tuple (issue #126).
+    emb = StubEmbeddings(dim=64)
+    store = TurboQuantVectorStore(embedding=emb)
+    out = store.add_texts(["a"], ids=("t1",))
+    assert isinstance(out, list)
+    assert out == ["t1"]
+
+
+def test_add_texts_bad_metadata_raises_named_error():
+    # A non-dict metadata entry must be rejected with an error naming the
+    # offending argument, not an opaque `dict(None)` TypeError (issue #139).
+    emb = StubEmbeddings(dim=64)
+    store = TurboQuantVectorStore(embedding=emb)
+    with pytest.raises(TypeError, match=r"metadatas\[0\].*NoneType"):
+        store.add_texts(["a"], metadatas=[None])
+    with pytest.raises(TypeError, match=r"metadatas\[1\].*str"):
+        store.add_texts(["a", "b"], metadatas=[{}, "oops"])
+
+
+def test_add_texts_bad_metadata_leaves_store_unchanged():
+    # The bad-metadata failure must happen before any mutation: previously
+    # the crash fired after index.add_with_ids, leaving docs / index /
+    # str_to_u64 desynced in memory — and dump() persisted the corruption
+    # (issue #139).
+    emb = StubEmbeddings(dim=64)
+    store = TurboQuantVectorStore.from_texts(
+        ["alpha", "beta"], emb, ids=["a", "b"], metadatas=[{"k": 1}, {"k": 2}]
+    )
+    index_len_before = len(store._index)
+    docs_before = dict(store._docs)
+    str_to_u64_before = dict(store._str_to_u64)
+    u64_to_str_before = dict(store._u64_to_str)
+    next_u64_before = store._next_u64
+    search_before = [
+        (d.id, round(s, 5)) for d, s in store.similarity_search_with_score("alpha", k=2)
+    ]
+
+    with pytest.raises(TypeError, match=r"metadatas\[0\]"):
+        store.add_texts(["gamma", "delta"], metadatas=[None, {}], ids=["c", "d"])
+
+    assert len(store._index) == index_len_before
+    assert store._docs == docs_before
+    assert store._str_to_u64 == str_to_u64_before
+    assert store._u64_to_str == u64_to_str_before
+    assert store._next_u64 == next_u64_before
+    assert [
+        (d.id, round(s, 5)) for d, s in store.similarity_search_with_score("alpha", k=2)
+    ] == search_before
+    assert [d.id for d in store.get_by_ids(["a", "b", "c", "d"])] == ["a", "b"]
+
+
+def test_aadd_texts_bad_metadata_raises_named_error():
+    import asyncio
+
+    emb = StubEmbeddings(dim=64)
+    store = TurboQuantVectorStore(embedding=emb)
+    with pytest.raises(TypeError, match=r"metadatas\[0\]"):
+        asyncio.run(store.aadd_texts(["a"], metadatas=[None]))
+    assert len(store._index) == 0
+    assert store._docs == {}
+
+
+def test_add_documents_accepts_generator():
+    # add_documents iterates its input several times; a generator must be
+    # materialized once at entry, not drained mid-way into a misleading
+    # length-mismatch error (issue #157).
+    emb = StubEmbeddings(dim=64)
+    store = TurboQuantVectorStore(embedding=emb)
+    out = store.add_documents(
+        Document(page_content=f"t{i}", id=f"id{i}") for i in range(4)
+    )
+    assert out == ["id0", "id1", "id2", "id3"]
+    assert len(store._docs) == 4
+
+
+def test_aadd_documents_accepts_generator():
+    import asyncio
+
+    emb = StubEmbeddings(dim=64)
+    store = TurboQuantVectorStore(embedding=emb)
+    out = asyncio.run(
+        store.aadd_documents(
+            Document(page_content=f"t{i}", id=f"id{i}") for i in range(3)
+        )
+    )
+    assert out == ["id0", "id1", "id2"]
+    assert len(store._docs) == 3
+
+
+def test_add_texts_accepts_generator_ids_and_metadatas():
+    # Generator ids/metadatas previously hit `len()` on an exhausted
+    # generator, raising a misleading TypeError (issue #157).
+    emb = StubEmbeddings(dim=64)
+    store = TurboQuantVectorStore(embedding=emb)
+    out = store.add_texts(
+        ["a", "b", "c"],
+        metadatas=({"n": i} for i in range(3)),
+        ids=(f"id{i}" for i in range(3)),
+    )
+    assert out == ["id0", "id1", "id2"]
+    docs = store.get_by_ids(out)
+    assert [d.metadata for d in docs] == [{"n": 0}, {"n": 1}, {"n": 2}]
+
+
+def test_from_texts_accepts_numpy_array_and_generator():
+    # `if texts:` on a numpy array raised "truth value of an array is
+    # ambiguous"; a generator input was drained by the truthiness test
+    # (issue #157). from_texts materializes and uses len()-based emptiness.
+    emb = StubEmbeddings(dim=64)
+    store = TurboQuantVectorStore.from_texts(np.array(["a", "b", "c"]), emb)
+    assert len(store._docs) == 3
+
+    store2 = TurboQuantVectorStore.from_texts((t for t in ["x", "y"]), emb)
+    assert len(store2._docs) == 2
+
+    empty = TurboQuantVectorStore.from_texts(np.array([]), emb)
+    assert len(empty._docs) == 0
+
+
+def test_afrom_texts_accepts_generator():
+    import asyncio
+
+    emb = StubEmbeddings(dim=64)
+    store = asyncio.run(
+        TurboQuantVectorStore.afrom_texts((t for t in ["x", "y"]), emb)
+    )
+    assert len(store._docs) == 2
+
+
+def test_delete_accepts_numpy_array_and_generator_ids():
+    # Sibling of the from_texts truthiness bug (issue #157): `if not ids:`
+    # on a multi-element numpy array raised the ambiguous-truth-value
+    # ValueError (single-element arrays and generators happened to work).
+    # delete now materializes once and uses len()-based emptiness.
+    emb = StubEmbeddings(dim=64)
+    store = TurboQuantVectorStore.from_texts(
+        ["a", "b", "c", "d"], emb, ids=["a", "b", "c", "d"]
+    )
+    store.delete(np.array(["a", "b"]))
+    assert sorted(store._docs) == ["c", "d"]
+    assert len(store._index) == 2
+
+    store.delete(i for i in ["c"])
+    assert sorted(store._docs) == ["d"]
+
+    # Empty array is a no-op, not a crash.
+    store.delete(np.array([]))
+    assert sorted(store._docs) == ["d"]

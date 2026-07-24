@@ -95,6 +95,27 @@ appears under each surface it touches.
 - Added the `Operating System :: Microsoft :: Windows` classifier to the
   PyPI metadata — Windows x64 wheels have shipped since 0.4.3 but the OS
   classifiers listed only Linux and macOS. (#143)
+- **LangChain: a `None` entry in an explicit `ids` list is replaced with a
+  generated UUID** at add time (matching the reference
+  `InMemoryVectorStore`), instead of being stored as `None` and silently
+  rewritten to the string `"null"` by a `dump`/`load` round-trip. (#124)
+- **LangChain: `add_texts` always returns a fresh `list[str]`** — passing
+  `ids` as a tuple previously returned the tuple unchanged. (#126)
+- **LangChain: a non-dict metadata entry (e.g. `None`) is rejected with a
+  `TypeError` naming the bad entry, before any state is touched.**
+  Previously the crash was an opaque `'NoneType' object is not iterable`
+  raised *after* the vectors had been added to the index, leaving the
+  docstore and index desynced in memory — and a subsequent `dump()`
+  persisted the corruption. (#139)
+- **LangChain: generator / one-shot-iterable inputs are materialized once
+  at each entry point** (`add_texts` / `aadd_texts` `metadatas` and `ids`,
+  `add_documents` / `aadd_documents`, `from_texts` / `afrom_texts`), and
+  `from_texts` tests emptiness via `len()` so a numpy array of texts works.
+  Previously such inputs were iterated more than once — drained on the
+  first pass — producing misleading length-mismatch / `len()` /
+  ambiguous-truth-value errors. `delete` / `adelete` get the same
+  treatment: a multi-element numpy array of ids previously crashed on the
+  `if not ids:` emptiness test. (#157)
 
 ### Docs
 
