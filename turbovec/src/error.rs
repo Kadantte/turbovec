@@ -11,6 +11,11 @@
 //! [`IdMapIndex::new`](crate::IdMapIndex::new),
 //! [`IdMapIndex::new_lazy`](crate::IdMapIndex::new_lazy)).
 //!
+//! [`FromPartsError`] is returned by the low-level validated constructor
+//! [`TurboQuantIndex::from_parts`](crate::TurboQuantIndex::from_parts),
+//! which builds an index directly from already-decoded fields and checks
+//! every structural invariant at that single chokepoint.
+//!
 //! Both are forms of user input error — wrong shape, wrong dim, wrong
 //! bit_width, or duplicate id — that callers can recover from. Internal
 //! preconditions (e.g. calling the low-level `add(&self, &[f32])` on a
@@ -132,3 +137,148 @@ impl fmt::Display for ConstructError {
 }
 
 impl Error for ConstructError {}
+
+/// Error returned by
+/// [`TurboQuantIndex::from_parts`](crate::TurboQuantIndex::from_parts) when
+/// the supplied fields violate one of the index's structural invariants.
+///
+/// `from_parts` is the single validated entry point for constructing an
+/// index directly from already-decoded bytes (the low-level API a
+/// database-storage embedder builds against — see the crate docs). Every
+/// invariant it checks maps to one variant here, so a caller passing a
+/// mismatched buffer, an out-of-range `bit_width`, or an inconsistent lazy
+/// state gets a named error instead of a panic, an out-of-bounds read, or a
+/// silently-wrong index.
+///
+/// `#[non_exhaustive]` so adding variants in future releases is not a
+/// breaking change — downstream `match` must carry a wildcard arm.
+// Eq is not derived because the value-validation variants carry an f32,
+// which is not `Eq` (NaN != NaN). PartialEq still works for the finite
+// values tests assert against.
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub enum FromPartsError {
+    /// `bit_width` must be 2, 3, or 4.
+    BitWidthOutOfRange(usize),
+
+    /// `dim` (when committed, i.e. `Some`) must be a positive multiple of 8.
+    /// The packed layout allocates `dim / 8` bytes per bit-plane, so no
+    /// other dim has a valid layout.
+    DimNotPositiveMultipleOf8(usize),
+
+    /// `dim` exceeds [`MAX_DIM`](crate::MAX_DIM). Bounds the lazily-built
+    /// `dim`×`dim` rotation matrix and the `bit_width`/`dim` codebook
+    /// allocation (guards the unbounded-allocation DoS class).
+    DimTooLarge { dim: usize, max: usize },
+
+    /// `n_vectors * dim * bit_width / 8` overflows `usize`, so no
+    /// `packed_codes` buffer of the implied length can exist. Mirrors the
+    /// loader's checked size arithmetic.
+    PackedCodesSizeOverflow {
+        n_vectors: usize,
+        dim: usize,
+        bit_width: usize,
+    },
+
+    /// `packed_codes.len()` does not equal the length implied by
+    /// `n_vectors * dim * bit_width / 8`.
+    PackedCodesLengthMismatch { expected: usize, got: usize },
+
+    /// `scales.len()` does not equal `n_vectors`.
+    ScalesLengthMismatch { expected: usize, got: usize },
+
+    /// The two TQ+ calibration arrays disagree in length
+    /// (`tqplus_shift.len() != tqplus_scale.len()`).
+    TqplusLengthMismatch { shift_len: usize, scale_len: usize },
+
+    /// A non-empty TQ+ calibration array has a length that is not `dim`.
+    TqplusLengthNotDim { got: usize, dim: usize },
+
+    /// A per-vector scale is not finite or is negative. The encoder only
+    /// ever emits finite, non-negative scales; an Inf slot would win every
+    /// top-1 and a NaN slot would vanish from all results. Mirrors the
+    /// loader's value validation, so a `from_parts`-accepted index always
+    /// survives its own `write` → `load` round-trip.
+    InvalidScaleValue { slot: usize, value: f32 },
+
+    /// A TQ+ shift coordinate is not finite. Mirrors the loader's value
+    /// validation.
+    InvalidTqplusShiftValue { coord: usize, value: f32 },
+
+    /// A TQ+ scale coordinate is not finite or is `<= 0`. Search divides
+    /// by `tqplus_scale`, so such a value silently turns every query's
+    /// scores into NaN/Inf. Mirrors the loader's value validation.
+    InvalidTqplusScaleValue { coord: usize, value: f32 },
+
+    /// Lazy (uncommitted, `dim == None`) index must have `n_vectors == 0`.
+    LazyMustHaveZeroVectors(usize),
+
+    /// Lazy index must have empty `packed_codes`.
+    LazyMustHaveEmptyPackedCodes(usize),
+
+    /// Lazy index must have empty `scales`.
+    LazyMustHaveEmptyScales(usize),
+
+    /// Lazy index must have empty TQ+ calibration arrays.
+    LazyMustHaveEmptyTqplus(usize),
+}
+
+impl fmt::Display for FromPartsError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::BitWidthOutOfRange(bw) => {
+                write!(f, "bit_width must be 2, 3, or 4, got {bw}")
+            }
+            Self::DimNotPositiveMultipleOf8(dim) => {
+                write!(f, "dim must be a positive multiple of 8, got {dim}")
+            }
+            Self::DimTooLarge { dim, max } => {
+                write!(f, "dim {dim} exceeds maximum {max}")
+            }
+            Self::PackedCodesSizeOverflow { n_vectors, dim, bit_width } => write!(
+                f,
+                "packed code size n_vectors({n_vectors}) * dim({dim}) * \
+                 bit_width({bit_width}) / 8 overflows usize",
+            ),
+            Self::PackedCodesLengthMismatch { expected, got } => write!(
+                f,
+                "packed_codes length {got} != n_vectors * dim * bit_width / 8 = {expected}",
+            ),
+            Self::ScalesLengthMismatch { expected, got } => {
+                write!(f, "scales length {got} != n_vectors {expected}")
+            }
+            Self::TqplusLengthMismatch { shift_len, scale_len } => write!(
+                f,
+                "tqplus_shift length {shift_len} != tqplus_scale length {scale_len}",
+            ),
+            Self::TqplusLengthNotDim { got, dim } => {
+                write!(f, "non-empty TQ+ calibration length {got} must equal dim {dim}")
+            }
+            Self::InvalidScaleValue { slot, value } => write!(
+                f,
+                "invalid per-vector scale at slot {slot}: {value} (must be finite and non-negative)",
+            ),
+            Self::InvalidTqplusShiftValue { coord, value } => {
+                write!(f, "invalid TQ+ shift at coord {coord}: {value} (must be finite)")
+            }
+            Self::InvalidTqplusScaleValue { coord, value } => write!(
+                f,
+                "invalid TQ+ scale at coord {coord}: {value} (must be finite and > 0)",
+            ),
+            Self::LazyMustHaveZeroVectors(n) => {
+                write!(f, "lazy (uncommitted-dim) index must have n_vectors=0, got {n}")
+            }
+            Self::LazyMustHaveEmptyPackedCodes(len) => {
+                write!(f, "lazy index must have empty packed_codes, got length {len}")
+            }
+            Self::LazyMustHaveEmptyScales(len) => {
+                write!(f, "lazy index must have empty scales, got length {len}")
+            }
+            Self::LazyMustHaveEmptyTqplus(len) => {
+                write!(f, "lazy index must have empty TQ+ calibration, got length {len}")
+            }
+        }
+    }
+}
+
+impl Error for FromPartsError {}
