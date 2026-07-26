@@ -16,6 +16,7 @@ callers that rely on ``Document.embedding`` after retrieval will see
 from __future__ import annotations
 
 import asyncio
+import copy as _copy
 import json
 import math
 import threading
@@ -906,6 +907,73 @@ class TurboQuantDocumentStore:
             )
         check_persisted_handles(store._index, store._u64_to_doc.keys(), what="document")
         return store
+
+    # ---- Copy & pickle ------------------------------------------------
+    #
+    # The Rust index is not directly picklable; it round-trips through
+    # the core's in-memory ``.tvim`` byte format
+    # (``IdMapIndex.to_bytes`` / ``from_bytes``). The per-store lock and
+    # the async executor are excluded from the state — neither can cross
+    # pickling — and recreated on restore; a restored/copied store always
+    # owns a fresh executor, even when the original wrapped a
+    # caller-provided one.
+
+    @staticmethod
+    def _snapshot_doc(data: Dict[str, Any]) -> Dict[str, Any]:
+        """Copy a per-doc payload deeply enough that no in-place store
+        mutation can reach the snapshot: ``update_by_filter`` mutates the
+        payload's ``meta`` dict in place, so sharing it would let a write
+        landing after ``__getstate__`` returns tear the pickle
+        mid-serialization."""
+        out = dict(data)
+        meta = out.get("meta")
+        if isinstance(meta, dict):
+            out["meta"] = dict(meta)
+        return out
+
+    def __getstate__(self) -> Dict[str, Any]:
+        # Snapshot under the writer lock so the index bytes and the
+        # side-car maps come from one consistent store state (the same
+        # guarantee save_to_disk() gives the on-disk pair). Everything
+        # the store mutates in place is copied (the maps, the per-doc
+        # payload dicts and their meta sub-dicts) so a write landing
+        # after this returns cannot desync — or tear — the captured pair.
+        with self._write_lock:
+            state = self.__dict__.copy()
+            del state["_write_lock"]
+            del state["executor"]
+            del state["_owns_executor"]
+            state["_index"] = self._index.to_bytes()
+            state["_str_to_u64"] = dict(self._str_to_u64)
+            state["_u64_to_doc"] = {
+                h: self._snapshot_doc(d) for h, d in self._u64_to_doc.items()
+            }
+        return state
+
+    def __setstate__(self, state: Dict[str, Any]) -> None:
+        state = dict(state)
+        index_bytes = state.pop("_index")
+        self.__dict__.update(state)
+        self._index = IdMapIndex.from_bytes(index_bytes)
+        self._write_lock = threading.RLock()
+        self._owns_executor = True
+        self.executor = ThreadPoolExecutor(
+            thread_name_prefix=f"async-turbovec-docstore-executor-{id(self)}",
+            max_workers=1,
+        )
+
+    def __deepcopy__(self, memo: Dict[int, Any]) -> "TurboQuantDocumentStore":
+        new = self.__class__.__new__(self.__class__)
+        new.__setstate__(_copy.deepcopy(self.__getstate__(), memo))
+        return new
+
+    def __copy__(self) -> "TurboQuantDocumentStore":
+        # Deliberately identical to __deepcopy__: there is no meaningful
+        # shallow copy of a store. Sharing the mutable Rust index between
+        # two store objects means every mutation of one silently mutates
+        # the other (issue #149), so ``copy.copy`` returns an independent
+        # copy instead of an alias.
+        return self.__deepcopy__({})
 
     # ---- Internals ----------------------------------------------------
 
