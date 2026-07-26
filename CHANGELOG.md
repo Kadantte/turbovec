@@ -662,6 +662,20 @@ appears under each surface it touches.
 
 ### Benchmarks
 
+- Insertion and removal speed benchmarks join the suite. (#65) For every
+  published search-speed cell (d=1536/3072 × 2-bit/4-bit × ARM/x86 ×
+  ST/MT), `benchmarks/suite/` gains `speed_insert_*` — bulk `add()` into
+  an empty index (rotation/codebook init + TQ+ calibration fit included),
+  a warm append with calibration frozen (the steady-state encode path),
+  single-vector `add()` latency, and a FAISS `IndexPQFastScan` bulk-add
+  baseline — and `speed_remove_*` — `IdMapIndex.remove(id)` per-op
+  latency and throughput against a raw `TurboQuantIndex.swap_remove`
+  baseline, isolating the id-map layer's bookkeeping. Fresh index per
+  timed run (add is cumulative, remove shrinks the index), fixed seeds,
+  median of 5, results in `benchmarks/results/` like the rest of the
+  suite. ARM (Apple M3 Max) and x86 (Intel Sapphire Rapids, c3-standard-8)
+  results are both recorded. `create_diagrams.py` gains matching figures
+  (insertion throughput ST/MT, removal latency) for both architectures.
 - `benchmarks/download_data.py` downloads to a `.tmp` sibling and renames
   into place on success, so an interrupted download no longer leaves a
   partial file at the final path that the existence guard then treats as
@@ -690,6 +704,11 @@ appears under each surface it touches.
 
 ### Docs
 
+- README gains an "Insertion & Removal Speed" section after Search Speed:
+  ARM insertion-throughput (ST/MT) and removal-latency figures generated
+  from the new `speed_insert_*` / `speed_remove_*` results, with the
+  measurement setup stated and results linked. x86 figures follow once
+  the x86 cells are run. (#65)
 - Agno integration: the "Basic usage" example called
   `Knowledge.load_text(...)`, which no longer exists in current agno
   (2.7.x) and raised `AttributeError` on copy-paste. The example now uses
