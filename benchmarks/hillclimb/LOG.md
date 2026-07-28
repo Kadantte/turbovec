@@ -13,7 +13,12 @@ Non-win streak: 0
 
 ## Baseline
 
-(recording — 15 reps both arches)
+Pinned in `benchmarks/results/hillclimb_baseline.json` (15 reps/arch, core = main
+b8328d4). Measured noise, established by interleaved old/new A/B runs during H1:
+ARM save ±20%, ARM load ±40%, x86 search bimodal (67–117 ms band under neighbor
+noise), x86 load ±30%. The 3% gate in whm.py is the *systematic* bar; apparent
+cell moves inside these bands need an interleaved A/B before they count as real
+regressions.
 
 ## Hypotheses
 
@@ -25,4 +30,12 @@ cache via `pack::seq_to_packed`, a scalar single-threaded loop — 1.7 s ARM /
 Rows are independent → rayon over block-aligned row chunks, serial below 4 MB
 (same threshold as `interleave_blocks_x86_in_place`).
 
-- Smoke: pending
+- Smoke (5 reps): insert-arm 1649→160 ms, delete-arm 1725→224; insert-x86
+  3128→569, delete-x86 3278→715. PASS.
+- Soak (15 reps): insert x10.39 (arm) / x5.02 (x86), delete x7.91 / x4.27;
+  target HM x6.77, WHM x1.53. whm.py flagged search-x86 x0.945, save-arm x0.727,
+  load-x86 x0.774, load_search-arm x0.949 — all cleared by interleaved old/new
+  A/B on both arches (no systematic difference; see noise bands above).
+- Correctness: full `cargo test -p turbovec --lib` + io_v6 + io_hardening green;
+  seq_to_packed round-trip covered by existing pack tests.
+- **Verdict: WIN** — committed.

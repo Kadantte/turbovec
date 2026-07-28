@@ -218,10 +218,44 @@ pub(crate) fn seq_to_packed(seq: &[u8], n_vectors: usize, bits: usize, dim: usiz
     let n_byte_groups = dim / codes_per_byte;
     let bytes_per_row = bits * bytes_per_plane;
     let mut packed = vec![0u8; n_vectors * bytes_per_row];
-    for vec_idx in 0..n_vectors {
+    // Rows are independent; parallelize over block-aligned row chunks so
+    // each chunk reads whole blocks of `seq`. Serial for small payloads
+    // (thread-spawn overhead dominates below ~4 MB, same threshold as
+    // `interleave_blocks_x86_in_place`).
+    const PAR_THRESHOLD: usize = 4 * 1024 * 1024;
+    const ROWS_PER_CHUNK: usize = 512 * BLOCK;
+    let unpack_rows = |first_vec: usize, rows: &mut [u8]| {
+        for (r, row) in rows.chunks_exact_mut(bytes_per_row).enumerate() {
+            unpack_row(seq, first_vec + r, row, bits, n_byte_groups, bytes_per_plane);
+        }
+    };
+    if packed.len() >= PAR_THRESHOLD {
+        use rayon::prelude::*;
+        packed
+            .par_chunks_mut(ROWS_PER_CHUNK * bytes_per_row)
+            .enumerate()
+            .for_each(|(ci, chunk)| unpack_rows(ci * ROWS_PER_CHUNK, chunk));
+    } else {
+        unpack_rows(0, &mut packed);
+    }
+    packed
+}
+
+/// Unpack one vector's bit-plane row from the sequential blocked layout —
+/// the per-row body of [`seq_to_packed`].
+#[inline]
+fn unpack_row(
+    seq: &[u8],
+    vec_idx: usize,
+    row: &mut [u8],
+    bits: usize,
+    n_byte_groups: usize,
+    bytes_per_plane: usize,
+) {
+    let codes_per_byte = 8 / bits;
+    {
         let block_idx = vec_idx / BLOCK;
         let lane = vec_idx % BLOCK;
-        let row = &mut packed[vec_idx * bytes_per_row..(vec_idx + 1) * bytes_per_row];
         for g in 0..n_byte_groups {
             let byte_val = seq[(block_idx * n_byte_groups + g) * BLOCK + lane];
             let dim_start = g * codes_per_byte;
@@ -243,7 +277,6 @@ pub(crate) fn seq_to_packed(seq: &[u8], n_vectors: usize, bits: usize, dim: usiz
             }
         }
     }
-    packed
 }
 
 /// Sequential blocked layout → the native layout the search kernel
