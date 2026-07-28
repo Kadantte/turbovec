@@ -9,7 +9,10 @@ Ops: search, save, load, insert, delete, load_search.
 - load:   IdMapIndex.load() of the seeded file
 - load_search: fresh subprocess doing load + first search (cold-path gate)
 
-Usage: python bench_ops.py --arch {arm,x86} [--reps N] [--out FILE]
+Modes: default is the multicore pool; --st pins RAYON_NUM_THREADS=1 (single-core
+cells, suffixed `<op>-<arch>_st`). Both modes matter — an MT win must not tax ST.
+
+Usage: python bench_ops.py --arch {arm,x86} [--st] [--reps N] [--out FILE]
 """
 
 import argparse
@@ -20,6 +23,9 @@ import subprocess
 import sys
 import tempfile
 import time
+
+if "--st" in sys.argv:  # must precede the extension's first pool build
+    os.environ["RAYON_NUM_THREADS"] = "1"
 
 import numpy as np
 from turbovec import IdMapIndex
@@ -55,10 +61,13 @@ def child_load_search():
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--arch", required=True, choices=["arm", "x86"])
+    ap.add_argument("--st", action="store_true",
+                    help="single-core mode (RAYON_NUM_THREADS=1)")
     ap.add_argument("--reps", type=int, default=9)
     ap.add_argument("--out")
     ap.add_argument("--child", action="store_true", help=argparse.SUPPRESS)
     args = ap.parse_args()
+    cell_arch = args.arch + ("_st" if args.st else "")
 
     if args.child:
         child_load_search()
@@ -122,16 +131,18 @@ def main():
 
     t = []
     for _ in range(args.reps):
+        cmd = [sys.executable, os.path.abspath(__file__), "--arch", args.arch,
+               "--child"]
+        if args.st:
+            cmd.append("--st")
         p = subprocess.run(
-            [sys.executable, os.path.abspath(__file__), "--arch", args.arch,
-             "--child"],
-            capture_output=True, text=True, check=True,
+            cmd, capture_output=True, text=True, check=True,
             env=os.environ.copy(),
         )
         t.append(float(p.stdout.strip()))
     r["load_search"] = median_ms(t)
 
-    cells = {f"{op}-{args.arch}": ms for op, ms in r.items()}
+    cells = {f"{op}-{cell_arch}": ms for op, ms in r.items()}
     text = json.dumps(cells, indent=2)
     print(text)
     if args.out:
