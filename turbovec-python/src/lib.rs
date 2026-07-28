@@ -333,17 +333,20 @@ impl TurboQuantIndex {
         // `add_2d` handles both eager (dim must match) and lazy (locks
         // dim on first call) cases.
         //
-        // Single-row adds take the same inline bypass as nq==1 search:
-        // every rayon bridge in a one-row encode (normalize, rotate,
-        // quantize, and the sub-chunk validation scan) has length 1 and
-        // folds on the calling thread, so skipping the pool `install`
-        // handoff cannot change results — it only removes the per-call
-        // latency. The forked-child guard mirrors `with_pool_if`.
+        // Single-row adds take the same inline bypass as nq==1 search —
+        // every rayon bridge in a one-row *encode* has length 1 and
+        // folds on the calling thread — but only when the packed rows
+        // are already materialized. The first mutation after a v6 load
+        // lazily rebuilds them from the blocked cache, a payload-sized
+        // parallel job regardless of row count, so that one call must
+        // run in the fork-safe pool. Probing under the write guard makes
+        // the check race-free.
         let n_rows = if dim == 0 { 0 } else { slice.len() / dim };
         py.detach(|| {
             let mut guard = lock_write(&self.inner);
             let inner = &mut *guard;
-            with_pool_if(n_rows > 1, || inner.add_2d(&owned, dim))
+            let pooled = n_rows > 1 || !inner.packed_ready();
+            with_pool_if(pooled, || inner.add_2d(&owned, dim))
         })?
         .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
         // Shrink before returning the buffer when it is far larger than
@@ -443,15 +446,23 @@ impl TurboQuantIndex {
     }
 
     fn write(&self, py: Python<'_>, path: &str) -> PyResult<()> {
-        py.detach(|| lock_read(&self.inner).write(path))
-            .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("{}", e)))
+        // Lock on the calling thread, never inside `with_pool` (see its
+        // invariant); the v6 write path parallelizes the layout
+        // transform, so it must run in the fork-safe pool.
+        py.detach(|| {
+            let guard = lock_read(&self.inner);
+            with_pool(|| guard.write(path))
+        })?
+        .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("{}", e)))
     }
 
     #[classmethod]
     fn load(cls: &Bound<PyType>, path: &str) -> PyResult<Self> {
+        // The v6 load parallelizes the layout transform — run it in the
+        // fork-safe pool.
         let inner = cls
             .py()
-            .detach(|| turbovec_core::TurboQuantIndex::load(path))
+            .detach(|| with_pool(|| turbovec_core::TurboQuantIndex::load(path)))?
             .map_err(|e| load_err(path, e))?;
         Ok(Self {
             inner: std::sync::RwLock::new(inner),
@@ -463,12 +474,15 @@ impl TurboQuantIndex {
     /// byte-identical to the file ``write(path)`` produces. Pairs with
     /// ``from_bytes`` for in-memory persistence (caches, databases,
     /// pickling) without a filesystem round-trip.
-    fn to_bytes<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
+    fn to_bytes<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
         // Serialize under the read lock with the GIL released (the
         // payload scales with the index size); wrap into a PyBytes
         // only once back under the GIL.
-        let buf = py.detach(|| lock_read(&self.inner).to_bytes());
-        PyBytes::new(py, &buf)
+        let buf = py.detach(|| {
+            let guard = lock_read(&self.inner);
+            with_pool(|| guard.to_bytes())
+        })?;
+        Ok(PyBytes::new(py, &buf))
     }
 
     /// Deserialize an index from ``bytes`` produced by ``to_bytes`` (or
@@ -481,7 +495,7 @@ impl TurboQuantIndex {
         let owned = extract_bytes("data", data)?;
         let inner = cls
             .py()
-            .detach(|| turbovec_core::TurboQuantIndex::from_bytes(&owned))
+            .detach(|| with_pool(|| turbovec_core::TurboQuantIndex::from_bytes(&owned)))?
             .map_err(from_bytes_err)?;
         Ok(Self {
             inner: std::sync::RwLock::new(inner),
@@ -514,22 +528,38 @@ impl TurboQuantIndex {
             // Bounds check and removal share one write guard, so a
             // concurrent writer cannot shrink the index in between.
             //
-            // No GIL detach on the uncontended path: the removal is
-            // O(1), cheaper than the detach round-trip. When another
-            // thread holds the write lock (a long bulk add), the
-            // gil-aware helper detaches before waiting so other Python
-            // threads keep running.
-            let removed = {
+            // Two paths: with the packed rows materialized (every case
+            // except the first mutation after a v6 load) the removal is
+            // O(1) and skips both the GIL detach and the pool, keeping
+            // the uncontended fast path. Otherwise the mutation lazily
+            // rebuilds the packed rows from the blocked cache — a
+            // parallel O(n·dim) job — so it detaches and runs in the
+            // fork-safe pool (lock on the calling thread, never inside
+            // `with_pool`). The probe can only go false→true, so a race
+            // merely sends a ready index down the slow path harmlessly.
+            let ready = lock_read(&self.inner).packed_ready();
+            let removed = if ready {
                 let mut inner = lock_write_gil_aware(py, &self.inner);
                 let len = inner.len();
                 if i < len {
-                    Ok(inner.swap_remove(i))
+                    Ok(Ok(inner.swap_remove(i)))
                 } else {
                     Err(len)
                 }
+            } else {
+                py.detach(|| {
+                    let mut guard = lock_write(&self.inner);
+                    let inner = &mut *guard;
+                    let len = inner.len();
+                    if i < len {
+                        Ok(with_pool(|| inner.swap_remove(i)))
+                    } else {
+                        Err(len)
+                    }
+                })
             };
             match removed {
-                Ok(moved) => return Ok(moved),
+                Ok(moved) => return moved,
                 Err(len) => {
                     return Err(pyo3::exceptions::PyIndexError::new_err(format!(
                         "index {} out of range for index of length {len}",
@@ -665,12 +695,24 @@ impl IdMapIndex {
     /// never present, so they return `False`.
     fn remove(&self, py: Python<'_>, id: &Bound<'_, PyAny>) -> PyResult<bool> {
         Ok(match extract_membership_id("id", id)? {
-            // No GIL detach on the uncontended path: the removal is O(1)
-            // (two hash-map updates and a swap), far cheaper than the
-            // detach round-trip. When another thread holds the write
-            // lock (a long bulk add), the gil-aware helper detaches
-            // before waiting so other Python threads keep running.
-            Some(v) => lock_write_gil_aware(py, &self.inner).remove(v),
+            // Fast path: packed rows materialized (every case except the
+            // first mutation after a v6 load) — O(1), no detach, no
+            // pool. Slow path: the mutation lazily rebuilds the packed
+            // rows from the blocked cache (parallel O(n·dim)), so it
+            // detaches and runs in the fork-safe pool. The probe can
+            // only go false→true, so a race merely sends a ready index
+            // down the slow path harmlessly.
+            Some(v) => {
+                if lock_read(&self.inner).packed_ready() {
+                    lock_write_gil_aware(py, &self.inner).remove(v)
+                } else {
+                    py.detach(|| {
+                        let mut guard = lock_write(&self.inner);
+                        let inner = &mut *guard;
+                        with_pool(|| inner.remove(v))
+                    })?
+                }
+            }
             None => false,
         })
     }
@@ -820,17 +862,25 @@ impl IdMapIndex {
 
     /// Serialize the index and id-map side-tables to a `.tvim` file.
     fn write(&self, py: Python<'_>, path: &str) -> PyResult<()> {
-        py.detach(|| lock_read(&self.inner).write(path))
-            .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("{}", e)))
+        // Lock on the calling thread, never inside `with_pool` (see its
+        // invariant); the v6 write path parallelizes the layout
+        // transform, so it must run in the fork-safe pool.
+        py.detach(|| {
+            let guard = lock_read(&self.inner);
+            with_pool(|| guard.write(path))
+        })?
+        .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("{}", e)))
     }
 
     /// Load an `IdMapIndex` from a `.tvim` file previously written by
     /// [`IdMapIndex.write`].
     #[classmethod]
     fn load(cls: &Bound<PyType>, path: &str) -> PyResult<Self> {
+        // The v6 load parallelizes the layout transform — run it in the
+        // fork-safe pool.
         let inner = cls
             .py()
-            .detach(|| turbovec_core::IdMapIndex::load(path))
+            .detach(|| with_pool(|| turbovec_core::IdMapIndex::load(path)))?
             .map_err(|e| load_err(path, e))?;
         Ok(Self {
             inner: std::sync::RwLock::new(inner),
@@ -842,12 +892,15 @@ impl IdMapIndex {
     /// the ``.tvim`` format — byte-identical to the file ``write(path)``
     /// produces. Pairs with ``from_bytes`` for in-memory persistence
     /// (caches, databases, pickling) without a filesystem round-trip.
-    fn to_bytes<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
+    fn to_bytes<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
         // Serialize under the read lock with the GIL released (the
         // payload scales with the index size); wrap into a PyBytes
         // only once back under the GIL.
-        let buf = py.detach(|| lock_read(&self.inner).to_bytes());
-        PyBytes::new(py, &buf)
+        let buf = py.detach(|| {
+            let guard = lock_read(&self.inner);
+            with_pool(|| guard.to_bytes())
+        })?;
+        Ok(PyBytes::new(py, &buf))
     }
 
     /// Deserialize an index from ``bytes`` produced by ``to_bytes`` (or
@@ -861,7 +914,7 @@ impl IdMapIndex {
         let owned = extract_bytes("data", data)?;
         let inner = cls
             .py()
-            .detach(|| turbovec_core::IdMapIndex::from_bytes(&owned))
+            .detach(|| with_pool(|| turbovec_core::IdMapIndex::from_bytes(&owned)))?
             .map_err(from_bytes_err)?;
         Ok(Self {
             inner: std::sync::RwLock::new(inner),
