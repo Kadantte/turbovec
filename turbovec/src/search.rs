@@ -11,6 +11,39 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use rayon::prelude::*;
+
+/// Block-count threshold above which a single unmasked query scans in
+/// parallel. Bindings use [`single_query_parallelizes`] (which wraps
+/// this) to decide when an nq=1 search must run inside the fork-safe
+/// pool instead of inline.
+pub const SINGLE_QUERY_PARALLEL_MIN_BLOCKS: usize = 256;
+
+/// Whether an nq=1 unmasked search over `n_vectors` takes the
+/// block-parallel path. The single source of truth for the gate — the
+/// core dispatch and the Python bindings' pool routing must agree, or an
+/// inline call could split parallel work outside the fork-safe pool
+/// (the #147 invariant).
+pub fn single_query_parallelizes(n_vectors: usize) -> bool {
+    n_vectors.div_ceil(crate::BLOCK) >= SINGLE_QUERY_PARALLEL_MIN_BLOCKS
+}
+
+/// Rescan a full top-k heap for its minimum. Ties on score resolve to
+/// the LARGEST index — the eviction victim among tied minima — so that
+/// sequential scans keep the lowest-index members of any tied cohort,
+/// matching the block-parallel paths' index-ascending merges. This is
+/// what makes top-k results identical across the batch, scalar, and
+/// parallel single-query paths even for bitwise-tied scores (duplicate
+/// vectors).
+#[inline(always)]
+fn rescan_min(hs: &[f32], hi: &[u64], k: usize) -> (f32, usize) {
+    let mut mi = 0usize;
+    for h in 1..k {
+        if hs[h] < hs[mi] || (hs[h] == hs[mi] && hi[h] > hi[mi]) {
+            mi = h;
+        }
+    }
+    (hs[mi], mi)
+}
 use crate::rotation::Rotation;
 use crate::{BLOCK, FLUSH_EVERY};
 
@@ -331,18 +364,16 @@ unsafe fn search_multi_query_avx2(
                         hi[*sz] = (base_vec + lane) as u64;
                         *sz += 1;
                         if *sz == k {
-                            *hmin = hs[0]; *hmi = 0;
-                            for h in 1..k {
-                                if hs[h] < *hmin { *hmin = hs[h]; *hmi = h; }
-                            }
+                            let (m, mi) = rescan_min(hs, hi, k);
+                            *hmin = m;
+                            *hmi = mi;
                         }
                     } else if score > *hmin {
                         hs[*hmi] = score;
                         hi[*hmi] = (base_vec + lane) as u64;
-                        *hmin = hs[0]; *hmi = 0;
-                        for h in 1..k {
-                            if hs[h] < *hmin { *hmin = hs[h]; *hmi = h; }
-                        }
+                        let (m, mi) = rescan_min(hs, hi, k);
+                        *hmin = m;
+                        *hmi = mi;
                     }
                 }
             } else {
@@ -363,11 +394,9 @@ unsafe fn search_multi_query_avx2(
                         if score > *hmin {
                             hs[*hmi] = score;
                             hi[*hmi] = (base_vec + lane) as u64;
-                            *hmi = 0;
-                            for h in 1..k {
-                                if hs[h] < hs[*hmi] { *hmi = h; }
-                            }
-                            *hmin = hs[*hmi];
+                            let (m, mi) = rescan_min(hs, hi, k);
+                            *hmin = m;
+                            *hmi = mi;
                         }
                     }
                 }
@@ -799,11 +828,9 @@ unsafe fn avx2_post_flush_heap_update(
                 if score > *hmin {
                     hs[*hmi] = score;
                     hi[*hmi] = (base_vec + lane) as u64;
-                    *hmi = 0;
-                    for h in 1..k {
-                        if hs[h] < hs[*hmi] { *hmi = h; }
-                    }
-                    *hmin = hs[*hmi];
+                    let (m, mi) = rescan_min(hs, hi, k);
+                    *hmin = m;
+                    *hmi = mi;
                 }
             }
         }
@@ -837,18 +864,16 @@ unsafe fn avx2_post_flush_heap_update(
                 hi[*sz] = (base_vec + lane) as u64;
                 *sz += 1;
                 if *sz == k {
-                    *hmin = hs[0]; *hmi = 0;
-                    for h in 1..k {
-                        if hs[h] < *hmin { *hmin = hs[h]; *hmi = h; }
-                    }
+                    let (m, mi) = rescan_min(hs, hi, k);
+                    *hmin = m;
+                    *hmi = mi;
                 }
             } else if score > *hmin {
                 hs[*hmi] = score;
                 hi[*hmi] = (base_vec + lane) as u64;
-                *hmin = hs[0]; *hmi = 0;
-                for h in 1..k {
-                    if hs[h] < *hmin { *hmin = hs[h]; *hmi = h; }
-                }
+                let (m, mi) = rescan_min(hs, hi, k);
+                *hmin = m;
+                *hmi = mi;
             }
         }
     } else {
@@ -869,11 +894,9 @@ unsafe fn avx2_post_flush_heap_update(
                 if score > *hmin {
                     hs[*hmi] = score;
                     hi[*hmi] = (base_vec + lane) as u64;
-                    *hmi = 0;
-                    for h in 1..k {
-                        if hs[h] < hs[*hmi] { *hmi = h; }
-                    }
-                    *hmin = hs[*hmi];
+                    let (m, mi) = rescan_min(hs, hi, k);
+                    *hmin = m;
+                    *hmi = mi;
                 }
             }
         }
@@ -1226,26 +1249,16 @@ fn score_query_into_heap(
                 heap_i[*heap_sz] = vi as u64;
                 *heap_sz += 1;
                 if *heap_sz == k {
-                    *heap_min = heap_s[0];
-                    *heap_mi = 0;
-                    for h in 1..k {
-                        if heap_s[h] < *heap_min {
-                            *heap_min = heap_s[h];
-                            *heap_mi = h;
-                        }
-                    }
+                    let (m, mi) = rescan_min(heap_s, heap_i, k);
+                    *heap_min = m;
+                    *heap_mi = mi;
                 }
             } else if score > *heap_min {
                 heap_s[*heap_mi] = score;
                 heap_i[*heap_mi] = vi as u64;
-                *heap_min = heap_s[0];
-                *heap_mi = 0;
-                for h in 1..k {
-                    if heap_s[h] < *heap_min {
-                        *heap_min = heap_s[h];
-                        *heap_mi = h;
-                    }
-                }
+                let (m, mi) = rescan_min(heap_s, heap_i, k);
+                *heap_min = m;
+                *heap_mi = mi;
             }
         }
     }
@@ -1369,8 +1382,102 @@ pub(crate) fn search(
         .collect();
 
     // Platform-specific scoring + top-k
+    // Single-query fast path (aarch64) — mirror of the x86 version: one
+    // query on a large index partitions the block range across pool
+    // workers; each range scores blocks with the single-query NEON
+    // kernel straight into a local top-k (no full scores row), then
+    // ranges merge deterministically.
+    #[cfg(target_arch = "aarch64")]
+    fn search_single_query_block_parallel_neon(
+        blocked_codes: &[u8],
+        lut: &QueryNeonLut,
+        n_byte_groups: usize,
+        vec_scales: &[f32],
+        n_vectors: usize,
+        n_blocks: usize,
+        k: usize,
+    ) -> (Vec<f32>, Vec<i64>) {
+        let n_threads = rayon::current_num_threads().max(1);
+        let blocks_per_range = (n_blocks.div_ceil(n_threads)).max(64);
+        let ranges: Vec<usize> = (0..n_blocks).step_by(blocks_per_range).collect();
+        let block_bytes = n_byte_groups * BLOCK;
+        let mut candidates: Vec<(f32, u64)> = ranges
+            .into_par_iter()
+            .flat_map(|block_start| {
+                let range_blocks = blocks_per_range.min(n_blocks - block_start);
+                let vec_start = block_start * BLOCK;
+                let range_vecs = (range_blocks * BLOCK).min(n_vectors - vec_start);
+                let codes = &blocked_codes
+                    [block_start * block_bytes..(block_start + range_blocks) * block_bytes];
+                let scales_slice = &vec_scales[vec_start..vec_start + range_vecs];
+                let mut heap: Vec<(f32, u64)> = Vec::with_capacity(k);
+                let mut heap_min = f32::NEG_INFINITY;
+                let mut heap_mi = 0usize;
+                let mut out = [0.0f32; BLOCK];
+                for b in 0..range_blocks {
+                    let base = b * BLOCK;
+                    let end = (base + BLOCK).min(range_vecs);
+                    // SAFETY: NEON is baseline on aarch64; slices are
+                    // range-relative and consistent.
+                    unsafe {
+                        score_4bit_block_neon(
+                            codes, &lut.uint8_luts, b * block_bytes, n_byte_groups,
+                            lut.scale, lut.bias, scales_slice, base, range_vecs, &mut out,
+                        );
+                    }
+                    for (lane, &s) in out[..end - base].iter().enumerate() {
+                        if heap.len() < k {
+                            heap.push((s, (base + lane) as u64));
+                            if heap.len() == k {
+                                heap_mi = 0;
+                                for (h, &(hs, hix)) in heap.iter().enumerate().skip(1) {
+                                    if hs < heap[heap_mi].0
+                                        || (hs == heap[heap_mi].0 && hix > heap[heap_mi].1)
+                                    {
+                                        heap_mi = h;
+                                    }
+                                }
+                                heap_min = heap[heap_mi].0;
+                            }
+                        } else if s > heap_min {
+                            heap[heap_mi] = (s, (base + lane) as u64);
+                            heap_mi = 0;
+                            for (h, &(hs, hix)) in heap.iter().enumerate().skip(1) {
+                                if hs < heap[heap_mi].0
+                                    || (hs == heap[heap_mi].0 && hix > heap[heap_mi].1)
+                                {
+                                    heap_mi = h;
+                                }
+                            }
+                            heap_min = heap[heap_mi].0;
+                        }
+                    }
+                }
+                heap.into_iter()
+                    .map(|(s, i)| (s, i + vec_start as u64))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        candidates.sort_unstable_by(|a, b| {
+            b.0.partial_cmp(&a.0)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.1.cmp(&b.1))
+        });
+        candidates.truncate(k);
+        (
+            candidates.iter().map(|p| p.0).collect(),
+            candidates.iter().map(|p| p.1 as i64).collect(),
+        )
+    }
+
     #[cfg(target_arch = "aarch64")]
     let results = {
+        if nq == 1 && mask.is_none() && n_blocks >= SINGLE_QUERY_PARALLEL_MIN_BLOCKS {
+            vec![search_single_query_block_parallel_neon(
+                blocked_codes, &query_luts[0], n_byte_groups, vec_scales,
+                n_vectors, n_blocks, k,
+            )]
+        } else {
         // ARM: 4-query fused scoring (shares code loads + nibble splits across queries)
         const QBS: usize = 4;
         let results: Vec<Vec<(Vec<f32>, Vec<i64>)>> = (0..nq)
@@ -1472,32 +1579,22 @@ pub(crate) fn search(
                                 heap_i[heap_sz] = i as u64;
                                 heap_sz += 1;
                                 if heap_sz == k {
-                                    heap_min = heap_s[0];
-                                    heap_mi = 0;
-                                    for h in 1..k {
-                                        if heap_s[h] < heap_min {
-                                            heap_min = heap_s[h];
-                                            heap_mi = h;
-                                        }
-                                    }
+                                    let (m, mi) = rescan_min(&heap_s, &heap_i, k);
+                                    heap_min = m;
+                                    heap_mi = mi;
                                 }
                             } else if s > heap_min {
                                 heap_s[heap_mi] = s;
                                 heap_i[heap_mi] = i as u64;
-                                heap_min = heap_s[0];
-                                heap_mi = 0;
-                                for h in 1..k {
-                                    if heap_s[h] < heap_min {
-                                        heap_min = heap_s[h];
-                                        heap_mi = h;
-                                    }
-                                }
+                                let (m, mi) = rescan_min(&heap_s, &heap_i, k);
+                                heap_min = m;
+                                heap_mi = mi;
                             }
                         }
                         let mut pairs: Vec<(f32, u64)> = heap_s[..heap_sz].iter()
                             .zip(heap_i[..heap_sz].iter())
                             .map(|(&s, &i)| (s, i)).collect();
-                        pairs.sort_unstable_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+                        pairs.sort_unstable_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal).then_with(|| a.1.cmp(&b.1)));
                         let s: Vec<f32> = pairs.iter().map(|p| p.0).collect();
                         let i: Vec<i64> = pairs.iter().map(|p| p.1 as i64).collect();
                         (s, i)
@@ -1506,10 +1603,110 @@ pub(crate) fn search(
             })
             .collect();
         results.into_iter().flatten().collect::<Vec<_>>()
+        }
     };
+
+    // Single-query fast path (x86): one query scanning a large index is
+    // memory-bandwidth-bound on one core, so partition the block range
+    // across rayon workers — each range runs the existing SIMD kernel on
+    // its sub-slices (kernels index relative to the slices they are
+    // given), producing a local top-k; ranges then merge. Masked
+    // searches keep the serial path (the bitmap is absolute-indexed).
+    #[cfg(target_arch = "x86_64")]
+    fn search_single_query_block_parallel(
+        blocked_codes: &[u8],
+        lut: &QueryNeonLut,
+        n_byte_groups: usize,
+        vec_scales: &[f32],
+        n_vectors: usize,
+        n_blocks: usize,
+        k: usize,
+        use_avx512: bool,
+    ) -> (Vec<f32>, Vec<i64>) {
+        let n_threads = rayon::current_num_threads().max(1);
+        // Whole blocks per range, at least 64 blocks (2k vectors) each.
+        let blocks_per_range = (n_blocks.div_ceil(n_threads)).max(64);
+        let ranges: Vec<usize> = (0..n_blocks).step_by(blocks_per_range).collect();
+        let block_bytes = n_byte_groups * BLOCK;
+        let mut candidates: Vec<(f32, u64)> = ranges
+            .into_par_iter()
+            .flat_map(|block_start| {
+                let range_blocks = blocks_per_range.min(n_blocks - block_start);
+                let vec_start = block_start * BLOCK;
+                let range_vecs = (range_blocks * BLOCK).min(n_vectors - vec_start);
+                let codes =
+                    &blocked_codes[block_start * block_bytes..(block_start + range_blocks) * block_bytes];
+                let scales_slice = &vec_scales[vec_start..vec_start + range_vecs];
+                let lut_refs = [lut.uint8_luts.as_slice(); 4];
+                let scale_vals = [lut.scale; 4];
+                let bias_vals = [lut.bias; 4];
+                let mut heap_scores = vec![vec![f32::NEG_INFINITY; k]];
+                let mut heap_indices = vec![vec![0u64; k]];
+                let mut heap_sizes = vec![0usize];
+                let mut heap_mins = vec![f32::NEG_INFINITY];
+                let mut heap_min_idxs = vec![0usize];
+                // SAFETY: feature presence checked by the caller once.
+                unsafe {
+                    if use_avx512 {
+                        search_multi_query_avx512bw(
+                            codes, &lut_refs, &scale_vals, &bias_vals,
+                            n_byte_groups, scales_slice, range_vecs,
+                            1, k, None,
+                            &mut heap_scores, &mut heap_indices,
+                            &mut heap_sizes, &mut heap_mins, &mut heap_min_idxs,
+                        );
+                    } else {
+                        search_multi_query_avx2(
+                            codes, &lut_refs, &scale_vals, &bias_vals,
+                            n_byte_groups, scales_slice, range_vecs,
+                            1, k, None,
+                            &mut heap_scores, &mut heap_indices,
+                            &mut heap_sizes, &mut heap_mins, &mut heap_min_idxs,
+                        );
+                    }
+                }
+                let sz = heap_sizes[0];
+                heap_scores[0][..sz]
+                    .iter()
+                    .zip(heap_indices[0][..sz].iter())
+                    .map(|(&s, &i)| (s, i + vec_start as u64))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        // Deterministic merge: score desc, index asc on ties.
+        candidates.sort_unstable_by(|a, b| {
+            b.0.partial_cmp(&a.0)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.1.cmp(&b.1))
+        });
+        candidates.truncate(k);
+        (
+            candidates.iter().map(|p| p.0).collect(),
+            candidates.iter().map(|p| p.1 as i64).collect(),
+        )
+    }
 
     #[cfg(target_arch = "x86_64")]
     let results = {
+        #[cfg(test)]
+        let force_scalar_single =
+            FORCE_SCALAR_FALLBACK.load(std::sync::atomic::Ordering::Relaxed);
+        #[cfg(not(test))]
+        let force_scalar_single = false;
+        let use_avx512 =
+            is_x86_feature_detected!("avx512bw") && is_x86_feature_detected!("avx512f");
+        let simd_ok = use_avx512 || is_x86_feature_detected!("avx2");
+        if nq == 1
+            && mask.is_none()
+            && n_blocks >= SINGLE_QUERY_PARALLEL_MIN_BLOCKS
+            && simd_ok
+            && !force_scalar_single
+        {
+            vec![search_single_query_block_parallel(
+                blocked_codes, &query_luts[0], n_byte_groups, vec_scales,
+                n_vectors, n_blocks, k, use_avx512,
+            )]
+        } else {
         const NQ_BATCH: usize = 4;
         let results: Vec<(Vec<f32>, Vec<i64>)> = (0..nq)
             .step_by(NQ_BATCH)
@@ -1604,7 +1801,7 @@ pub(crate) fn search(
                     let mut pairs: Vec<(f32, u64)> = heap_scores[qo][..sz].iter()
                         .zip(heap_indices[qo][..sz].iter())
                         .map(|(&s, &i)| (s, i)).collect();
-                    pairs.sort_unstable_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+                    pairs.sort_unstable_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal).then_with(|| a.1.cmp(&b.1)));
                     batch_results.push((
                         pairs.iter().map(|p| p.0).collect::<Vec<f32>>(),
                         pairs.iter().map(|p| p.1 as i64).collect::<Vec<i64>>(),
@@ -1614,6 +1811,7 @@ pub(crate) fn search(
             })
             .collect();
         results
+        }
     };
 
     #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
@@ -1647,7 +1845,7 @@ pub(crate) fn search(
                 );
                 let mut pairs: Vec<(f32, u64)> = heap_s[..heap_sz].iter()
                     .zip(heap_i[..heap_sz].iter()).map(|(&s, &i)| (s, i)).collect();
-                pairs.sort_unstable_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+                pairs.sort_unstable_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal).then_with(|| a.1.cmp(&b.1)));
                 (pairs.iter().map(|p| p.0).collect(), pairs.iter().map(|p| p.1 as i64).collect())
             })
             .collect();

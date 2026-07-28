@@ -57,7 +57,7 @@
 //! file" cleanly.
 
 use std::fs::File;
-use std::io::{self, BufReader, BufWriter, Read, Write};
+use std::io::{self, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
 const TV_MAGIC: &[u8; 4] = b"TVPI";
@@ -88,6 +88,15 @@ pub enum CodePayload {
     /// spares every load a ~60 ms Lloyd-Max solve and pins search to the
     /// writer's codebook rather than a recomputed one.
     BlockedSeq {
+        codes: Vec<u8>,
+        boundaries: Vec<f32>,
+        centroids: Vec<f32>,
+    },
+    /// Codes already in the *native* kernel layout for this platform —
+    /// produced by the fast path loader, whose extraction pass fuses the
+    /// platform transform into the copy. Byte-identical to `BlockedSeq`
+    /// on non-x86 (the stored layout is native there).
+    BlockedNative {
         codes: Vec<u8>,
         boundaries: Vec<f32>,
         centroids: Vec<f32>,
@@ -164,8 +173,22 @@ pub fn write_to<W: Write>(
 /// because the v5 rotation break changed every encoded byte. Files
 /// with empty TQ+ are treated as identity calibration.
 pub fn load(path: impl AsRef<Path>) -> io::Result<CoreLoad> {
-    let mut f = BufReader::new(File::open(path)?);
-    load_from(&mut f)
+    let f = File::open(path)?;
+    // The file's real length caps section preallocation: a section can
+    // pre-reserve its declared size only when the bytes provably exist,
+    // so a tiny file declaring a huge payload still cannot drive a large
+    // allocation (same posture as the capped incremental read).
+    let cap = f.metadata()?.len();
+    // Fast v6 path: sections read straight from the file — the fixed
+    // header offset lets the codes section parallel-pread directly into
+    // its final buffer (no intermediate copy), then transform in place
+    // on warm pages. v5/malformed files fall back to the generic
+    // streamed reader for canonical errors.
+    if let Some((core, _tail)) = try_load_v6_fast(&f, cap, TV_MAGIC)? {
+        return Ok(core);
+    }
+    let buf = read_file_parallel(&f, cap)?;
+    load_from_capped(&mut &buf[..], cap)
 }
 
 /// `.tv` load from any [`Read`] source — the in-memory counterpart of
@@ -173,6 +196,12 @@ pub fn load(path: impl AsRef<Path>) -> io::Result<CoreLoad> {
 /// (structural checks, value-level float validation), so a byte slice
 /// and the file it came from load — or fail — identically.
 pub fn load_from<R: Read>(f: &mut R) -> io::Result<CoreLoad> {
+    load_from_capped(f, 0)
+}
+
+/// [`load_from`] with a preallocation cap from a trusted source (the
+/// real file length for path loads; `0` = never preallocate).
+fn load_from_capped<R: Read>(f: &mut R, alloc_cap: u64) -> io::Result<CoreLoad> {
     let mut magic = [0u8; 4];
     f.read_exact(&mut magic)?;
     if &magic != TV_MAGIC {
@@ -190,7 +219,7 @@ pub fn load_from<R: Read>(f: &mut R) -> io::Result<CoreLoad> {
     }
     let mut version = [0u8; 1];
     f.read_exact(&mut version)?;
-    read_core_versioned(f, version[0], TV_VERSION, ".tv")
+    read_core_versioned(f, version[0], TV_VERSION, ".tv", alloc_cap)
 }
 
 /// Error for an index written in a pre-v5 format (versions 1 through 4).
@@ -292,8 +321,27 @@ pub fn write_id_map_to<W: Write>(
 pub fn load_id_map(
     path: impl AsRef<Path>,
 ) -> io::Result<(usize, usize, usize, CodePayload, Vec<f32>, Vec<f32>, Vec<f32>, Vec<u64>)> {
-    let mut f = BufReader::new(File::open(path)?);
-    load_id_map_from(&mut f)
+    let f = File::open(path)?;
+    // See `load` for the allocation-cap rationale.
+    let cap = f.metadata()?.len();
+    // See `load` — direct-to-destination fast v6 path.
+    if let Some((core, tail)) = try_load_v6_fast(&f, cap, TVIM_MAGIC)? {
+        let (bit_width, dim, n_vectors, codes, scales, tqplus_shift, tqplus_scale) = core;
+        let mut r = &tail[..];
+        let id_bytes = n_vectors
+            .checked_mul(8)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "id table size overflows usize"))?;
+        let raw = read_exact_vec_capped(&mut r, id_bytes, cap)?;
+        let slot_to_id: Vec<u64> = raw
+            .chunks_exact(8)
+            .map(|b| u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]))
+            .collect();
+        return Ok((
+            bit_width, dim, n_vectors, codes, scales, tqplus_shift, tqplus_scale, slot_to_id,
+        ));
+    }
+    let buf = read_file_parallel(&f, cap)?;
+    load_id_map_from_capped(&mut &buf[..], cap)
 }
 
 /// `.tvim` load from any [`Read`] source — the in-memory counterpart of
@@ -303,6 +351,16 @@ pub fn load_id_map(
 #[allow(clippy::type_complexity)]
 pub fn load_id_map_from<R: Read>(
     f: &mut R,
+) -> io::Result<(usize, usize, usize, CodePayload, Vec<f32>, Vec<f32>, Vec<f32>, Vec<u64>)> {
+    load_id_map_from_capped(f, 0)
+}
+
+/// [`load_id_map_from`] with a trusted preallocation cap (see
+/// [`load_from_capped`]).
+#[allow(clippy::type_complexity)]
+fn load_id_map_from_capped<R: Read>(
+    f: &mut R,
+    alloc_cap: u64,
 ) -> io::Result<(usize, usize, usize, CodePayload, Vec<f32>, Vec<f32>, Vec<f32>, Vec<u64>)> {
     let mut magic = [0u8; 4];
     f.read_exact(&mut magic)?;
@@ -315,7 +373,7 @@ pub fn load_id_map_from<R: Read>(
     let mut version = [0u8; 1];
     f.read_exact(&mut version)?;
     let (bit_width, dim, n_vectors, codes, scales, tqplus_shift, tqplus_scale) =
-        read_core_versioned(f, version[0], TVIM_VERSION, ".tvim")?;
+        read_core_versioned(f, version[0], TVIM_VERSION, ".tvim", alloc_cap)?;
 
     // Read the slot_to_id table via the capped reader rather than
     // `Vec::with_capacity(n_vectors)` — `n_vectors` is attacker-controlled and
@@ -323,7 +381,7 @@ pub fn load_id_map_from<R: Read>(
     let id_bytes = n_vectors
         .checked_mul(8)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "id table size overflows usize"))?;
-    let raw = read_exact_vec(f, id_bytes)?;
+    let raw = read_exact_vec_capped(f, id_bytes, alloc_cap)?;
     let slot_to_id: Vec<u64> = raw
         .chunks_exact(8)
         .map(|b| u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]))
@@ -440,9 +498,10 @@ fn read_core_versioned<R: Read>(
     version: u8,
     expected: u8,
     label: &str,
+    alloc_cap: u64,
 ) -> io::Result<CoreLoad> {
     match version {
-        6 => read_core_v6(r),
+        6 => read_core_v6(r, alloc_cap),
         5 => read_core_v5(r),
         1..=4 => Err(incompatible_version_error(version, label)),
         _ => Err(io::Error::new(
@@ -458,17 +517,35 @@ fn read_core_versioned<R: Read>(
 /// v6: identical header and trailer to v5, but the code payload is the
 /// arch-neutral sequential blocked layout (see [`CodePayload`]); its
 /// length is the padded blocked size, not the packed row size.
-fn read_core_v6<R: Read>(r: &mut R) -> io::Result<CoreLoad> {
+fn read_core_v6<R: Read>(r: &mut R, alloc_cap: u64) -> io::Result<CoreLoad> {
     let (bit_width, dim, n_vectors) = read_v5_header(r)?;
     let n_levels = 1usize << bit_width;
     let boundaries = read_f32_array(r, n_levels - 1)?;
     let centroids = read_f32_array(r, n_levels)?;
+    validate_codebook(n_vectors, &boundaries, &centroids)?;
+    let blocked_bytes = v6_blocked_len(bit_width, dim, n_vectors)?;
+    let blocked = read_exact_vec_capped(r, blocked_bytes, alloc_cap)?;
+    let scales = read_scales_validated(r, n_vectors)?;
+    let (tqplus_shift, tqplus_scale) = read_tqplus_trailer(r, dim)?;
+    Ok((
+        bit_width,
+        dim,
+        n_vectors,
+        CodePayload::BlockedSeq { codes: blocked, boundaries, centroids },
+        scales,
+        tqplus_shift,
+        tqplus_scale,
+    ))
+}
+
+/// Codebook value validation shared by the streamed and fast v6 loaders.
+fn validate_codebook(n_vectors: usize, boundaries: &[f32], centroids: &[f32]) -> io::Result<()> {
     // Codebook value validation (skipped for an empty index, whose
     // codebook is an ignored all-zero placeholder): search uses these to
     // decode every score, so a non-finite or out-of-support value would
     // silently poison results. |v| <= 1 is the quantizer's support.
     if n_vectors > 0 {
-        for (name, vals) in [("boundaries", &boundaries), ("centroids", &centroids)] {
+        for (name, vals) in [("boundaries", boundaries), ("centroids", centroids)] {
             if let Some((i, &v)) = vals
                 .iter()
                 .enumerate()
@@ -493,37 +570,25 @@ fn read_core_v6<R: Read>(r: &mut R) -> io::Result<CoreLoad> {
             ));
         }
     }
-    let blocked_bytes = if dim == 0 {
-        0
-    } else {
-        // Checked: dim/n_vectors are attacker-controlled.
-        let codes_per_byte = 8 / bit_width;
-        let n_byte_groups = dim / codes_per_byte;
-        let n_blocks = n_vectors
-            .checked_add(crate::BLOCK - 1)
-            .map(|x| x / crate::BLOCK)
-            .ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidData, "block count overflows usize")
-            })?;
-        n_blocks
-            .checked_mul(n_byte_groups)
-            .and_then(|x| x.checked_mul(crate::BLOCK))
-            .ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidData, "blocked code size overflows usize")
-            })?
-    };
-    let blocked = read_exact_vec(r, blocked_bytes)?;
-    let scales = read_scales_validated(r, n_vectors)?;
-    let (tqplus_shift, tqplus_scale) = read_tqplus_trailer(r, dim)?;
-    Ok((
-        bit_width,
-        dim,
-        n_vectors,
-        CodePayload::BlockedSeq { codes: blocked, boundaries, centroids },
-        scales,
-        tqplus_shift,
-        tqplus_scale,
-    ))
+    Ok(())
+}
+
+/// The v6 blocked-payload length for a validated header, with checked
+/// arithmetic (dim/n_vectors are attacker-controlled).
+fn v6_blocked_len(bit_width: usize, dim: usize, n_vectors: usize) -> io::Result<usize> {
+    if dim == 0 {
+        return Ok(0);
+    }
+    let codes_per_byte = 8 / bit_width;
+    let n_byte_groups = dim / codes_per_byte;
+    let n_blocks = n_vectors
+        .checked_add(crate::BLOCK - 1)
+        .map(|x| x / crate::BLOCK)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "block count overflows usize"))?;
+    n_blocks
+        .checked_mul(n_byte_groups)
+        .and_then(|x| x.checked_mul(crate::BLOCK))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "blocked code size overflows usize"))
 }
 
 /// v5: header (`bit_width` u8 + `dim` u32 + `n_vectors` u64) + codes +
@@ -702,8 +767,235 @@ fn read_scales_validated<R: Read>(r: &mut R, n_vectors: usize) -> io::Result<Vec
 /// on a `take`-limited reader grows the buffer only to the bytes actually
 /// present, so we never reserve the attacker's claimed size before confirming
 /// the data exists. The length check then rejects a truncated file cleanly.
+/// Read a whole file of known length with positioned reads across scoped
+/// threads — the generic-fallback whole-file form of
+/// [`read_range_parallel`], used when the fast v6 path declines. The
+/// buffer is allocated uninitialized and every
+/// byte is written by exactly one positioned read before `set_len`
+/// exposes it (on any error the Vec drops with len 0, so uninitialized
+/// bytes are never readable). Scoped `std::thread` (not rayon) keeps
+/// this outside the fork-safety pool machinery. Small files read
+/// serially.
+fn read_file_parallel(f: &File, len: u64) -> io::Result<Vec<u8>> {
+    read_range_parallel(f, 0, len)
+}
+
+/// Positioned parallel read of `[off, off+len)` into a fresh exact-size
+/// buffer — the offset form lets the fast v6 loader read the codes
+/// section straight into its final home (no intermediate whole-file
+/// buffer, no extraction copy).
+fn read_range_parallel(f: &File, range_off: u64, len: u64) -> io::Result<Vec<u8>> {
+    read_range_parallel_transform(f, range_off, len, None)
+}
+
+/// [`read_range_parallel`] with an optional in-place transform fused
+/// into the read: each thread reads its span in L2-sized sub-chunks
+/// (256 KB, a 32-byte-block multiple) and transforms each sub-chunk
+/// immediately, while its lines are still resident — the transform's
+/// separate cold memory pass disappears.
+fn read_range_parallel_transform(
+    f: &File,
+    range_off: u64,
+    len: u64,
+    transform: Option<fn(&mut [u8])>,
+) -> io::Result<Vec<u8>> {
+    let len_usize = usize::try_from(len)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "file too large for this platform"))?;
+    const CHUNK_MIN: usize = 8 * 1024 * 1024;
+    let n_threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+    let mut buf: Vec<u8> = Vec::with_capacity(len_usize);
+    if len_usize < 2 * CHUNK_MIN || n_threads < 2 {
+        // Positioned serial read — must honor `range_off` (a plain
+        // `take` would read from the descriptor's current position).
+        buf.resize(len_usize, 0);
+        read_exact_at(f, &mut buf, range_off)?;
+        if let Some(t) = transform {
+            t(&mut buf);
+        }
+        return Ok(buf);
+    }
+    // One even chunk per thread, one positioned read each — fewer,
+    // larger syscalls measure faster than a fine-grained work queue on
+    // both target platforms.
+    let chunk = len_usize.div_ceil(n_threads).max(CHUNK_MIN).next_multiple_of(4096);
+    let n_chunks = len_usize.div_ceil(chunk);
+    // Pointer wrapper carrying real provenance across the thread
+    // boundary (an integer round-trip would fail strict-provenance
+    // tooling like Miri).
+    #[derive(Clone, Copy)]
+    struct BasePtr(*mut u8);
+    unsafe impl Send for BasePtr {}
+    unsafe impl Sync for BasePtr {}
+    let base = BasePtr(buf.spare_capacity_mut().as_mut_ptr() as *mut u8);
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let err: std::sync::Mutex<Option<io::Error>> = std::sync::Mutex::new(None);
+    std::thread::scope(|s| {
+        for _ in 0..n_threads.min(n_chunks) {
+            s.spawn(|| {
+                // Capture the wrapper whole (2021 field-precise capture
+                // would otherwise grab the raw pointer field directly).
+                let base = base;
+                loop {
+                let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if i >= n_chunks {
+                    break;
+                }
+                let off = i * chunk;
+                let this = chunk.min(len_usize - off);
+                // SAFETY: chunks are disjoint [off, off+this) views of the
+                // allocation; each is written (never read) by exactly one
+                // thread via read_exact_at.
+                let chunk =
+                    unsafe { std::slice::from_raw_parts_mut(base.0.add(off), this) };
+                let res = match transform {
+                    None => read_exact_at(f, chunk, range_off + off as u64),
+                    Some(t) => {
+                        const SUB: usize = 256 * 1024;
+                        let mut r = Ok(());
+                        let mut sub_off = 0usize;
+                        while sub_off < chunk.len() {
+                            let sub_len = SUB.min(chunk.len() - sub_off);
+                            let sub = &mut chunk[sub_off..sub_off + sub_len];
+                            r = read_exact_at(f, sub, range_off + (off + sub_off) as u64);
+                            if r.is_err() {
+                                break;
+                            }
+                            t(sub);
+                            sub_off += sub_len;
+                        }
+                        r
+                    }
+                };
+                if let Err(e) = res {
+                    *err.lock().expect("err lock") = Some(e);
+                    break;
+                }
+                }
+            });
+        }
+    });
+    if let Some(e) = err.into_inner().expect("err lock") {
+        return Err(e);
+    }
+    // SAFETY: every byte in 0..len was filled by a successful
+    // read_exact_at (any failure returned above).
+    unsafe { buf.set_len(len_usize) };
+    Ok(buf)
+}
+
+/// Fast v6 loader: reads sections straight from the file. The prefix
+/// (magic + version + header + codebook — 142 bytes at 4-bit, bounded by
+/// PREFIX_MAX) is read serially and parsed with the same validators as
+/// the streamed reader; the codes section is then parallel-pread into
+/// its exact final buffer and transformed to the native layout in place
+/// (pages just faulted by the read, so the transform runs warm); the
+/// small tail (scales + TQ+ [+ id table]) is read serially and returned
+/// for the caller to finish. Returns `Ok(None)` for anything that is
+/// not a well-formed v6 magic+version prefix — callers fall back to the
+/// generic reader, which produces the canonical error messages.
+#[allow(clippy::type_complexity)]
+fn try_load_v6_fast(
+    f: &File,
+    cap: u64,
+    magic: &[u8; 4],
+) -> io::Result<Option<(CoreLoad, Vec<u8>)>> {
+    const PREFIX_MAX: usize = 4096;
+    let cap_usize = usize::try_from(cap)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "file too large for this platform"))?;
+    let prefix_len = cap_usize.min(PREFIX_MAX);
+    if prefix_len < 5 {
+        return Ok(None);
+    }
+    let mut prefix = vec![0u8; prefix_len];
+    read_exact_at(f, &mut prefix, 0)?;
+    if &prefix[0..4] != magic || prefix[4] != 6 {
+        return Ok(None);
+    }
+    let mut r: &[u8] = &prefix[5..];
+    let (bit_width, dim, n_vectors) = read_v5_header(&mut r)?;
+    let n_levels = 1usize << bit_width;
+    let boundaries = read_f32_array(&mut r, n_levels - 1)?;
+    let centroids = read_f32_array(&mut r, n_levels)?;
+    validate_codebook(n_vectors, &boundaries, &centroids)?;
+    let blocked_bytes = v6_blocked_len(bit_width, dim, n_vectors)?;
+    let codes_start = (prefix_len - r.len()) as u64;
+    let codes_end = codes_start
+        .checked_add(blocked_bytes as u64)
+        .filter(|&e| e <= cap)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!(
+                    "truncated file: expected {blocked_bytes} bytes, got {}",
+                    cap.saturating_sub(codes_start)
+                ),
+            )
+        })?;
+    // Native transform fused into the read at L2 granularity; identity
+    // on non-x86, where the stored layout is already native.
+    #[cfg(target_arch = "x86_64")]
+    let transform: Option<fn(&mut [u8])> = Some(crate::pack::interleave_chunk_x86);
+    #[cfg(not(target_arch = "x86_64"))]
+    let transform: Option<fn(&mut [u8])> = None;
+    let codes = read_range_parallel_transform(f, codes_start, blocked_bytes as u64, transform)?;
+    // Tail: scales + TQ+ (+ id table for .tvim) — small.
+    let tail_len = cap_usize - codes_end as usize;
+    let mut tail = vec![0u8; tail_len];
+    read_exact_at(f, &mut tail, codes_end)?;
+    let mut tr: &[u8] = &tail[..];
+    let scales = read_scales_validated(&mut tr, n_vectors)?;
+    let (tqplus_shift, tqplus_scale) = read_tqplus_trailer(&mut tr, dim)?;
+    let rest = tr.to_vec();
+    Ok(Some((
+        (
+            bit_width,
+            dim,
+            n_vectors,
+            CodePayload::BlockedNative { codes, boundaries, centroids },
+            scales,
+            tqplus_shift,
+            tqplus_scale,
+        ),
+        rest,
+    )))
+}
+
+#[cfg(unix)]
+fn read_exact_at(f: &File, buf: &mut [u8], off: u64) -> io::Result<()> {
+    use std::os::unix::fs::FileExt;
+    f.read_exact_at(buf, off)
+}
+
+#[cfg(windows)]
+fn read_exact_at(f: &File, mut buf: &mut [u8], mut off: u64) -> io::Result<()> {
+    use std::os::windows::fs::FileExt;
+    while !buf.is_empty() {
+        let n = f.seek_read(buf, off)?;
+        if n == 0 {
+            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "truncated file"));
+        }
+        buf = &mut buf[n..];
+        off += n as u64;
+    }
+    Ok(())
+}
+
 fn read_exact_vec<R: Read>(r: &mut R, n: usize) -> io::Result<Vec<u8>> {
-    let mut buf = Vec::new();
+    read_exact_vec_capped(r, n, 0)
+}
+
+/// [`read_exact_vec`] with a trusted allocation cap: when the declared
+/// section size provably fits the source (`n <= alloc_cap`, where the
+/// cap comes from real file metadata), pre-reserve it exactly — the
+/// capped `read_to_end` then fills spare capacity with no zero-fill and
+/// no growth-doubling copies. Otherwise fall back to the incremental
+/// read, which never trusts `n` for allocation.
+fn read_exact_vec_capped<R: Read>(r: &mut R, n: usize, alloc_cap: u64) -> io::Result<Vec<u8>> {
+    let mut buf = if (n as u64) <= alloc_cap {
+        Vec::with_capacity(n)
+    } else {
+        Vec::new()
+    };
     let read = r.take(n as u64).read_to_end(&mut buf)?;
     if read != n {
         return Err(io::Error::new(
