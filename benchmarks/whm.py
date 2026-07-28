@@ -5,7 +5,9 @@ Usage:
     python benchmarks/whm.py baseline.json current.json [--target OP]
 
 Both JSON files map cell name -> median ms, cells being "<op>-<arch>" for
-op in {search, save, load, insert, delete, load_search} and arch in {arm, x86}.
+op in {search, save, load, insert, delete, load_search} and arch in
+{arm, x86, arm_st, x86_st} — the _st variants run with RAYON_NUM_THREADS=1
+(both modes are first-class: an MT win must not regress ST).
 Prints per-cell speedups and the WHM; with --target, also verdicts the run:
 the target op's cells must improve and every other cell must stay within
 NOISE_TOLERANCE of baseline. Exit code 0 = win, 1 = no-win/regression.
@@ -16,7 +18,7 @@ import json
 import sys
 
 OPS = ["search", "save", "load", "insert", "delete", "load_search"]
-ARCHES = ["arm", "x86"]
+ARCHES = ["arm", "x86", "arm_st", "x86_st"]
 
 # Per-op weights in the objective. load_search is gate-only (weight 0):
 # it exists to veto load/search cost-shifting, not to double-credit wins.
