@@ -133,7 +133,15 @@ pub struct TurboQuantIndex {
     dim: Option<usize>,
     bit_width: usize,
     n_vectors: usize,
-    packed_codes: Vec<u8>,
+    /// Per-vector bit-plane packed codes — the canonical in-memory form
+    /// every mutation operates on. Materialized lazily: a v6 load seeds
+    /// only the SIMD-blocked cache (the file's layout is one cheap
+    /// transform from it), and the packed rows are reconstructed from
+    /// that cache on first need (a mutation, or serialization without a
+    /// warm cache) via `pack::native_to_seq` + `pack::seq_to_packed`.
+    /// Every other construction path sets it eagerly, so the lazy path
+    /// exists only between a v6 load and the first mutation.
+    packed_codes: OnceLock<Vec<u8>>,
     scales: Vec<f32>,
 
     /// TQ+ per-coord calibration. Both have length `dim` once the first
@@ -211,6 +219,48 @@ impl SearchResults {
 }
 
 impl TurboQuantIndex {
+    /// The packed bit-plane codes, materializing them from the blocked
+    /// cache if this index was v6-loaded and hasn't needed them yet.
+    /// O(n·dim) on that first materialization, O(1) afterwards.
+    fn packed(&self) -> &Vec<u8> {
+        self.packed_codes.get_or_init(|| {
+            let (Some(dim), Some(cache)) = (self.dim, self.blocked.get()) else {
+                // Reaching here with vectors would mean a mutation
+                // invalidated `blocked` before materializing packed —
+                // an ordering bug that would silently wipe the codes.
+                debug_assert!(
+                    self.n_vectors == 0,
+                    "packed_codes unset with no blocked cache but n_vectors > 0"
+                );
+                return Vec::new();
+            };
+            if self.n_vectors == 0 {
+                return Vec::new();
+            }
+            let seq = pack::native_to_seq(&cache.data);
+            pack::seq_to_packed(&seq, self.n_vectors, self.bit_width, dim)
+        })
+    }
+
+    /// Whether the packed bit-plane rows are materialized. `false` only
+    /// between a v6 [`Self::load`] and the first mutation or
+    /// serialization that needs them — the window where a mutation
+    /// triggers the (parallel, O(n·dim)) lazy reconstruction. Lets
+    /// bindings pick between an O(1) fast path and a pooled slow path.
+    pub fn packed_ready(&self) -> bool {
+        self.packed_codes.get().is_some()
+    }
+
+    /// Mutable access to the packed codes, materializing first (see
+    /// [`Self::packed`]). Callers that mutate must also invalidate
+    /// `blocked`, as before.
+    fn packed_mut(&mut self) -> &mut Vec<u8> {
+        self.packed();
+        self.packed_codes
+            .get_mut()
+            .expect("packed_codes just materialized")
+    }
+
     /// Construct an index with a known dimensionality. The dim is locked
     /// at construction; subsequent [`Self::add`] / [`Self::add_2d`] calls
     /// must match.
@@ -233,7 +283,7 @@ impl TurboQuantIndex {
             dim: Some(dim),
             bit_width,
             n_vectors: 0,
-            packed_codes: Vec::new(),
+            packed_codes: OnceLock::from(Vec::new()),
             scales: Vec::new(),
             tqplus_shift: Vec::new(),
             tqplus_scale: Vec::new(),
@@ -259,7 +309,7 @@ impl TurboQuantIndex {
             dim: None,
             bit_width,
             n_vectors: 0,
-            packed_codes: Vec::new(),
+            packed_codes: OnceLock::from(Vec::new()),
             scales: Vec::new(),
             tqplus_shift: Vec::new(),
             tqplus_scale: Vec::new(),
@@ -341,9 +391,16 @@ impl TurboQuantIndex {
         };
         // Take the scratch and output buffers out of self so they can be
         // borrowed mutably alongside the shared cache borrows above;
-        // encode appends the new rows directly at their tails.
+        // encode appends the new rows directly at their tails. Materialize
+        // the packed rows first (a v6-loaded index rebuilds them from the
+        // still-valid blocked cache) so encode has the existing rows to
+        // append after.
+        self.packed();
         let mut scratch = std::mem::take(&mut self.encode_scratch);
-        let mut packed_codes = std::mem::take(&mut self.packed_codes);
+        let mut packed_codes = self
+            .packed_codes
+            .take()
+            .expect("packed_codes just materialized");
         let mut scales_buf = std::mem::take(&mut self.scales);
         // Unwind guard: encode appends to the taken buffers, so a panic
         // inside it (kernel invariant assert, rayon worker panic) must
@@ -374,7 +431,7 @@ impl TurboQuantIndex {
             Err(panic) => {
                 packed_codes.truncate(packed_len_before);
                 scales_buf.truncate(scales_len_before);
-                self.packed_codes = packed_codes;
+                self.packed_codes = OnceLock::from(packed_codes);
                 self.scales = scales_buf;
                 self.encode_scratch = scratch;
                 std::panic::resume_unwind(panic);
@@ -388,7 +445,7 @@ impl TurboQuantIndex {
             scratch.shrink_to(n * dim);
         }
         self.encode_scratch = scratch;
-        self.packed_codes = packed_codes;
+        self.packed_codes = OnceLock::from(packed_codes);
         self.scales = scales_buf;
 
         if self.n_vectors == 0 {
@@ -574,7 +631,7 @@ impl TurboQuantIndex {
         });
         let blocked = self.blocked.get_or_init(|| {
             let (data, n_blocks) =
-                pack::repack(&self.packed_codes, self.n_vectors, self.bit_width, dim);
+                pack::repack(self.packed(), self.n_vectors, self.bit_width, dim);
             BlockedCache { data, n_blocks }
         });
 
@@ -654,7 +711,7 @@ impl TurboQuantIndex {
         });
         self.blocked.get_or_init(|| {
             let (data, n_blocks) =
-                pack::repack(&self.packed_codes, self.n_vectors, self.bit_width, dim);
+                pack::repack(self.packed(), self.n_vectors, self.bit_width, dim);
             BlockedCache { data, n_blocks }
         });
     }
@@ -665,16 +722,64 @@ impl TurboQuantIndex {
         // freshly-constructed lazy state. dim=0 is otherwise meaningless
         // (the constructor asserts dim % 8 == 0 with dim >= 8), so this
         // doesn't collide with any valid eager index.
+        let (boundaries, centroids) = self.codebook_for_write();
         io::write(
             path,
             self.bit_width,
             self.dim.unwrap_or(0),
             self.n_vectors,
-            &self.packed_codes,
+            &self.codes_blocked_seq(),
+            &boundaries,
+            &centroids,
             &self.scales,
             &self.tqplus_shift,
             &self.tqplus_scale,
         )
+    }
+
+    /// The v6 file payload: codes in the arch-neutral sequential blocked
+    /// layout. Cheap when the SIMD-blocked cache is warm (a per-block
+    /// nibble de-interleave on x86, a copy elsewhere); otherwise the full
+    /// O(n·dim) bit-plane repack — the same cost the pre-v6 format paid
+    /// on every load instead of once per write.
+    pub fn codes_blocked_seq(&self) -> Vec<u8> {
+        let Some(dim) = self.dim else {
+            return Vec::new();
+        };
+        if self.n_vectors == 0 {
+            return Vec::new();
+        }
+        if let Some(cache) = self.blocked.get() {
+            return pack::native_to_seq(&cache.data);
+        }
+        pack::repack_seq(self.packed(), self.n_vectors, self.bit_width, dim)
+    }
+
+    /// The codebook arrays the v6 file embeds — `(boundaries,
+    /// centroids)`: the real (cached or freshly computed) Lloyd-Max
+    /// codebook when the index has vectors, all-zero placeholders for an
+    /// empty/lazy index (ignored on load). Pairs with
+    /// [`Self::codes_blocked_seq`] for callers serializing through the
+    /// raw [`io`] writers.
+    pub fn codebook_for_write(&self) -> (Vec<f32>, Vec<f32>) {
+        let n_levels = 1usize << self.bit_width;
+        let Some(dim) = self.dim else {
+            return (vec![0.0; n_levels - 1], vec![0.0; n_levels]);
+        };
+        if self.n_vectors == 0 {
+            return (vec![0.0; n_levels - 1], vec![0.0; n_levels]);
+        }
+        // Solve once and seed both locks (mirrors `add`) — the cold
+        // from_parts → write path would otherwise run the ~60 ms
+        // Lloyd-Max solve twice.
+        if self.boundaries.get().is_none() || self.centroids.get().is_none() {
+            let (b, c) = codebook::codebook(self.bit_width, dim);
+            let _ = self.boundaries.set(b);
+            let _ = self.centroids.set(c);
+        }
+        let boundaries = self.boundaries.get().expect("boundaries just seeded");
+        let centroids = self.centroids.get().expect("centroids just seeded");
+        (boundaries.clone(), centroids.clone())
     }
 
     /// Serialize the index in the `.tv` byte format to any
@@ -684,12 +789,15 @@ impl TurboQuantIndex {
     /// Unlike [`Self::write`] there is no atomic-replace behaviour: the
     /// caller owns the sink.
     pub fn write_to_writer<W: std::io::Write>(&self, w: &mut W) -> std::io::Result<()> {
+        let (boundaries, centroids) = self.codebook_for_write();
         io::write_to(
             w,
             self.bit_width,
             self.dim.unwrap_or(0),
             self.n_vectors,
-            &self.packed_codes,
+            &self.codes_blocked_seq(),
+            &boundaries,
+            &centroids,
             &self.scales,
             &self.tqplus_shift,
             &self.tqplus_scale,
@@ -733,24 +841,75 @@ impl TurboQuantIndex {
     /// assemble an index from an io-layer core payload. The v5 rotation
     /// is deterministic and cheap to (re)build, so nothing is seeded from
     /// the load path — the cache fills lazily on first search.
-    fn from_loaded(
-        parts: (usize, usize, usize, Vec<u8>, Vec<f32>, Vec<f32>, Vec<f32>),
+    pub(crate) fn from_loaded(
+        parts: (usize, usize, usize, io::CodePayload, Vec<f32>, Vec<f32>, Vec<f32>),
     ) -> std::io::Result<Self> {
-        let (bit_width, dim, n_vectors, packed_codes, scales, tqplus_shift, tqplus_scale) = parts;
+        let (bit_width, dim, n_vectors, codes, scales, tqplus_shift, tqplus_scale) = parts;
         let dim_opt = if dim == 0 { None } else { Some(dim) };
-        // The io layer already validates the payload at the read layer, so
-        // from_parts should always succeed here; surface any residual
-        // inconsistency as InvalidData rather than panicking.
-        Self::from_parts(
-            dim_opt,
-            bit_width,
-            n_vectors,
-            packed_codes,
-            scales,
-            tqplus_shift,
-            tqplus_scale,
-        )
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))
+        match codes {
+            // v5 file: packed rows, exactly the pre-v6 load path.
+            io::CodePayload::Packed(packed_codes) => Self::from_parts(
+                dim_opt,
+                bit_width,
+                n_vectors,
+                packed_codes,
+                scales,
+                tqplus_shift,
+                tqplus_scale,
+            )
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())),
+            // v6 file: seed the search cache directly from the blocked
+            // payload (the whole point of the format — no O(n·dim)
+            // first-search repack) and leave `packed_codes` to lazy
+            // reconstruction. Validation: the io layer checked the
+            // payload length against the header geometry; scales length
+            // is checked here as from_parts would.
+            io::CodePayload::BlockedSeq { codes: seq, boundaries, centroids } => {
+                if scales.len() != n_vectors {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "scales length {} does not match n_vectors {n_vectors}",
+                            scales.len()
+                        ),
+                    ));
+                }
+                let blocked = OnceLock::new();
+                let boundaries_lock = OnceLock::new();
+                let centroids_lock = OnceLock::new();
+                if let Some(d) = dim_opt {
+                    if n_vectors > 0 {
+                        let (n_blocks, _, _) = pack::blocked_geometry(n_vectors, bit_width, d);
+                        let data = pack::seq_into_native(seq);
+                        let _ = blocked.set(BlockedCache { data, n_blocks });
+                        // Seed the codebook from the file — the second
+                        // half of skipping the first-search rebuild (the
+                        // Lloyd-Max solve is ~60 ms at dim 768).
+                        let _ = boundaries_lock.set(boundaries);
+                        let _ = centroids_lock.set(centroids);
+                    }
+                }
+                let packed_codes = if n_vectors == 0 {
+                    OnceLock::from(Vec::new())
+                } else {
+                    OnceLock::new()
+                };
+                Ok(Self {
+                    dim: dim_opt,
+                    bit_width,
+                    n_vectors,
+                    packed_codes,
+                    scales,
+                    tqplus_shift,
+                    tqplus_scale,
+                    encode_scratch: Vec::new(),
+                    rotation: OnceLock::new(),
+                    boundaries: boundaries_lock,
+                    centroids: centroids_lock,
+                    blocked,
+                })
+            }
+        }
     }
 
     /// Construct an index directly from already-decoded fields, validating
@@ -992,7 +1151,7 @@ impl TurboQuantIndex {
             dim,
             bit_width,
             n_vectors,
-            packed_codes,
+            packed_codes: OnceLock::from(packed_codes),
             scales,
             tqplus_shift,
             tqplus_scale,
@@ -1006,8 +1165,12 @@ impl TurboQuantIndex {
 
     /// Bit-plane packed codes backing this index. Pairs with
     /// [`Self::from_parts`] to round-trip an index through external storage.
+    ///
+    /// After a v6 [`Self::load`] the packed rows are reconstructed from
+    /// the loaded blocked layout on the first call (O(n·dim)); every
+    /// other path — and every subsequent call — is O(1).
     pub fn packed_codes(&self) -> &[u8] {
-        &self.packed_codes
+        self.packed()
     }
 
     /// Per-vector correction scales. Pairs with [`Self::from_parts`].
@@ -1053,16 +1216,18 @@ impl TurboQuantIndex {
 
         if idx != last {
             // Move last vector's packed bytes into slot `idx`.
+            // (`packed_mut` materializes from the still-valid blocked
+            // cache first if this index was v6-loaded.)
             let src = last * bytes_per_vec;
             let dst = idx * bytes_per_vec;
-            self.packed_codes.copy_within(src..src + bytes_per_vec, dst);
+            self.packed_mut().copy_within(src..src + bytes_per_vec, dst);
 
             // Move last norm into slot `idx`.
             self.scales[idx] = self.scales[last];
         }
 
         // Truncate both arrays.
-        self.packed_codes.truncate(last * bytes_per_vec);
+        self.packed_mut().truncate(last * bytes_per_vec);
         self.scales.truncate(last);
         self.n_vectors -= 1;
 

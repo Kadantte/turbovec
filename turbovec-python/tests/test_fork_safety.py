@@ -290,6 +290,51 @@ def _mp_fresh(q):
         q.put("err:%s: %s" % (type(e).__name__, e))
 
 
+def scenario_v6_mutate_after_fork():
+    """First mutation on a v6-loaded index in a forked child. The mutation
+    lazily materializes the packed rows from the blocked cache, which
+    parallelizes for payloads >= 4 MiB — so an un-pooled remove/swap_remove
+    binding would inject work into the parent's dead pool and hang."""
+    import tempfile
+    import turbovec
+    np = _np()
+    # >= 4 MiB blocked payload: n*DIM/2 bytes at 4-bit -> n >= 88k at DIM=96.
+    n = 90_000
+    im = turbovec.IdMapIndex(dim=DIM)
+    im.add_with_ids(make_vecs(n, 4), np.arange(n, dtype=np.uint64))
+    d = tempfile.mkdtemp()
+    p_tvim = os.path.join(d, "i.tvim")
+    p_tv = os.path.join(d, "i.tv")
+    im.write(p_tvim)
+    build_index(n, 4).write(p_tv)
+    loaded_im = turbovec.IdMapIndex.load(p_tvim)
+    loaded_tv = turbovec.TurboQuantIndex.load(p_tv)
+    loaded_tv2 = turbovec.TurboQuantIndex.load(p_tv)
+    # The module-init global-pool sentinel is what arms the hang; this
+    # nq=1 search is belt-and-suspenders warm-up only (inline path).
+    loaded_im.search(make_vecs(1, 5), k=5)
+    def _search_then_single_add():
+        # Rebuild the child's pool first (clears the in_forked_child
+        # guard), then do a single-row add: the inline bypass must still
+        # route this call through the pool, because the v6-loaded index's
+        # first mutation triggers the payload-sized parallel packed-rows
+        # rebuild regardless of row count.
+        loaded_tv2.search(make_vecs(1, 7), k=5)
+        loaded_tv2.add(make_vecs(1, 8))
+        return len(loaded_tv2)
+
+    ops = [
+        ("IdMapIndex.remove", lambda: (loaded_im.remove(3), len(loaded_im))[1]),
+        ("TurboQuantIndex.swap_remove", lambda: (loaded_tv.swap_remove(3), len(loaded_tv))[1]),
+        ("search-then-single-add", _search_then_single_add),
+    ]
+    for name, fn in ops:
+        res = run_forked(fn)
+        if res[0] != "ok":
+            return emit(False, "child op %r -> %r" % (name, res))
+    emit(True, "v6-loaded mutations survive fork")
+
+
 SCENARIOS = {
     "probe": scenario_probe,
     "correctness": scenario_correctness,
@@ -301,6 +346,7 @@ SCENARIOS = {
     "mp_fork_inherited": lambda: scenario_mp("fork", True),
     "mp_fork_fresh": lambda: scenario_mp("fork", False),
     "mp_spawn_fresh": lambda: scenario_mp("spawn", False),
+    "v6_mutate_after_fork": scenario_v6_mutate_after_fork,
 }
 
 if __name__ == "__main__":
@@ -400,6 +446,15 @@ def test_gunicorn_preload_proxy():
 
 
 @pytest.mark.skipif(not _IS_LINUX, reason="fork-safety is a Linux concern; macOS aborts a forked child after framework (Accelerate) init and defaults multiprocessing to spawn, so these fork cases only run on the Linux CI gate")
+def test_v6_loaded_mutation_in_forked_child():
+    """First mutation on a v6-loaded >=4 MiB index in a forked child — the
+    lazy packed materialization parallelizes, so the remove/swap_remove
+    bindings must route through the fork-safe pool (review blocker on the
+    v6 format PR)."""
+    _run("v6_mutate_after_fork", timeout=60)
+
+
+@pytest.mark.skipif(not _IS_LINUX, reason="fork-safety is a Linux concern; macOS aborts a forked child after framework (Accelerate) init and defaults multiprocessing to spawn, so these fork cases only run on the Linux CI gate")
 def test_child_nq1_inline_after_rebuild():
     """A child's single-query search AFTER its pool has been rebuilt takes the
     inline path again and must stay correct (review finding F5-adjacent)."""
@@ -427,7 +482,7 @@ _RAYON_CALL = re.compile(r"\.par_[a-z_]*\s*\(|\binto_par_iter\s*\(|\brayon::[a-z
 # appears in any other file, a new un-chokepointed parallel site has been
 # introduced: route it through `with_pool` and, if it legitimately belongs
 # in a new file, add that file here in the same change.
-_RAYON_ALLOWED_FILES = {"encode.rs", "search.rs", "par_copy.rs"}
+_RAYON_ALLOWED_FILES = {"encode.rs", "search.rs", "pack.rs", "par_copy.rs"}
 
 
 def _repo_root() -> pathlib.Path:
