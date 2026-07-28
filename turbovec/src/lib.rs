@@ -453,13 +453,31 @@ impl TurboQuantIndex {
             self.tqplus_scale = scale_tq;
         }
         // else: tqplus_shift/scale unchanged — locked by the first add.
+        let old_n = self.n_vectors;
         self.n_vectors += n;
 
-        // Invalidate the blocked cache — it was derived from the old
-        // `packed_codes` and no longer matches the extended vector set.
-        // Rotation, boundaries, and centroids remain valid (they only depend
-        // on `(dim, ROTATION_SEED)` and `(bit_width, dim)`).
-        self.blocked = OnceLock::new();
+        // Maintain the blocked cache incrementally instead of discarding
+        // it: appended rows only affect the (possibly partial) tail block
+        // and the new blocks after it, so recompute exactly those from
+        // the packed rows. A cold cache stays cold (first search builds
+        // it). Rotation, boundaries, and centroids remain valid (they
+        // only depend on `(dim, ROTATION_SEED)` and `(bit_width, dim)`).
+        if let Some(cache) = self.blocked.get_mut() {
+            let (new_n_blocks, n_byte_groups, _) =
+                pack::blocked_geometry(self.n_vectors, self.bit_width, dim);
+            let block_bytes = n_byte_groups * BLOCK;
+            let first_block = old_n / BLOCK;
+            cache.data.truncate(first_block * block_bytes);
+            cache.data.extend_from_slice(&pack::repack_block_range(
+                self.packed_codes.get().expect("packed materialized in add"),
+                self.n_vectors,
+                self.bit_width,
+                dim,
+                first_block,
+                new_n_blocks,
+            ));
+            cache.n_blocks = new_n_blocks;
+        }
     }
 
     /// Add `vectors` of dimension `dim`. On a lazy index this locks the
@@ -717,13 +735,27 @@ impl TurboQuantIndex {
     }
 
     pub fn write(&self, path: impl AsRef<Path>) -> std::io::Result<()> {
+        self.write_with_durability(path, io::Durability::Durable)
+    }
+
+    /// [`Self::write`] with an explicit [`io::Durability`] level:
+    /// `Durable` (the default) fsyncs before the atomic rename; `Fast`
+    /// keeps the temp-file + atomic-rename protocol (the destination can
+    /// never hold a torn index and the previous file survives a process
+    /// crash) but skips fsync, so a power loss shortly after a completed
+    /// save may lose the new file.
+    pub fn write_with_durability(
+        &self,
+        path: impl AsRef<Path>,
+        durability: io::Durability,
+    ) -> std::io::Result<()> {
         // Sentinel: dim=0 in the file header means "lazy index, dim never
         // committed". The loader interprets dim=0 + n_vectors=0 as a
         // freshly-constructed lazy state. dim=0 is otherwise meaningless
         // (the constructor asserts dim % 8 == 0 with dim >= 8), so this
         // doesn't collide with any valid eager index.
         let (boundaries, centroids) = self.codebook_for_write();
-        io::write(
+        io::write_with_durability(
             path,
             self.bit_width,
             self.dim.unwrap_or(0),
@@ -734,6 +766,7 @@ impl TurboQuantIndex {
             &self.scales,
             &self.tqplus_shift,
             &self.tqplus_scale,
+            durability,
         )
     }
 
@@ -1273,8 +1306,31 @@ impl TurboQuantIndex {
         self.scales.truncate(last);
         self.n_vectors -= 1;
 
-        // Invalidate the blocked cache since it was derived from the old layout.
-        self.blocked = OnceLock::new();
+        // Maintain the blocked cache incrementally: only the block that
+        // received the moved row and the (now shorter) tail block
+        // changed. The tail must be recomputed even though kernels mask
+        // lanes >= n_vectors, because serialization copies the cache
+        // verbatim — stale padding lanes would break byte determinism.
+        if let Some(cache) = self.blocked.get_mut() {
+            let (new_n_blocks, n_byte_groups, _) =
+                pack::blocked_geometry(self.n_vectors, self.bit_width, dim);
+            let block_bytes = n_byte_groups * BLOCK;
+            cache.data.truncate(new_n_blocks * block_bytes);
+            cache.n_blocks = new_n_blocks;
+            let packed = self.packed_codes.get().expect("packed materialized in swap_remove");
+            let mut redo = |b: usize| {
+                if b < new_n_blocks {
+                    let patch = pack::repack_block_range(
+                        packed, self.n_vectors, self.bit_width, dim, b, b + 1,
+                    );
+                    cache.data[b * block_bytes..(b + 1) * block_bytes].copy_from_slice(&patch);
+                }
+            };
+            redo(idx / BLOCK);
+            if new_n_blocks > 0 {
+                redo(new_n_blocks - 1);
+            }
+        }
 
         last
     }
