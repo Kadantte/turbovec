@@ -349,3 +349,80 @@ fn empty_index_prepare_skips_rotation_build() {
     );
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// Fast-durability writes keep the atomic protocol: byte-identical
+/// output to durable writes and no temp strays — only the fsync is
+/// skipped. (Failure-path preservation is covered by the panicking-
+/// write tests above.)
+#[test]
+fn fast_durability_write_is_atomic_and_byte_identical() {
+    use turbovec::io::Durability;
+    let dir = temp_dir("fast-durability");
+    let p_durable = dir.join("d.tv");
+    let p_fast = dir.join("f.tv");
+    let mut idx = TurboQuantIndex::new(32, 4).unwrap();
+    let v: Vec<f32> = (0..64 * 32).map(|i| (i % 97) as f32 / 97.0 - 0.5).collect();
+    idx.add(&v);
+    idx.write(&p_durable).unwrap();
+    idx.write_with_durability(&p_fast, Durability::Fast).unwrap();
+    assert_eq!(
+        std::fs::read(&p_durable).unwrap(),
+        std::fs::read(&p_fast).unwrap(),
+        "fast writes must be byte-identical to durable writes",
+    );
+    // Overwrite with fast mode; loads fine, no temp strays.
+    idx.write_with_durability(&p_fast, Durability::Fast).unwrap();
+    TurboQuantIndex::load(&p_fast).unwrap();
+    assert!(
+        dir_entries(&dir).iter().all(|n| !n.contains(".tmp.")),
+        "no temp strays after fast writes",
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The parallel-pwrite branch of the x86 path writer engages only for
+/// codes >= 8 MiB; every other test uses tiny indexes and exercises the
+/// serial fallback. This covers the branch that runs on real saves:
+/// large synthetic sections, both durability modes, byte parity with
+/// the streamed writer, and a successful load.
+#[test]
+fn large_payload_write_matches_streamed_writer_in_both_durability_modes() {
+    use turbovec::io::{self, Durability};
+    let dir = temp_dir("large-parallel-write");
+    let (bit_width, dim, n_vectors) = (4usize, 768usize, 90_000usize);
+    let blocked = {
+        let len = n_vectors.div_ceil(32) * 32 * (dim / 2);
+        let mut s = 0x00D1_CEu64;
+        (0..len)
+            .map(|_| {
+                s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                (s >> 33) as u8
+            })
+            .collect::<Vec<u8>>()
+    };
+    let cb = test_codebook(bit_width);
+    let scales = vec![1.0f32; n_vectors];
+
+    let mut streamed = Vec::new();
+    io::write_to(&mut streamed, bit_width, dim, n_vectors, &blocked, &cb.0, &cb.1, &scales, &[], &[])
+        .unwrap();
+
+    for (name, durability) in [("durable", Durability::Durable), ("fast", Durability::Fast)] {
+        let p = dir.join(format!("{name}.tv"));
+        io::write_with_durability(
+            &p, bit_width, dim, n_vectors, &blocked, &cb.0, &cb.1, &scales, &[], &[], durability,
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read(&p).unwrap(),
+            streamed,
+            "{name}: parallel path writer must be byte-identical to the streamed writer",
+        );
+        io::load(&p).unwrap();
+    }
+    assert!(
+        dir_entries(&dir).iter().all(|n| !n.contains(".tmp.")),
+        "no temp strays",
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
