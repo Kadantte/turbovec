@@ -100,14 +100,10 @@ const MAX_INPUT_MAGNITUDE: f32 = 1e16;
 ///     +Inf, `scale[i] = Inf` gets stored, slot incorrectly wins
 ///     top-k against every query.
 pub fn first_invalid_coord(values: &[f32], dim: usize) -> Option<(usize, usize, f32)> {
-    for (i, x) in values.iter().enumerate() {
-        if !x.is_finite() || x.abs() >= MAX_INPUT_MAGNITUDE {
-            let vector_index = if dim == 0 { 0 } else { i / dim };
-            let coord_index = if dim == 0 { i } else { i % dim };
-            return Some((vector_index, coord_index, *x));
-        }
-    }
-    None
+    // The parallel scan lives in encode.rs — one of the audited rayon
+    // chokepoint files (fork safety, issue #147); binding entry points
+    // reach it inside `with_pool`.
+    encode::par_first_invalid_coord(values, dim, MAX_INPUT_MAGNITUDE)
 }
 
 /// SIMD-blocked cache derived from `packed_codes`.
@@ -163,6 +159,12 @@ pub struct TurboQuantIndex {
     boundaries: OnceLock<Vec<f32>>,
     centroids: OnceLock<Vec<f32>>,
     blocked: OnceLock<BlockedCache>,
+
+    /// Reusable encode scratch (the rotated-batch buffer). Purely
+    /// derived state: never serialized, contents meaningless between
+    /// calls — kept only so repeated adds reuse one allocation instead
+    /// of paying a fresh multi-MB mmap + page-fault walk per call.
+    encode_scratch: Vec<f32>,
 }
 
 /// Top-`k` results for a batch of queries, as returned by
@@ -239,6 +241,7 @@ impl TurboQuantIndex {
             boundaries: OnceLock::new(),
             centroids: OnceLock::new(),
             blocked: OnceLock::new(),
+            encode_scratch: Vec::new(),
         })
     }
 
@@ -264,6 +267,7 @@ impl TurboQuantIndex {
             boundaries: OnceLock::new(),
             centroids: OnceLock::new(),
             blocked: OnceLock::new(),
+            encode_scratch: Vec::new(),
         })
     }
 
@@ -335,27 +339,63 @@ impl TurboQuantIndex {
         } else {
             Some((self.tqplus_shift.as_slice(), self.tqplus_scale.as_slice()))
         };
-        let (packed, scales, shift, scale_tq) = encode::encode(
-            vectors,
-            n,
-            dim,
-            rotation,
-            boundaries,
-            centroids,
-            self.bit_width,
-            existing,
-        );
+        // Take the scratch and output buffers out of self so they can be
+        // borrowed mutably alongside the shared cache borrows above;
+        // encode appends the new rows directly at their tails.
+        let mut scratch = std::mem::take(&mut self.encode_scratch);
+        let mut packed_codes = std::mem::take(&mut self.packed_codes);
+        let mut scales_buf = std::mem::take(&mut self.scales);
+        // Unwind guard: encode appends to the taken buffers, so a panic
+        // inside it (kernel invariant assert, rayon worker panic) must
+        // not leave `self` with emptied buffers while n_vectors still
+        // counts the old rows. On unwind, truncate back to the pre-call
+        // lengths (encode never touches the existing prefix) and restore
+        // the buffers before propagating.
+        let packed_len_before = packed_codes.len();
+        let scales_len_before = scales_buf.len();
+        let bit_width = self.bit_width;
+        let encode_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            encode::encode(
+                vectors,
+                n,
+                dim,
+                rotation,
+                boundaries,
+                centroids,
+                bit_width,
+                existing,
+                &mut scratch,
+                &mut packed_codes,
+                &mut scales_buf,
+            )
+        }));
+        let (shift, scale_tq) = match encode_result {
+            Ok(pair) => pair,
+            Err(panic) => {
+                packed_codes.truncate(packed_len_before);
+                scales_buf.truncate(scales_len_before);
+                self.packed_codes = packed_codes;
+                self.scales = scales_buf;
+                self.encode_scratch = scratch;
+                std::panic::resume_unwind(panic);
+            }
+        };
+        // Keep the scratch warm for same-size adds, but don't let a
+        // one-time huge bulk load pin its full rotated-batch capacity
+        // for the index lifetime: shrink when the buffer is far larger
+        // than this call needed.
+        if scratch.capacity() > 4 * n * dim {
+            scratch.shrink_to(n * dim);
+        }
+        self.encode_scratch = scratch;
+        self.packed_codes = packed_codes;
+        self.scales = scales_buf;
 
         if self.n_vectors == 0 {
-            self.packed_codes = packed;
-            self.scales = scales;
             self.tqplus_shift = shift;
             self.tqplus_scale = scale_tq;
-        } else {
-            self.packed_codes.extend_from_slice(&packed);
-            self.scales.extend_from_slice(&scales);
-            // tqplus_shift/scale unchanged — locked by the first add.
         }
+        // else: tqplus_shift/scale unchanged — locked by the first add.
         self.n_vectors += n;
 
         // Invalidate the blocked cache — it was derived from the old
@@ -960,6 +1000,7 @@ impl TurboQuantIndex {
             boundaries: OnceLock::new(),
             centroids: OnceLock::new(),
             blocked: OnceLock::new(),
+            encode_scratch: Vec::new(),
         })
     }
 
