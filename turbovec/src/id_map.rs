@@ -208,7 +208,9 @@ impl IdMapIndex {
     /// Returns
     /// [`AddError::VectorBufferNotMultipleOfDim`](crate::AddError::VectorBufferNotMultipleOfDim),
     /// [`AddError::IdsCountMismatch`](crate::AddError::IdsCountMismatch),
+    /// [`AddError::ZeroDim`](crate::AddError::ZeroDim),
     /// [`AddError::IdAlreadyPresent`](crate::AddError::IdAlreadyPresent),
+    /// [`AddError::DuplicateIdInBatch`](crate::AddError::DuplicateIdInBatch),
     /// or any error returned by
     /// [`TurboQuantIndex::add_2d`](crate::TurboQuantIndex::add_2d).
     pub fn add_with_ids_2d(
@@ -217,7 +219,10 @@ impl IdMapIndex {
         dim: usize,
         ids: &[u64],
     ) -> Result<(), AddError> {
-        if dim == 0 || vectors.len() % dim != 0 {
+        if dim == 0 {
+            return Err(AddError::ZeroDim);
+        }
+        if vectors.len() % dim != 0 {
             return Err(AddError::VectorBufferNotMultipleOfDim {
                 vectors_len: vectors.len(),
                 dim,
@@ -240,17 +245,28 @@ impl IdMapIndex {
         let deferred = self.id_to_slot.get().is_none();
         let mut seen_this_call: std::collections::HashSet<u64, IdBuildHasher> =
             std::collections::HashSet::with_capacity_and_hasher(n, IdBuildHasher::default());
+        // Split by window: in the deferred (post-load, map-unset) window
+        // presence is a binary search over the retained sorted table, so
+        // an add never forces the O(n) map build. Both windows keep
+        // main's typed distinction between an id already in the index and
+        // a duplicate within this batch.
         if deferred {
             let sorted = self.sorted_ids.get_mut().expect("sorted_ids lock poisoned");
             for &id in ids {
-                if sorted.binary_search(&id).is_ok() || !seen_this_call.insert(id) {
+                if sorted.binary_search(&id).is_ok() {
                     return Err(AddError::IdAlreadyPresent(id));
+                }
+                if !seen_this_call.insert(id) {
+                    return Err(AddError::DuplicateIdInBatch(id));
                 }
             }
         } else {
             for &id in ids {
-                if self.ids().contains_key(&id) || !seen_this_call.insert(id) {
+                if self.ids().contains_key(&id) {
                     return Err(AddError::IdAlreadyPresent(id));
+                }
+                if !seen_this_call.insert(id) {
+                    return Err(AddError::DuplicateIdInBatch(id));
                 }
             }
         }

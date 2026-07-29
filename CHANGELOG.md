@@ -268,6 +268,20 @@ appears under each surface it touches.
 
 #### Fixed
 
+- **Add-path and loader error messages now name the condition that
+  actually occurred (#329).** An id repeated inside a single
+  `add_with_ids` batch reported "id N already present in index" — false
+  on an empty index, and it sent callers hunting for a phantom prior
+  insert; it is now the new `AddError::DuplicateIdInBatch`, "duplicate
+  id N appears more than once in this batch". A zero-width batch
+  (`dim == 0`, usually an embedder returning empty embeddings) was folded
+  into "vector buffer length 0 not a multiple of dim 0" — mathematically
+  nonsense and the wrong cause — and is now the new `AddError::ZeroDim`
+  on both `TurboQuantIndex::add_2d` and `IdMapIndex::add_with_ids_2d`.
+  The pre-v5 rejection hint no longer names a version number: it pointed
+  at a release that does not exist and at a remedy the reader was already
+  running. The `.tvim` wrong-magic error now reads "not a turbovec .tvim
+  file", matching its `.tv` counterpart.
 - **A zero-row `add_2d` no longer commits a lazy index's dim (#308).**
   `add_2d` set `self.dim` before delegating to `add`, whose zero-row
   no-op guard then returned — so an empty batch permanently locked the
@@ -637,6 +651,25 @@ appears under each surface it touches.
 
 #### Fixed
 
+- **agno: a half-present save loaded silently empty and was then
+  overwritten (#328).** `create()` caught the `FileNotFoundError` that
+  `_load_from` raises for a folder holding only one of
+  `index.tvim` / `docstore.json` and built a fresh empty index instead,
+  so the next `save()` overwrote the surviving file and the data was
+  gone. Only a folder with *neither* artifact is treated as a fresh
+  path now; a partial store propagates the "missing one of ..." error.
+  The other three stores load through explicit classmethods that already
+  propagate, and are unchanged.
+
+- **`write()` errors now name the file and use `FileNotFoundError`
+  (#329).** `TurboQuantIndex.write` / `IdMapIndex.write` raised a bare
+  `OSError: No such file or directory (os error 2)` identifying no path,
+  so a batch job writing several paths could not tell which failed and
+  `except FileNotFoundError:` around a write never matched. Both now go
+  through the same path-appending helper `load` uses. Duplicate-id and
+  zero-width-batch messages from the add path are corrected with the
+  Rust-side change above, and a persisted-store corruption message no
+  longer leads with the internal "handle" vocabulary.
 - **A zero-row `add` / `add_with_ids` no longer commits a lazy index's
   dim (#308).** `TurboQuantIndex(bit_width=4)` followed by
   `idx.add(np.zeros((0, 768), np.float32))` left `idx.dim == 768`, so the
