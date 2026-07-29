@@ -91,6 +91,14 @@ pub struct IdMapIndex {
     /// duplicate-id validation happens at load via a sort instead), and
     /// eagerly on every other path.
     id_to_slot: std::sync::OnceLock<HashMap<u64, usize, IdBuildHasher>>,
+    /// Sorted copy of the load-time id table, kept ONLY while
+    /// `id_to_slot` is unset: the load already sorts the ids to validate
+    /// uniqueness, and keeping the result lets post-load adds validate
+    /// new ids by binary search instead of forcing the O(n) map build
+    /// into the add path. Cleared (and thereafter ignored) once the map
+    /// materializes — `ids_mut` is the only place the map goes live on a
+    /// loaded index.
+    sorted_ids: Vec<u64>,
 }
 
 impl IdMapIndex {
@@ -102,6 +110,7 @@ impl IdMapIndex {
             inner: TurboQuantIndex::new(dim, bit_width)?,
             slot_to_id: Vec::new(),
             id_to_slot: std::sync::OnceLock::from(HashMap::default()),
+            sorted_ids: Vec::new(),
         })
     }
 
@@ -113,6 +122,7 @@ impl IdMapIndex {
             inner: TurboQuantIndex::new_lazy(bit_width)?,
             slot_to_id: Vec::new(),
             id_to_slot: std::sync::OnceLock::from(HashMap::default()),
+            sorted_ids: Vec::new(),
         })
     }
 
@@ -130,6 +140,9 @@ impl IdMapIndex {
 
     fn ids_mut(&mut self) -> &mut HashMap<u64, usize, IdBuildHasher> {
         self.ids();
+        // The map is authoritative from here on; the load-time sorted
+        // copy is dead weight (and would go stale).
+        self.sorted_ids = Vec::new();
         self.id_to_slot.get_mut().expect("ids just materialized")
     }
 
@@ -185,11 +198,20 @@ impl IdMapIndex {
 
         // Validate all ids up-front so a partial failure is impossible.
         // Reject both ids already in the index and duplicates within
-        // this call.
+        // this call. In the post-load window (map unset) presence checks
+        // run against the load-time sorted table by binary search, so an
+        // add never forces the O(n) map build; the map stays lazy for
+        // remove/contains to build if ever needed.
+        let deferred = self.id_to_slot.get().is_none();
         let mut seen_this_call: std::collections::HashSet<u64, IdBuildHasher> =
             std::collections::HashSet::with_capacity_and_hasher(n, IdBuildHasher::default());
         for &id in ids {
-            if self.ids().contains_key(&id) || !seen_this_call.insert(id) {
+            let present = if deferred {
+                self.sorted_ids.binary_search(&id).is_ok()
+            } else {
+                self.ids().contains_key(&id)
+            };
+            if present || !seen_this_call.insert(id) {
                 return Err(AddError::IdAlreadyPresent(id));
             }
         }
@@ -203,12 +225,21 @@ impl IdMapIndex {
         let base_slot = self.inner.len();
         self.inner.add_2d(vectors, dim)?;
 
-        self.ids_mut().reserve(n);
-        self.slot_to_id.reserve(n);
-        for (i, &id) in ids.iter().enumerate() {
-            self.ids_mut().insert(id, base_slot + i);
+        if deferred {
+            // Keep the sorted table current for the next add's binary
+            // searches; the map itself stays unset (a later lazy build
+            // reads the extended slot_to_id and includes these rows).
+            self.sorted_ids.extend_from_slice(ids);
+            self.sorted_ids.sort_unstable();
+        } else {
+            self.ids_mut().reserve(n);
+            for (i, &id) in ids.iter().enumerate() {
+                self.ids_mut().insert(id, base_slot + i);
+            }
         }
+        self.slot_to_id.reserve(n);
         self.slot_to_id.extend_from_slice(ids);
+        let _ = base_slot;
 
         Ok(())
     }
@@ -492,6 +523,7 @@ impl IdMapIndex {
             inner,
             slot_to_id,
             id_to_slot: std::sync::OnceLock::new(),
+            sorted_ids: sorted,
         })
     }
 }

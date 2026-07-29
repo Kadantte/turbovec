@@ -362,4 +362,21 @@ little-endian group bytes (`build_extract_lut`, mirror of
   (x1.10). Eager-add / from_parts / cold-write paths share the win
   (strictly less work, same bytes).
 - Target HM x1.129, no cell regressing.
+- **Verdict: WIN** — committed (3882d16). Streak 0.
+
+### H21 — deferred id→slot map: adds validate by binary search post-load (target: insert)
+
+add_with_ids validated new ids via ids().contains_key — forcing the
+O(n) map build (3.7–5 ms x86, ~1 ms ARM) into the first add after a
+load. The load already sorts the whole id table for duplicate
+validation and threw the result away; it's now kept (sorted_ids) while
+the map is unset: adds validate by binary search and merge new ids into
+the sorted table, deferring the map to the first remove/contains that
+actually needs slots (which clears the sorted copy). Same errors, same
+eventual map, no observable change.
+
+- Suite green both arches; pytest 634 passed.
+- A/B insert (3 rounds each): ARM MT 4.99 → 4.55 (x1.10), ST 11.77 →
+  10.87 (x1.08); x86 MT 10.3 → 7.75 (x1.33), ST 19.2 → 17.0 (x1.13).
+- Target HM x1.152, no cell regressing.
 - **Verdict: WIN** — committed. Streak 0.
