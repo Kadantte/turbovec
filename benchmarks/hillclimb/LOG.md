@@ -405,5 +405,21 @@ exactly from the session record; all 20 test binaries green on both
 arches and bitwise parity against the ORIGINAL H10-era saved outputs
 (small + 200k index, both arches) — the reconstruction is behaviorally
 identical to what was measured, so H10's verdicts stand. Committed for
-real this time, with commit-content verification added to the loop's
-process (git show --stat before push).
+real this time (daf3e37), with commit-content verification added to the
+loop's process (git show --stat before push).
+
+### H24 — tile factor 4 (target: search)
+
+With factor 3, x86 never tiles at nq=100 (8 workers × 3 / 25 quads = 1
+range) — the 25-task/8-worker imbalance H10 fixed on ARM persisted on
+x86. Factor 4 activates 2 ranges (50 tiles); ARM's range count is
+unchanged at the bench parameters (ceil(30/25) = ceil(40/25) = 2), and
+1-thread pools still take one range.
+
+- A/B x86 (3 rounds): search MT 67.0 → 61.96 (x1.081, tight). x86 ST /
+  ARM cells unchanged by construction.
+- First real exercise of x86 sliced tiling: bitwise parity on the 200k
+  index vs the original references on BOTH arches; allowlist path
+  (untiled by design) sane.
+- Target HM x1.019, no cell regressing.
+- **Verdict: WIN** — committed. Streak 0.
