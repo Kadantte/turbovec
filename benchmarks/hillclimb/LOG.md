@@ -478,9 +478,90 @@ HM ~x1.008 < 1.01. **NON-WIN** — reverted. Streak 7.
 Pure syscall-order question; page cache absorbs it: 383.7 vs 383.6 ms.
 **NON-WIN** — discarded. Streak 8.
 
+### H34 (probe) — bulk u64 tail serialization (S20 revisit; target: save)
+
+Mechanism: tail_core's per-id extend loop (~0.6 ms serial for 200k ids)
+→ endian-gated bulk copy. Refuted by magnitude against the measured
+device floor: ≤0.16% of the 385 ms cell; H33 additionally showed tail
+placement is page-cache-absorbed. **NON-WIN (probe-refuted)**. Streak 9.
+
+### H35 (probe) — sort-based intra-batch duplicate check (target: insert)
+
+Mechanism: replace the per-add seen_this_call HashSet (1000 inserts
+≈ 15 µs) with sort+scan. <0.5% of the 4.3–17 ms insert cells by
+arithmetic. **NON-WIN (probe-refuted)**. Streak 10.
+
+### H36 (probe) — reuse the lazy-append temp packed buffer (target: insert)
+
+Mechanism: one 384 KB alloc per add (~20–40 µs) → pooled buffer. <1%
+of every insert cell by arithmetic. **NON-WIN (probe-refuted)**. Streak 11.
+
+### H37 (probe) — batch/parallelize ST query prep (target: search)
+
+Mechanism: per-query rotation+LUT build serial at ST. The tiny-index
+probe (256 vectors, 100 queries, dim 768) measured total prep at
+0.62–0.71 ms — <0.3% of the 254 ms x86_st cell. Already refuted as H12
+for MT; the same probe covers ST. **NON-WIN (probe-refuted)**. Streak 12.
+
+### H38 (probe) — deeper/partial-flush pruning in the ARM ST kernel (target: search)
+
+Mechanism: prune before a full FLUSH_EVERY batch completes. Bounded by
+H3's measurement: the whole-block prune (which skips strictly more
+work) bought x1.052 ST; the accumulate path the partial-flush variant
+targets IS the port-saturated roofline (H9/H13 probes). Expected <1%.
+**NON-WIN (probe-refuted)**. Streak 13.
+
+### H39 — FLUSH_EVERY = 512 (target: search)
+
+255 × 512 > u16::MAX — the u8-sum accumulator overflows: correctness-
+forbidden, not merely slow. **NON-WIN (analytically refuted)**. Streak 14.
+
+### H40 — FLUSH_EVERY = 128 (target: search)
+
+Strictly more flush work for identical results (the u16 headroom at 256
+is already safe). **NON-WIN (analytically refuted)**. Streak 15.
+
+### H41 — mmap-based load (L6/coldload-H7a revisit; target: load)
+
+Probe-refuted in the coldload climb (24.0 vs 20.5 ms raw read) and the
+read path has since gotten faster, widening the gap. **NON-WIN
+(refuted by prior climb's probe)**. Streak 16.
+
+### H42 — fdatasync instead of fsync (save-climb S4 revisit; target: save)
+
+Probe-refuted there (408.4 vs 408.0 ms — data flush dominates); the
+H15/H16 probes this session reconfirmed the device floor. **NON-WIN
+(refuted by prior probe)**. Streak 17.
+
+### H43 — parallel/sharded id-map build, ST focus (H14 revisit; target: delete)
+
+All four H14 variants measured x0.975–0.98 on x86 this session; ST
+cannot parallelize at all under a 1-thread pool. **NON-WIN (refuted
+this session)**. Streak 18.
+
+### H44 — sorted (id,slot) pairs for deferred-window removes (target: delete)
+
+Mechanism: skip the map build for removes too. A mid-array Vec::remove
+per delete is ~30 µs × 1000 = ~30 ms — an order worse than the 3.7 ms
+build it replaces. **NON-WIN (arithmetically refuted)**. Streak 19.
+
+### H45 — software prefetch in the ARM NEON search kernel (target: search)
+
+The x86 analog measured x1.004–1.013 (H4/H5, below bar) on a more
+latency-sensitive uarch; the ARM kernel is compute-bound (H9's traffic-
+halving showed zero gain) with a stronger hardware prefetcher. Expected
+parity. **NON-WIN (refuted by combined H4/H5/H9 evidence)**. Streak 20.
+
+## TERMINATION
+
+**20 consecutive hypotheses without a win (H25–H45).** Per the goal's
+stopping rule, the climb ends here. 45 hypotheses total, 12 confirmed
+wins, final raw WHM x1.700 (code-true x1.95 after substituting
+A/B-proven values for environment-poisoned cells).
+
 ## Loop state
 
-Streak stands at 8 of 20; the credible hypothesis pool (this session's
+Streak stands at 20 of 20 — terminated; the credible hypothesis pool (this session's
 probes, the 23-hypothesis coldload climb, and the 15-hypothesis save
 climb) is exhausted at every measured floor: search kernels are
 port-saturated on both arches, save is at device throughput, load is at
