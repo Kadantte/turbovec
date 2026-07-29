@@ -180,4 +180,37 @@ uncontended fast path.
   target HM x387.9. WHM x1.754.
 - Flags: same cell list as H6/H7 soaks, all inside the same-code spreads
   those A/Bs established; diff is one binding method none of them call.
-- **Verdict: WIN** — committed.
+- **Verdict: WIN** — committed (f20df40).
+
+### H9 — 8-query code passes in ARM batch search (target: search)
+
+Two 4-query kernels back-to-back per block to halve DRAM passes (the
+bandwidth-bound hypothesis). A/B (3 rounds): MT 23.1 → 23.7 (slightly
+worse — fewer, more ragged tasks), ST parity. ARM MT batch search is
+compute-bound, not bandwidth-bound; the imbalance cost outweighed the
+traffic saving.
+- **Verdict: NON-WIN** — discarded (reverted). Streak 1. Diagnostic
+  value: points at schedule imbalance, not traffic → H10.
+
+### H10 — 2D (query-quad × block-range) tile parallelism (target: search)
+
+1D quad partitioning gives ~nq/4 ragged tasks; the tail round idles most
+of the pool. Both batch paths (ARM + x86) now tile over quad × block-range
+(ranges ≥1024 blocks; per-tile candidates merge score-desc/index-asc —
+the same deterministic merge the single-query parallel path uses, so
+results are identical). Gates: 1-thread pools, masked searches (absolute-
+indexed bitmap), and the scalar x86 fallback keep exactly one range —
+bit-identical behavior to before. x86 tiles reuse the slice+remap
+machinery from search_single_query_block_parallel.
+
+- Correctness: full suite green both arches; bitwise parity on the small
+  index AND the 200k index (tiling active, 2 ranges) on both arches.
+- A/B ARM (3 rounds): MT 23.20 → 20.72 (x1.12, consistent); ST parity by
+  construction (single range).
+- A/B x86: the box entered its bimodal noisy state (samples 67-144 ms
+  regardless of core); 9 paired samples read h10 ≥ h8 in 7 (medians
+  107.6 vs 110.3, good-state pairs 71.6→67.1) — parity-or-better, no
+  regression signal. ST parity.
+- Target HM ≈ x1.03 (ARM MT x1.12, others ~1.0), no target cell
+  regressing.
+- **Verdict: WIN** — committed. Streak resets to 0.
