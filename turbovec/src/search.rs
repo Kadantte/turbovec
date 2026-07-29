@@ -1545,13 +1545,41 @@ pub(crate) fn search(
                 n_vectors, n_blocks, k,
             )]
         } else {
-        // ARM: 4-query fused scoring (shares code loads + nibble splits across queries)
+        // ARM: 4-query fused scoring (shares code loads + nibble splits
+        // across queries), parallelized over 2D (query-quad × block-range)
+        // tiles. 1D quad partitioning gives ~nq/4 ragged tasks; with ~8-10
+        // workers the tail round idles much of the pool. Splitting the
+        // block axis smooths the schedule. Each tile's per-query top-k
+        // candidates merge with the same (score desc, index asc) order the
+        // single-query block-parallel path uses, so results are identical
+        // to a serial scan. A 1-thread pool gets exactly one range —
+        // identical work and visit order to the serial scan.
         const QBS: usize = 4;
-        let results: Vec<Vec<(Vec<f32>, Vec<i64>)>> = (0..nq)
+        const MIN_TILE_BLOCKS: usize = 1024;
+        let n_quads = nq.div_ceil(QBS);
+        let n_threads = rayon::current_num_threads().max(1);
+        let n_ranges = if n_threads == 1 {
+            1
+        } else {
+            (n_threads * 3)
+                .div_ceil(n_quads)
+                .min(n_blocks.div_ceil(MIN_TILE_BLOCKS))
+                .max(1)
+        };
+        let blocks_per_range = n_blocks.div_ceil(n_ranges).max(1);
+        let tiles: Vec<(usize, usize)> = (0..nq)
             .step_by(QBS)
-            .collect::<Vec<_>>()
+            .flat_map(|q| {
+                (0..n_blocks.max(1))
+                    .step_by(blocks_per_range)
+                    .map(move |b| (q, b))
+            })
+            .collect();
+
+        let tile_results: Vec<(usize, Vec<Vec<(f32, u64)>>)> = tiles
             .into_par_iter()
-            .map(|qi_start| {
+            .map(|(qi_start, block_start)| {
+                let block_end = (block_start + blocks_per_range).min(n_blocks);
                 let qi_end = (qi_start + QBS).min(nq);
                 let batch_size = qi_end - qi_start;
 
@@ -1586,7 +1614,7 @@ pub(crate) fn search(
                         query_luts[qi_start + 3].bias,
                     ];
                     let mut block_out = [[0.0f32; BLOCK]; QBS];
-                    for block_idx in 0..n_blocks {
+                    for block_idx in block_start..block_end {
                         let base_vec = block_idx * BLOCK;
                         if !block_has_allowed(mask, base_vec) {
                             // No allowed slot in the block: skipping it inserts
@@ -1616,7 +1644,7 @@ pub(crate) fn search(
                     for qi_off in 0..batch_size {
                         let qi = qi_start + qi_off;
                         let qlut = &query_luts[qi];
-                        for block_idx in 0..n_blocks {
+                        for block_idx in block_start..block_end {
                             let base_vec = block_idx * BLOCK;
                             if !block_has_allowed(mask, base_vec) {
                                 continue;
@@ -1640,22 +1668,45 @@ pub(crate) fn search(
                     }
                 }
 
-                // Sort each query's heap into descending-score order.
-                (0..batch_size)
+                // Hand back each query's raw candidates; the merge below
+                // sorts across ranges.
+                let cands: Vec<Vec<(f32, u64)>> = (0..batch_size)
                     .map(|qi_off| {
                         let sz = heap_sz[qi_off];
-                        let mut pairs: Vec<(f32, u64)> = heap_s[qi_off][..sz].iter()
+                        heap_s[qi_off][..sz]
+                            .iter()
                             .zip(heap_i[qi_off][..sz].iter())
-                            .map(|(&s, &i)| (s, i)).collect();
-                        pairs.sort_unstable_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal).then_with(|| a.1.cmp(&b.1)));
-                        let s: Vec<f32> = pairs.iter().map(|p| p.0).collect();
-                        let i: Vec<i64> = pairs.iter().map(|p| p.1 as i64).collect();
-                        (s, i)
+                            .map(|(&s, &i)| (s, i))
+                            .collect()
                     })
-                    .collect()
+                    .collect();
+                (qi_start, cands)
             })
             .collect();
-        results.into_iter().flatten().collect::<Vec<_>>()
+
+        // Merge each query's per-range candidates: (score desc, index asc),
+        // truncate to k — the same deterministic order the heaps maintain,
+        // so tiled and serial results are identical even for tied scores.
+        let mut merged: Vec<Vec<(f32, u64)>> = vec![Vec::new(); nq];
+        for (qi_start, cands) in tile_results {
+            for (off, c) in cands.into_iter().enumerate() {
+                merged[qi_start + off].extend(c);
+            }
+        }
+        merged
+            .into_iter()
+            .map(|mut pairs| {
+                pairs.sort_unstable_by(|a, b| {
+                    b.0.partial_cmp(&a.0)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then_with(|| a.1.cmp(&b.1))
+                });
+                pairs.truncate(k);
+                let s: Vec<f32> = pairs.iter().map(|p| p.0).collect();
+                let i: Vec<i64> = pairs.iter().map(|p| p.1 as i64).collect();
+                (s, i)
+            })
+            .collect::<Vec<_>>()
         }
     };
 
@@ -1761,11 +1812,47 @@ pub(crate) fn search(
             )]
         } else {
         const NQ_BATCH: usize = 4;
-        let results: Vec<(Vec<f32>, Vec<i64>)> = (0..nq)
+        // 2D tiles (query-quad × block-range), mirroring the ARM path:
+        // 1D quad partitioning leaves a ragged tail round on the pool.
+        // Only when unmasked and SIMD — the mask bitmap is absolute-indexed
+        // and the scalar fallback is unsliced, so those keep one range
+        // (identical behavior to before). A 1-thread pool also keeps one
+        // range: identical work and visit order to the serial scan.
+        #[cfg(test)]
+        let force_scalar_any = FORCE_SCALAR_FALLBACK.load(std::sync::atomic::Ordering::Relaxed);
+        #[cfg(not(test))]
+        let force_scalar_any = false;
+        const MIN_TILE_BLOCKS: usize = 1024;
+        let n_quads = nq.div_ceil(NQ_BATCH);
+        let n_threads = rayon::current_num_threads().max(1);
+        let n_ranges = if n_threads == 1 || mask.is_some() || !simd_ok || force_scalar_any {
+            1
+        } else {
+            (n_threads * 3)
+                .div_ceil(n_quads)
+                .min(n_blocks.div_ceil(MIN_TILE_BLOCKS))
+                .max(1)
+        };
+        let blocks_per_range = n_blocks.div_ceil(n_ranges).max(1);
+        let block_bytes = n_byte_groups * BLOCK;
+        let tiles: Vec<(usize, usize)> = (0..nq)
             .step_by(NQ_BATCH)
-            .collect::<Vec<_>>()
+            .flat_map(|q| {
+                (0..n_blocks.max(1))
+                    .step_by(blocks_per_range)
+                    .map(move |b| (q, b))
+            })
+            .collect();
+
+        let tile_results: Vec<(usize, Vec<Vec<(f32, u64)>>)> = tiles
             .into_par_iter()
-            .flat_map(|qi_start| {
+            .map(|(qi_start, block_start)| {
+                let range_blocks = blocks_per_range.min(n_blocks - block_start);
+                let vec_start = block_start * BLOCK;
+                let range_vecs = (range_blocks * BLOCK).min(n_vectors - vec_start);
+                let codes = &blocked_codes
+                    [block_start * block_bytes..(block_start + range_blocks) * block_bytes];
+                let scales_slice = &vec_scales[vec_start..vec_start + range_vecs];
                 let qi_end = (qi_start + NQ_BATCH).min(nq);
                 let batch_nq = qi_end - qi_start;
                 let pad_qi = qi_end - 1;
@@ -1805,16 +1892,16 @@ pub(crate) fn search(
                         && is_x86_feature_detected!("avx512f")
                     {
                         search_multi_query_avx512bw(
-                            blocked_codes, &lut_refs, &scale_vals, &bias_vals,
-                            n_byte_groups, vec_scales, n_vectors,
+                            codes, &lut_refs, &scale_vals, &bias_vals,
+                            n_byte_groups, scales_slice, range_vecs,
                             batch_nq, k, mask,
                             &mut heap_scores, &mut heap_indices,
                             &mut heap_sizes, &mut heap_mins, &mut heap_min_idxs,
                         );
                     } else if !force_scalar && is_x86_feature_detected!("avx2") {
                         search_multi_query_avx2(
-                            blocked_codes, &lut_refs, &scale_vals, &bias_vals,
-                            n_byte_groups, vec_scales, n_vectors,
+                            codes, &lut_refs, &scale_vals, &bias_vals,
+                            n_byte_groups, scales_slice, range_vecs,
                             batch_nq, k, mask,
                             &mut heap_scores, &mut heap_indices,
                             &mut heap_sizes, &mut heap_mins, &mut heap_min_idxs,
@@ -1826,6 +1913,8 @@ pub(crate) fn search(
                         // at 0 — `search` then returned empty top-k results
                         // for every query with no error signal. Fall back to
                         // per-query scalar scoring instead.
+                        // Only reachable with n_ranges == 1 (see the tiling
+                        // gate), so the unsliced buffers are the full index.
                         for qo in 0..batch_nq {
                             score_query_into_heap(
                                 lut_refs[qo],
@@ -1848,22 +1937,44 @@ pub(crate) fn search(
                     }
                 }
 
-                let mut batch_results = Vec::with_capacity(batch_nq);
-                for qo in 0..batch_nq {
-                    let sz = heap_sizes[qo];
-                    let mut pairs: Vec<(f32, u64)> = heap_scores[qo][..sz].iter()
-                        .zip(heap_indices[qo][..sz].iter())
-                        .map(|(&s, &i)| (s, i)).collect();
-                    pairs.sort_unstable_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal).then_with(|| a.1.cmp(&b.1)));
-                    batch_results.push((
-                        pairs.iter().map(|p| p.0).collect::<Vec<f32>>(),
-                        pairs.iter().map(|p| p.1 as i64).collect::<Vec<i64>>(),
-                    ));
-                }
-                batch_results
+                // Raw candidates with indices remapped to absolute; the
+                // merge below sorts across ranges.
+                let cands: Vec<Vec<(f32, u64)>> = (0..batch_nq)
+                    .map(|qo| {
+                        let sz = heap_sizes[qo];
+                        heap_scores[qo][..sz]
+                            .iter()
+                            .zip(heap_indices[qo][..sz].iter())
+                            .map(|(&s, &i)| (s, i + vec_start as u64))
+                            .collect()
+                    })
+                    .collect();
+                (qi_start, cands)
             })
             .collect();
-        results
+
+        // Merge each query's per-range candidates: (score desc, index asc),
+        // truncate to k — identical selection to the serial heap.
+        let mut merged: Vec<Vec<(f32, u64)>> = vec![Vec::new(); nq];
+        for (qi_start, cands) in tile_results {
+            for (off, c) in cands.into_iter().enumerate() {
+                merged[qi_start + off].extend(c);
+            }
+        }
+        merged
+            .into_iter()
+            .map(|mut pairs| {
+                pairs.sort_unstable_by(|a, b| {
+                    b.0.partial_cmp(&a.0)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then_with(|| a.1.cmp(&b.1))
+                });
+                pairs.truncate(k);
+                let s: Vec<f32> = pairs.iter().map(|p| p.0).collect();
+                let i: Vec<i64> = pairs.iter().map(|p| p.1 as i64).collect();
+                (s, i)
+            })
+            .collect::<Vec<_>>()
         }
     };
 
