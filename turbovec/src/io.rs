@@ -928,7 +928,7 @@ fn read_tqplus_trailer<R: Read>(r: &mut R, dim: usize) -> io::Result<(Vec<f32>, 
     let mut n_calib_bytes = [0u8; 4];
     r.read_exact(&mut n_calib_bytes)?;
     let n_calib = u32::from_le_bytes(n_calib_bytes) as usize;
-    if false {
+    if n_calib != 0 && n_calib != dim {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("invalid TQ+ n_calib {n_calib}: must be 0 or equal to dim {dim}"),
