@@ -344,4 +344,22 @@ disappears entirely (the save-climb's S3, now measurable via x86).
   rayon-independent writer threads). ARM: no systematic difference
   through drift (mechanically a strict copy removal).
 - Target HM ≈ x1.015, no target cell regressing.
-- **Verdict: WIN** — committed. Streak resets to 0.
+- **Verdict: WIN** — committed (ac4c679). Streak resets to 0.
+
+### H20 — LUT-based extract_codes_flat (target: insert)
+
+The packed→group-byte gather feeding every repack (and H7's lazy
+append) was still the scalar bit-by-bit loop — the exact mirror of what
+H2's LUT fixed in the unpack direction. Now each 8-dim chunk is `bits`
+lookups in a per-plane 256-entry u32 scatter table, OR-ed and stored as
+little-endian group bytes (`build_extract_lut`, mirror of
+`build_unpack_lut`).
+
+- Suite green both arches (round-trip tests pin exactness for bits
+  2/3/4).
+- A/B insert (3 rounds each): ARM MT 5.69 → 4.95 (x1.15), ARM ST 13.51
+  → 12.57 (x1.075); x86 MT 13.0 → 10.8 (x1.20), x86 ST 22.1 → 20.0
+  (x1.10). Eager-add / from_parts / cold-write paths share the win
+  (strictly less work, same bytes).
+- Target HM x1.129, no cell regressing.
+- **Verdict: WIN** — committed. Streak 0.
