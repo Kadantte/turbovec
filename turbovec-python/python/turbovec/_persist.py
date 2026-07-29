@@ -22,15 +22,70 @@ the same clean ``ValueError`` at load time.
 """
 from __future__ import annotations
 
+import itertools
 import json
 import os
-from typing import Any, Iterable
+import secrets
+import time
+from typing import Any, Iterable, Optional
+
+# Mirrors the Rust writer's TMP_SEQ (turbovec/src/io.rs): a pid suffix
+# alone collides when two store objects in one process save to the same
+# directory — they interleave writes into one temp file and each
+# ``finally`` unlinks the other's in-flight temp (#316). ``count().
+# __next__`` is atomic under the GIL/free-threading lock.
+_TMP_SEQ = itertools.count()
+
+
+# NAME_MAX on every filesystem we target (ext4, APFS, NTFS component).
+_TMP_NAME_MAX = 255
 
 
 def _tmp_path(path: str) -> str:
-    """Pid-suffixed sibling temp-file name in the same directory as
-    ``path``."""
-    return f"{path}.tmp.{os.getpid()}"
+    """Sibling temp-file name ``<path>.tmp.{pid}.{seq}.{rand}`` in the
+    same directory as ``path`` — unique per save, even across concurrent
+    saves from one process.
+
+    Mirrors the Rust writer's ``tmp_sibling``: when the destination's own
+    filename would push the sibling past NAME_MAX, the *base* portion of
+    the temp name is truncated to fit. Without this a legal destination
+    name of ~232-255 bytes saves fine but its temp does not, so the save
+    fails with ENAMETOOLONG (#299/#355). The destination name itself is
+    never touched — the temp only has to be unique and recognizable.
+    """
+    directory, base = os.path.split(path)
+    suffix = f".tmp.{os.getpid()}.{next(_TMP_SEQ)}.{secrets.token_hex(4)}"
+    encoded = base.encode()
+    budget = _TMP_NAME_MAX - len(suffix.encode())
+    if len(encoded) > budget:
+        # Cut on a character boundary so the name stays valid text.
+        base = encoded[: max(budget, 0)].decode(errors="ignore")
+    return os.path.join(directory, base + suffix)
+
+
+def _replace_atomic(src: str, dst: str) -> None:
+    """``os.replace`` with a short retry on Windows sharing violations.
+
+    On Windows the rename fails with ERROR_SHARING_VIOLATION (winerror 32)
+    while any other handle to the destination lacks FILE_SHARE_DELETE —
+    CPython's own ``open()`` qualifies, as do antivirus and indexer scans.
+    The Rust writer already retries (``rename_atomic``); the Python side
+    needs the same posture or the integrations still hit #313 (#355).
+    """
+    if os.name != "nt":
+        os.replace(src, dst)
+        return
+    delay = 0.001
+    for _ in range(10):
+        try:
+            os.replace(src, dst)
+            return
+        except OSError as exc:  # pragma: no cover - Windows-only path
+            if getattr(exc, "winerror", None) != 32:
+                raise
+            time.sleep(delay)
+            delay = min(delay * 2, 0.064)
+    os.replace(src, dst)
 
 
 def atomic_save(index, index_path, payload: Any, sidecar_path) -> None:
@@ -76,12 +131,14 @@ def atomic_save(index, index_path, payload: Any, sidecar_path) -> None:
         index.write(index_tmp)
         with open(index_tmp, "rb+") as f:
             os.fsync(f.fileno())
-        with open(sidecar_tmp, "w") as f:
+        # "x" (O_CREAT|O_EXCL) refuses a pre-existing file or planted
+        # symlink at the temp name instead of writing through it.
+        with open(sidecar_tmp, "x") as f:
             f.write(payload_str)
             f.flush()
             os.fsync(f.fileno())
-        os.replace(index_tmp, index_path)
-        os.replace(sidecar_tmp, sidecar_path)
+        _replace_atomic(index_tmp, index_path)
+        _replace_atomic(sidecar_tmp, sidecar_path)
     finally:
         for tmp in (index_tmp, sidecar_tmp):
             try:
@@ -90,17 +147,28 @@ def atomic_save(index, index_path, payload: Any, sidecar_path) -> None:
                 pass
 
 
-def check_persisted_handles(index, handles: Iterable[int], *, what: str = "entry") -> None:
+def check_persisted_handles(
+    index,
+    handles: Iterable[int],
+    *,
+    what: str = "entry",
+    next_u64: Optional[int] = None,
+) -> None:
     """Validate that the side-car's handle set matches the loaded index.
 
     Args:
         index: the loaded ``IdMapIndex`` (uses ``len`` and ``contains``).
         handles: the u64 handles the side-car maps can resolve.
         what: noun for error messages (e.g. "document", "node").
+        next_u64: the side-car's handle watermark, if the caller has it.
+            Handles are issued by pre-incrementing it, so it must be at
+            least the largest handle in use; a smaller value reissues live
+            handles on the next write (issue #321).
 
     Raises:
         ValueError: if the side-car has duplicate handles, a different count
-            than the index, or a handle the index doesn't contain.
+            than the index, a handle the index doesn't contain, or a
+            watermark below the largest handle in use.
     """
     handle_list = [int(h) for h in handles]
     n_index = len(index)
@@ -122,6 +190,13 @@ def check_persisted_handles(index, handles: Iterable[int], *, what: str = "entry
                 f"{h} is not present in the index. The .tvim index and its JSON "
                 f"side-car are out of sync."
             )
+    if next_u64 is not None and handle_list and int(next_u64) < max(handle_list):
+        raise ValueError(
+            f"persisted store is corrupt: the handle watermark next_u64="
+            f"{int(next_u64)} is below the largest {what} handle in use "
+            f"({max(handle_list)}). Loading it would reissue live handles "
+            f"on the next write."
+        )
 
 
 def check_sidecar_keysets(
