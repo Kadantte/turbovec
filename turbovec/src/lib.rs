@@ -1371,6 +1371,15 @@ impl TurboQuantIndex {
         let dim = self.dim.expect("n_vectors > 0 but dim is None");
         let bytes_per_vec = dim * self.bit_width / 8;
         let last = self.n_vectors - 1;
+        // At least one code representation must exist, or the branches
+        // below would silently update neither and corrupt the index.
+        // Every current path guarantees this (constructors and adds set
+        // packed; v6 loads seed blocked); this makes a future violation
+        // loud instead of silent.
+        debug_assert!(
+            self.packed_codes.get().is_some() || self.blocked.get().is_some(),
+            "swap_remove: neither packed_codes nor the blocked cache is present"
+        );
 
         // Maintain packed rows only if they are materialized. In the
         // v6-load window (blocked seeded from the file, packed unset) the
