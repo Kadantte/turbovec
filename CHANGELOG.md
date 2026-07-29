@@ -40,6 +40,23 @@ appears under each surface it touches.
 
 #### Changed
 
+- **`IdMapIndex::remove` updates its tables only after the inner removal
+  returns (#380).** Ordering hardening rather than a fix for reachable
+  misbehaviour: no unwind is reachable from `remove`, whose slot comes
+  from the id table and so is in bounds by construction — the documented
+  `idx >= n_vectors` panic in `TurboQuantIndex::swap_remove` cannot fire
+  for it. Past that assert, `swap_remove` calls `packed_mut()` only when
+  the packed rows are already materialized, so the lazy O(n·dim) rebuild
+  never fires from a remove, and the rest is in-bounds indexing and
+  allocation-free lane ops. Taking the id out of `id_to_slot` before that
+  call was nonetheless the wrong order: were the inner removal ever to
+  become fallible, a caught panic would leave the id gone from the map,
+  still present in `slot_to_id`, and `slot_to_id` one entry longer than
+  the inner index — the vector searchable but unresolvable, with every
+  later `remove` computing the swap target off the wrong length. The
+  removal now runs first, matching the "index first, then the maps" order
+  the Python stores' delete paths use. No behaviour change.
+
 - **x86 search dispatch now tests every CPU feature the kernels declare
   (#291).** The AVX2 gates additionally require FMA and the AVX-512 gates
   additionally require AVX2+FMA, matching what those kernels execute. On a
@@ -325,6 +342,15 @@ appears under each surface it touches.
   Linux x86_64 wheel from ~1.8 MB to ~42 MB. (#206)
 
 #### Fixed
+
+- **A panicking first add no longer wedges a lazy index at a committed
+  dim (#380).** `add_2d` locked the inferred dim before the encode, so a
+  caught encode panic left an index with a dim and no vectors, and the
+  follow-up `add_2d` at a different dim got `DimMismatch` instead of the
+  fresh start #129 established. The dim — and the rotation, boundary and
+  centroid caches derived from it — are now rolled back if the add
+  unwinds; rolling back the dim alone would leave the next add at a
+  different dim panicking inside `rotation` instead of starting fresh.
 
 - **A caught panic in the eager add's cache repack no longer leaves the
   stored codes ahead of the row count (#388).** The blocked-cache patch is
@@ -744,6 +770,17 @@ appears under each surface it touches.
   unchanged. (#167)
 
 #### Fixed
+
+- **agno: a failed load no longer leaves a half-loaded store (#380).**
+  `_load_from` replaced `_index`, `_u64_to_doc`, `_next_u64` and all three
+  reverse indexes *before* the side-car/index consistency check that can
+  raise, so a store whose load failed still reported `exists() is True`
+  and a retried `create()` returned silently as "already created",
+  handing back the half-load. The new state is now built into locals and
+  committed in one block after every check has passed — a store whose
+  load raised is one the method never touched. agno is the only
+  integration that loads in place; the other three return a fresh object
+  and were already safe.
 
 - **agno: a half-present save loaded silently empty and was then
   overwritten (#328).** `create()` caught the `FileNotFoundError` that
