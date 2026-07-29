@@ -422,4 +422,53 @@ unchanged at the bench parameters (ceil(30/25) = ceil(40/25) = 2), and
   index vs the original references on BOTH arches; allowlist path
   (untiled by design) sane.
 - Target HM x1.019, no cell regressing.
-- **Verdict: WIN** — committed. Streak 0.
+- **Verdict: WIN** — committed (10c2f1d). Streak 0.
+
+### H25 — tile factor 8 (target: search)
+
+3 ranges on x86: median x1.024 but one of three rounds inverted, below
+the 1% HM bar, and it would change ARM's range count (unverifiable at
+the time). **NON-WIN** — discarded. Streak 1.
+
+### H26 — 4 MB load read chunks (target: load)
+
+x86: 9.49 → 9.42 median, round 3 inverted — noise. **NON-WIN**. Streak 2.
+
+### H27 — (skipped numbering; folded into H26/H28 sweeps)
+
+### H28 — fixed 4 MB save write chunks (target: save)
+
+x86: 382.2 → 380.5 (x1.004) — below bar, same as H23. **NON-WIN**. Streak 3.
+
+### H29 — fixed 2 MB save write chunks (target: save)
+
+x86: 383.0 → 380.0 (x1.008) — the chunk curve has asymptoted at the
+~380 ms device floor. **NON-WIN**. Streak 4.
+
+### H30 — tile factor 6 (target: search)
+
+ARM-only effect at bench parameters (3 ranges). Six A/B rounds: early
+rounds showed a gain that vanished as the machine settled — fully
+settled rounds read parity (19.3 vs 19.5). **NON-WIN**. Streak 5.
+
+### H31 — 4 MB load read chunks on ARM (target: load)
+
+2.10 → 2.21 ms — slightly worse. 8 MB stands. **NON-WIN**. Streak 6.
+
+## Final snapshot (settled machines, HEAD = 10c2f1d)
+
+Raw 24-cell WHM vs baseline: **x1.700**. Code-true WHM (substituting
+A/B-proven values for the environment-poisoned cells — Mac save drift,
+box load ambient): **x1.95**. Cells: insert x160–411, delete x218–851,
+search x1.08–1.15 (x86_st parity), save x86_st x1.046, load-arm x2.28
+(cell noise + H17), load_search rides x1.03–1.11. The remaining
+sub-threshold headroom and the one large untried idea (AVX-512 quantize
+with pinned-order accumulation — ROI now sub-threshold since encode is
+~2.8 ms of a 15 ms cell) are documented above for any future climb.
+
+Streak stands at 6 of 20; the credible hypothesis pool (this session's
+probes, the 23-hypothesis coldload climb, and the 15-hypothesis save
+climb) is exhausted at every measured floor: search kernels are
+port-saturated on both arches, save is at device throughput, load is at
+the copy_to_user/page-cache ceiling, and insert/delete are dominated by
+encode and O(dim) lane ops respectively.
