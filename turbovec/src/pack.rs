@@ -131,6 +131,38 @@ pub(crate) fn move_lane(blocked: &mut [u8], n_byte_groups: usize, src_vec: usize
     }
 }
 
+/// Append `n_new` vectors' packed bit-plane rows to the native blocked
+/// layout as direct lane writes, growing the buffer to the new geometry
+/// (fresh bytes zeroed, so padding lanes match a from-scratch repack).
+/// Existing lanes — including the partial tail block's — are untouched:
+/// the cache's exact-bytes invariant carries them. Lets `add` append in
+/// the v6-load window without materializing the packed prefix.
+pub(crate) fn append_lanes(
+    blocked: &mut Vec<u8>,
+    packed_rows: &[u8],
+    old_n: usize,
+    n_new: usize,
+    bits: usize,
+    dim: usize,
+) {
+    let (_, n_byte_groups, new_len) = blocked_geometry(old_n + n_new, bits, dim);
+    blocked.resize(new_len, 0);
+    let codes_flat = extract_codes_flat(packed_rows, n_new, bits, dim);
+    for (i, row) in codes_flat.iter().enumerate() {
+        let v = old_n + i;
+        let (b, l) = (v / BLOCK, v % BLOCK);
+        for (g, &code) in row.iter().enumerate().take(n_byte_groups) {
+            let off = (b * n_byte_groups + g) * BLOCK;
+            #[cfg(target_arch = "x86_64")]
+            write_x86_code_byte(blocked, off, l, code);
+            #[cfg(not(target_arch = "x86_64"))]
+            {
+                blocked[off + l] = code;
+            }
+        }
+    }
+}
+
 /// Zero vector `vec_idx`'s code bytes across every byte-group — vacated
 /// and padding lanes must be exactly zero so serialized cache bytes match
 /// a from-scratch repack.

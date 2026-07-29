@@ -389,18 +389,33 @@ impl TurboQuantIndex {
         } else {
             Some((self.tqplus_shift.as_slice(), self.tqplus_scale.as_slice()))
         };
+        // In the v6-load window (blocked cache seeded from the file,
+        // packed rows unmaterialized) the blocked cache stays
+        // authoritative: encode the new rows into a temp buffer, append
+        // them to the cache as direct lane writes, and leave packed
+        // unset — the O(n·dim) materialization never runs for the
+        // load→add→search/save flow. Everywhere else, materialize and
+        // append in place as before.
+        let lazy_append = self.n_vectors > 0
+            && self.packed_codes.get().is_none()
+            && self.blocked.get().is_some();
+        if !lazy_append {
+            // Materialize the packed rows (a v6-loaded index rebuilds
+            // them from the still-valid blocked cache) so encode has the
+            // existing rows to append after.
+            self.packed();
+        }
         // Take the scratch and output buffers out of self so they can be
         // borrowed mutably alongside the shared cache borrows above;
-        // encode appends the new rows directly at their tails. Materialize
-        // the packed rows first (a v6-loaded index rebuilds them from the
-        // still-valid blocked cache) so encode has the existing rows to
-        // append after.
-        self.packed();
+        // encode appends the new rows directly at their tails. In the
+        // lazy window `take()` yields nothing and encode fills a fresh
+        // temp holding only the new rows.
         let mut scratch = std::mem::take(&mut self.encode_scratch);
-        let mut packed_codes = self
-            .packed_codes
-            .take()
-            .expect("packed_codes just materialized");
+        let mut packed_codes = self.packed_codes.take().unwrap_or_default();
+        debug_assert!(
+            lazy_append || self.n_vectors == 0 || !packed_codes.is_empty(),
+            "eager add must start from materialized packed rows"
+        );
         let mut scales_buf = std::mem::take(&mut self.scales);
         // Unwind guard: encode appends to the taken buffers, so a panic
         // inside it (kernel invariant assert, rayon worker panic) must
@@ -429,9 +444,13 @@ impl TurboQuantIndex {
         let (shift, scale_tq) = match encode_result {
             Ok(pair) => pair,
             Err(panic) => {
-                packed_codes.truncate(packed_len_before);
                 scales_buf.truncate(scales_len_before);
-                self.packed_codes = OnceLock::from(packed_codes);
+                if !lazy_append {
+                    packed_codes.truncate(packed_len_before);
+                    self.packed_codes = OnceLock::from(packed_codes);
+                }
+                // lazy: the temp holds only new rows — drop it and leave
+                // the lock unset; blocked was never touched.
                 self.scales = scales_buf;
                 self.encode_scratch = scratch;
                 std::panic::resume_unwind(panic);
@@ -445,7 +464,6 @@ impl TurboQuantIndex {
             scratch.shrink_to(n * dim);
         }
         self.encode_scratch = scratch;
-        self.packed_codes = OnceLock::from(packed_codes);
         self.scales = scales_buf;
 
         if self.n_vectors == 0 {
@@ -455,6 +473,24 @@ impl TurboQuantIndex {
         // else: tqplus_shift/scale unchanged — locked by the first add.
         let old_n = self.n_vectors;
         self.n_vectors += n;
+
+        if lazy_append {
+            // packed stays unset (the lock was left empty by take());
+            // append the temp's rows to the blocked cache as direct lane
+            // writes (fresh blocks zero-padded, the partial tail block's
+            // existing lanes untouched — the cache's exact-bytes
+            // invariant carries them). The temp drops here.
+            let bit_width = self.bit_width;
+            let cache = self
+                .blocked
+                .get_mut()
+                .expect("lazy_append requires a blocked cache");
+            pack::append_lanes(&mut cache.data, &packed_codes, old_n, n, bit_width, dim);
+            let (new_n_blocks, _, _) = pack::blocked_geometry(self.n_vectors, bit_width, dim);
+            cache.n_blocks = new_n_blocks;
+            return;
+        }
+        self.packed_codes = OnceLock::from(packed_codes);
 
         // Maintain the blocked cache incrementally instead of discarding
         // it: appended rows only affect the (possibly partial) tail block
