@@ -78,7 +78,8 @@ def main():
     queries = rng.random((100, DIM), dtype=np.float32)
     one_q = queries[:1]
     batch = rng.random((1000, DIM), dtype=np.float32)
-    out_path = os.path.join(tempfile.mkdtemp(), "out.tvim")
+    out_dir = tempfile.TemporaryDirectory()  # auto-removed on exit — a 77 MB
+    out_path = os.path.join(out_dir.name, "out.tvim")  # file per run leaks fast
     r = {}
 
     ix = IdMapIndex.load(PATH)
