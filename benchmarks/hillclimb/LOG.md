@@ -162,4 +162,22 @@ state on demand. Eager path unchanged, unwind guard split per path.
 - Flags all cleared by interleaved H6-vs-H7 A/B (search/save/load_search
   statistically identical across 3 rounds; save wobble 83–97 ms on both
   cores = documented Mac drift).
+- **Verdict: WIN** — committed (d22a4d9).
+
+### H8 — always-fast-path removes in the bindings (target: delete)
+
+Post-H6 a removal is O(dim) lane ops regardless of packed state, but the
+bindings still routed !packed_ready removes through detach + with_pool —
+a per-remove pool handoff that was ~90% of the MT delete cell (and why
+ST delete beat MT). Both remove() and swap_remove() now always take the
+uncontended fast path.
+
+- Correctness: python test suite 477 passed (1 pre-existing environmental
+  failure in test_llama_index metadata_separator round-trip — reproduces
+  identically on the H7 wheel, unrelated to the climb).
+- A/B H7 vs H8 (3 rounds): delete-arm MT 22→2.1 ms, ST 8→4.0.
+- Soak: delete x822.3 arm / x405.7 x86 / x493.4 arm_st / x217.3 x86_st —
+  target HM x387.9. WHM x1.754.
+- Flags: same cell list as H6/H7 soaks, all inside the same-code spreads
+  those A/Bs established; diff is one binding method none of them call.
 - **Verdict: WIN** — committed.
