@@ -103,6 +103,14 @@ thread_local! {
     static FORCE_ENCODE_PANIC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+/// See [`TurboQuantIndex::force_fit_panic`]. Thread-local for exactly the
+/// reason [`FORCE_ENCODE_PANIC`] is — it is checked on the calling thread,
+/// before `fit_calibration` fans out to rayon (#373).
+#[cfg(test)]
+thread_local! {
+    static FORCE_FIT_PANIC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// Norm at or below which a vector has no representable direction.
 ///
 /// The encoder stores every vector as (unit direction, norm). At or
@@ -362,6 +370,21 @@ impl TurboQuantIndex {
         self.packed_codes.get().is_some()
     }
 
+    /// Whether an [`Self::add`] of `n_rows` rows will run parallel work
+    /// that is not proportional to `n_rows`.
+    ///
+    /// True exactly when this batch crosses the TQ+ warm-up threshold:
+    /// the crossing fits a calibration and re-encodes the whole buffered
+    /// prefix — up to ~1000 rows of splitting work for an add of a
+    /// single row. Callers that decide whether to enter a fork-safe pool
+    /// from the row count alone would otherwise miss it (#364).
+    pub fn add_parallelizes(&self, n_rows: usize) -> bool {
+        let (Some(dim), Some(buffer)) = (self.dim, self.warmup.as_ref()) else {
+            return false;
+        };
+        buffer.len() / dim + n_rows >= encode::TQPLUS_MIN_SAMPLES
+    }
+
     /// Mutable access to the packed codes, materializing first (see
     /// [`Self::packed`]). Callers that mutate must also invalidate
     /// `blocked`, as before.
@@ -509,13 +532,22 @@ impl TurboQuantIndex {
                 return;
             }
             // Threshold crossed. Leave warm-up for good.
-            let buffer = self.warmup.take().expect("warmup is Some in this branch");
-            if buffer.is_empty() {
+            if self
+                .warmup
+                .as_ref()
+                .expect("warmup is Some in this branch")
+                .is_empty()
+            {
                 // Nothing to re-encode — this batch alone fits the
-                // calibration, which is the plain bulk-add path.
+                // calibration, which is the plain bulk-add path. Encode
+                // FIRST, for the same reason the sub-threshold branch
+                // does: a caught panic must leave the index still
+                // warming up rather than silently forfeiting TQ+ (#361).
                 self.encode_and_append(vectors, n, dim);
+                self.warmup = None;
                 return;
             }
+            let buffer = self.warmup.take().expect("warmup is Some in this branch");
             // Fit the calibration up front so the buffered rows and this
             // batch land in the same coordinate system, then re-encode
             // the buffered rows (their identity-encoded codes are
@@ -536,20 +568,54 @@ impl TurboQuantIndex {
                 concat = [buffer.as_slice(), vectors].concat();
                 (concat.as_slice(), buffered + n)
             };
-            let (shift, scale_tq) =
-                encode::fit_calibration(fit_src, fit_n, dim, rotation, &mut scratch);
+            // The crossing rewrites every row, so it necessarily commits
+            // state that must stay in step with `n_vectors` (the codes,
+            // the calibration, `warmup` itself) before all of the
+            // fallible work is done. Both fallible steps therefore run
+            // under an unwind guard that restores the whole pre-crossing
+            // state, so a caught panic leaves a still-warming-up index
+            // with its rows intact instead of an empty one (#361) or one
+            // that has silently forfeited TQ+ for good.
+            let fitted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                #[cfg(test)]
+                if FORCE_FIT_PANIC.with(|f| f.replace(false)) {
+                    panic!("forced calibration fit panic (test)");
+                }
+                encode::fit_calibration(fit_src, fit_n, dim, rotation, &mut scratch)
+            }));
             self.encode_scratch = scratch;
+            let (shift, scale_tq) = match fitted {
+                Ok(pair) => pair,
+                Err(panic) => {
+                    self.warmup = Some(buffer);
+                    std::panic::resume_unwind(panic);
+                }
+            };
             // Drop the identity-encoded rows and commit the fitted
             // calibration before re-encoding, so both encode calls below
-            // take the reuse path with the new calibration.
-            self.packed_codes = OnceLock::from(Vec::new());
-            self.scales.clear();
+            // take the reuse path with the new calibration — holding on
+            // to the old values so the guard below can put them back.
+            let old_packed = std::mem::replace(&mut self.packed_codes, OnceLock::from(Vec::new()));
+            let old_scales = std::mem::take(&mut self.scales);
+            let old_blocked = std::mem::replace(&mut self.blocked, OnceLock::new());
+            let old_n = self.n_vectors;
+            let old_shift = std::mem::replace(&mut self.tqplus_shift, shift);
+            let old_scale = std::mem::replace(&mut self.tqplus_scale, scale_tq);
             self.n_vectors = 0;
-            self.blocked = OnceLock::new();
-            self.tqplus_shift = shift;
-            self.tqplus_scale = scale_tq;
-            self.encode_and_append(&buffer, buffered, dim);
-            self.encode_and_append(vectors, n, dim);
+            let reencoded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                self.encode_and_append(&buffer, buffered, dim);
+                self.encode_and_append(vectors, n, dim);
+            }));
+            if let Err(panic) = reencoded {
+                self.packed_codes = old_packed;
+                self.scales = old_scales;
+                self.blocked = old_blocked;
+                self.n_vectors = old_n;
+                self.tqplus_shift = old_shift;
+                self.tqplus_scale = old_scale;
+                self.warmup = Some(buffer);
+                std::panic::resume_unwind(panic);
+            }
             return;
         }
 
@@ -567,6 +633,15 @@ impl TurboQuantIndex {
     #[cfg(test)]
     pub(crate) fn force_encode_panic(on: bool) {
         FORCE_ENCODE_PANIC.with(|f| f.set(on));
+    }
+
+    /// Sibling of [`Self::force_encode_panic`] for the calibration fit,
+    /// thread-local for the same reason (#373). The threshold crossing
+    /// fits before it re-encodes, and the two failure points have to roll
+    /// back different state, so they need separately targetable switches.
+    #[cfg(test)]
+    pub(crate) fn force_fit_panic(on: bool) {
+        FORCE_FIT_PANIC.with(|f| f.set(on));
     }
 
     /// Encode `n` rows and append them to the stored codes, using the
