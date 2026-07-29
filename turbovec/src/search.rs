@@ -44,6 +44,46 @@ fn rescan_min(hs: &[f32], hi: &[u64], k: usize) -> (f32, usize) {
     }
     (hs[mi], mi)
 }
+/// Upper bound on block-range tiles for a given `k`.
+///
+/// Splitting the block axis duplicates the per-query top-k: each range
+/// keeps its own `k`-entry heap (every replacement an O(k)
+/// [`rescan_min`]) and the cross-range merge then sorts `n_ranges * k`
+/// candidates. That cost grows with `k`, while the load-balancing
+/// benefit of tiling does not — so past some point splitting is a net
+/// loss. Bound the split by how many vectors each range would still
+/// hold per unit of `k`. At the batch default (k=10, 200k vectors) this
+/// never binds; at k=1000 it collapses to a single range, i.e. exactly
+/// the untiled behavior.
+#[inline]
+fn range_cap_for_k(n_vectors: usize, k: usize) -> usize {
+    // Swept on a c4a-standard-8 (200k x 768, 4-bit) over
+    // k ∈ {10, 100, 200, 400, 1000} × nq ∈ {20, 100}: 256 left k=400 at
+    // 1.2-1.5x, 1024 gave back the k=100 win; 512 holds every cell at or
+    // below parity while preserving the k=10 win (0.69x / 0.84x).
+    const MIN_VECTORS_PER_RANGE_PER_K: usize = 512;
+    n_vectors
+        .div_ceil(MIN_VECTORS_PER_RANGE_PER_K * k.max(1))
+        .max(1)
+}
+
+/// Avoid the ragged schedule where the tile count lands just above the
+/// worker count — one full round plus a long tail on mostly-idle
+/// workers. When the caps push us into that zone, prefer a single round
+/// instead: the duplicated per-range top-k is exactly the cost the `k`
+/// cap exists to avoid, so paying it *and* getting a bad schedule is the
+/// worst of both. (Measured: at nq=20 on 8 workers this is the whole
+/// difference between 1.2x and 0.96x at k=400.)
+#[inline]
+fn smooth_tile_count(n_ranges: usize, n_quads: usize, n_threads: usize) -> usize {
+    let tiles = n_quads * n_ranges;
+    if tiles > n_threads && tiles < 2 * n_threads {
+        (n_threads / n_quads).max(1)
+    } else {
+        n_ranges
+    }
+}
+
 use crate::rotation::Rotation;
 use crate::{BLOCK, FLUSH_EVERY};
 
@@ -1564,8 +1604,10 @@ pub(crate) fn search(
             (n_threads * 4)
                 .div_ceil(n_quads)
                 .min(n_blocks.div_ceil(MIN_TILE_BLOCKS))
+                .min(range_cap_for_k(n_vectors, k))
                 .max(1)
         };
+        let n_ranges = smooth_tile_count(n_ranges, n_quads, n_threads);
         let blocks_per_range = n_blocks.div_ceil(n_ranges).max(1);
         let tiles: Vec<(usize, usize)> = (0..nq)
             .step_by(QBS)
@@ -1831,8 +1873,10 @@ pub(crate) fn search(
             (n_threads * 4)
                 .div_ceil(n_quads)
                 .min(n_blocks.div_ceil(MIN_TILE_BLOCKS))
+                .min(range_cap_for_k(n_vectors, k))
                 .max(1)
         };
+        let n_ranges = smooth_tile_count(n_ranges, n_quads, n_threads);
         let blocks_per_range = n_blocks.div_ceil(n_ranges).max(1);
         let block_bytes = n_byte_groups * BLOCK;
         let tiles: Vec<(usize, usize)> = (0..nq)

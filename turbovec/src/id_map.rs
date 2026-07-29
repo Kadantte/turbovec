@@ -96,8 +96,15 @@ pub struct IdMapIndex {
     /// uniqueness, and keeping the result lets post-load adds validate
     /// new ids by binary search instead of forcing the O(n) map build
     /// into the add path. Freed the moment the map materializes (in
-    /// [`Self::ids`], so a load+search-only index doesn't carry it), and
-    /// ignored thereafter.
+    /// [`Self::ids`]), and ignored thereafter.
+    ///
+    /// Note this is NOT freed by a load+search-only workload: plain
+    /// `search` and `search_with_allowlist(None)` never consult the map,
+    /// so such an index carries the table (8 bytes/vector) for its
+    /// lifetime, where main dropped it at the end of the load. The
+    /// trade is deliberate — it buys post-load adds an O(log n) presence
+    /// check instead of forcing the O(n) map build — but a read-only
+    /// serving deployment pays for something it never uses.
     ///
     /// `Mutex` purely for that free: materialization happens behind
     /// `&self`. Mutating callers hold `&mut self` and use `get_mut`, so

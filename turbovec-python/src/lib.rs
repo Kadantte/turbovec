@@ -695,10 +695,19 @@ impl IdMapIndex {
     /// never present, so they return `False`.
     fn remove(&self, py: Python<'_>, id: &Bound<'_, PyAny>) -> PyResult<bool> {
         Ok(match extract_membership_id("id", id)? {
-            // Always the uncontended fast path — no detach, no pool: a
-            // removal is O(dim) lane ops on the blocked cache whether or
-            // not the packed rows are materialized (it no longer
-            // triggers the lazy O(n·dim) rebuild).
+            // The core removal is O(dim) lane ops on the blocked cache
+            // whether or not the packed rows are materialized — it no
+            // longer triggers the lazy O(n·dim) packed rebuild — so it
+            // takes the uncontended GIL-aware path with no pool handoff.
+            //
+            // One caveat: the FIRST remove after a load also builds the
+            // id → slot map (O(n), ~10 ms per million ids), and that
+            // build happens here with the GIL held, briefly stalling
+            // other Python threads. Bounded and once per loaded index,
+            // but it is not the O(1) work `lock_write_gil_aware` is
+            // documented for. Resolving it needs a slot-bearing lookup
+            // in the deferred window (`sorted_ids` holds ids only), so
+            // it is left as a follow-up rather than papered over here.
             Some(v) => lock_write_gil_aware(py, &self.inner).remove(v),
             None => false,
         })
