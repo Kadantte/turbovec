@@ -545,38 +545,21 @@ impl TurboQuantIndex {
             // Bounds check and removal share one write guard, so a
             // concurrent writer cannot shrink the index in between.
             //
-            // Two paths: with the packed rows materialized (every case
-            // except the first mutation after a v6 load) the removal is
-            // O(1) and skips both the GIL detach and the pool, keeping
-            // the uncontended fast path. Otherwise the mutation lazily
-            // rebuilds the packed rows from the blocked cache — a
-            // parallel O(n·dim) job — so it detaches and runs in the
-            // fork-safe pool (lock on the calling thread, never inside
-            // `with_pool`). The probe can only go false→true, so a race
-            // merely sends a ready index down the slow path harmlessly.
-            let ready = lock_read(&self.inner).packed_ready();
-            let removed = if ready {
+            // Always the uncontended fast path — no GIL detach, no pool:
+            // a removal is O(dim) lane ops on the blocked cache whether or
+            // not the packed rows are materialized (it no longer triggers
+            // the lazy O(n·dim) rebuild).
+            let removed = {
                 let mut inner = lock_write_gil_aware(py, &self.inner);
                 let len = inner.len();
                 if i < len {
-                    Ok(Ok(inner.swap_remove(i)))
+                    Ok(inner.swap_remove(i))
                 } else {
                     Err(len)
                 }
-            } else {
-                py.detach(|| {
-                    let mut guard = lock_write(&self.inner);
-                    let inner = &mut *guard;
-                    let len = inner.len();
-                    if i < len {
-                        Ok(with_pool(|| inner.swap_remove(i)))
-                    } else {
-                        Err(len)
-                    }
-                })
             };
             match removed {
-                Ok(moved) => return moved,
+                Ok(moved) => return Ok(moved),
                 Err(len) => {
                     return Err(pyo3::exceptions::PyIndexError::new_err(format!(
                         "index {} out of range for index of length {len}",
@@ -712,24 +695,11 @@ impl IdMapIndex {
     /// never present, so they return `False`.
     fn remove(&self, py: Python<'_>, id: &Bound<'_, PyAny>) -> PyResult<bool> {
         Ok(match extract_membership_id("id", id)? {
-            // Fast path: packed rows materialized (every case except the
-            // first mutation after a v6 load) — O(1), no detach, no
-            // pool. Slow path: the mutation lazily rebuilds the packed
-            // rows from the blocked cache (parallel O(n·dim)), so it
-            // detaches and runs in the fork-safe pool. The probe can
-            // only go false→true, so a race merely sends a ready index
-            // down the slow path harmlessly.
-            Some(v) => {
-                if lock_read(&self.inner).packed_ready() {
-                    lock_write_gil_aware(py, &self.inner).remove(v)
-                } else {
-                    py.detach(|| {
-                        let mut guard = lock_write(&self.inner);
-                        let inner = &mut *guard;
-                        with_pool(|| inner.remove(v))
-                    })?
-                }
-            }
+            // Always the uncontended fast path — no detach, no pool: a
+            // removal is O(dim) lane ops on the blocked cache whether or
+            // not the packed rows are materialized (it no longer
+            // triggers the lazy O(n·dim) rebuild).
+            Some(v) => lock_write_gil_aware(py, &self.inner).remove(v),
             None => false,
         })
     }
