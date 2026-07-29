@@ -92,6 +92,61 @@ pub(crate) fn deinterleave_x86_code_byte(blocked: &[u8], group_off: usize, lane:
     (hi << 4) | lo
 }
 
+/// Write one vector's *sequential* code byte into the x86 native layout —
+/// the exact inverse of [`deinterleave_x86_code_byte`]: nibble-merge the
+/// byte into the two plane bytes that hold lane `lane`'s hi/lo nibbles,
+/// preserving the partner lane's nibbles.
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn write_x86_code_byte(blocked: &mut [u8], group_off: usize, lane: usize, code: u8) {
+    let j = INV_PERM0[lane & 15];
+    let hp = group_off + j;
+    let lp = group_off + 16 + j;
+    if lane < 16 {
+        blocked[hp] = (blocked[hp] & 0xF0) | (code >> 4);
+        blocked[lp] = (blocked[lp] & 0xF0) | (code & 0x0F);
+    } else {
+        blocked[hp] = (blocked[hp] & 0x0F) | (code & 0xF0);
+        blocked[lp] = (blocked[lp] & 0x0F) | ((code & 0x0F) << 4);
+    }
+}
+
+/// Copy vector `src_vec`'s code bytes into vector `dst_vec`'s lane across
+/// every byte-group of the native blocked layout — the O(dim) primitive
+/// that lets `swap_remove` maintain the cache without a block repack.
+pub(crate) fn move_lane(blocked: &mut [u8], n_byte_groups: usize, src_vec: usize, dst_vec: usize) {
+    let (sb, sl) = (src_vec / BLOCK, src_vec % BLOCK);
+    let (db, dl) = (dst_vec / BLOCK, dst_vec % BLOCK);
+    for g in 0..n_byte_groups {
+        let s_off = (sb * n_byte_groups + g) * BLOCK;
+        let d_off = (db * n_byte_groups + g) * BLOCK;
+        #[cfg(target_arch = "x86_64")]
+        {
+            let code = deinterleave_x86_code_byte(blocked, s_off, sl);
+            write_x86_code_byte(blocked, d_off, dl, code);
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            blocked[d_off + dl] = blocked[s_off + sl];
+        }
+    }
+}
+
+/// Zero vector `vec_idx`'s code bytes across every byte-group — vacated
+/// and padding lanes must be exactly zero so serialized cache bytes match
+/// a from-scratch repack.
+pub(crate) fn zero_lane(blocked: &mut [u8], n_byte_groups: usize, vec_idx: usize) {
+    let (b, l) = (vec_idx / BLOCK, vec_idx % BLOCK);
+    for g in 0..n_byte_groups {
+        let off = (b * n_byte_groups + g) * BLOCK;
+        #[cfg(target_arch = "x86_64")]
+        write_x86_code_byte(blocked, off, l, 0);
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            blocked[off + l] = 0;
+        }
+    }
+}
+
 #[cfg(not(target_arch = "x86_64"))]
 fn pack_blocked(
     n: usize,

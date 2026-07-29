@@ -1289,47 +1289,41 @@ impl TurboQuantIndex {
         let bytes_per_vec = dim * self.bit_width / 8;
         let last = self.n_vectors - 1;
 
-        if idx != last {
-            // Move last vector's packed bytes into slot `idx`.
-            // (`packed_mut` materializes from the still-valid blocked
-            // cache first if this index was v6-loaded.)
-            let src = last * bytes_per_vec;
-            let dst = idx * bytes_per_vec;
-            self.packed_mut().copy_within(src..src + bytes_per_vec, dst);
+        // Maintain packed rows only if they are materialized. In the
+        // v6-load window (blocked seeded from the file, packed unset) the
+        // blocked cache is authoritative: leave the OnceLock empty and the
+        // lazy rebuild reconstructs post-removal packed on demand — a
+        // remove no longer forces the O(n·dim) materialization.
+        if self.packed_codes.get().is_some() {
+            if idx != last {
+                let src = last * bytes_per_vec;
+                let dst = idx * bytes_per_vec;
+                self.packed_mut().copy_within(src..src + bytes_per_vec, dst);
+            }
+            self.packed_mut().truncate(last * bytes_per_vec);
+        }
 
+        if idx != last {
             // Move last norm into slot `idx`.
             self.scales[idx] = self.scales[last];
         }
-
-        // Truncate both arrays.
-        self.packed_mut().truncate(last * bytes_per_vec);
         self.scales.truncate(last);
         self.n_vectors -= 1;
 
-        // Maintain the blocked cache incrementally: only the block that
-        // received the moved row and the (now shorter) tail block
-        // changed. The tail must be recomputed even though kernels mask
-        // lanes >= n_vectors, because serialization copies the cache
-        // verbatim — stale padding lanes would break byte determinism.
+        // Maintain the blocked cache with O(dim) lane ops: copy the last
+        // vector's lane into the vacated slot, zero the vacated last lane
+        // (serialization copies the cache verbatim — a stale lane would
+        // break byte determinism), then truncate to the new geometry.
         if let Some(cache) = self.blocked.get_mut() {
             let (new_n_blocks, n_byte_groups, _) =
                 pack::blocked_geometry(self.n_vectors, self.bit_width, dim);
             let block_bytes = n_byte_groups * BLOCK;
+            if idx != last {
+                pack::move_lane(&mut cache.data, n_byte_groups, last, idx);
+            }
+            pack::zero_lane(&mut cache.data, n_byte_groups, last);
             cache.data.truncate(new_n_blocks * block_bytes);
             cache.n_blocks = new_n_blocks;
-            let packed = self.packed_codes.get().expect("packed materialized in swap_remove");
-            let mut redo = |b: usize| {
-                if b < new_n_blocks {
-                    let patch = pack::repack_block_range(
-                        packed, self.n_vectors, self.bit_width, dim, b, b + 1,
-                    );
-                    cache.data[b * block_bytes..(b + 1) * block_bytes].copy_from_slice(&patch);
-                }
-            };
-            redo(idx / BLOCK);
-            if new_n_blocks > 0 {
-                redo(new_n_blocks - 1);
-            }
         }
 
         last

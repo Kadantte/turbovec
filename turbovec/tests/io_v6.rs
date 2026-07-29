@@ -511,3 +511,49 @@ fn incremental_blocked_cache_serializes_identically_to_cold_rebuild() {
     assert_eq!(a.indices, b.indices);
     assert_eq!(a.scores, b.scores);
 }
+
+/// swap_remove in the v6-load window (blocked cache seeded, packed rows
+/// unmaterialized) must leave packed lazy, and both serialization and the
+/// eventual lazy packed reconstruction must be byte-identical to the same
+/// removes performed on an eagerly-materialized clone — for every bit
+/// width, across block-boundary and remove-to-empty edges.
+#[test]
+fn lazy_swap_remove_defers_packed_and_stays_byte_identical() {
+    for bits in [2usize, 3, 4] {
+        let dim = 64usize;
+        let mut src = TurboQuantIndex::new(dim, bits).unwrap();
+        src.add(&lcg_vectors(100, dim, 0xD00D + bits as u64));
+        let bytes = src.to_bytes();
+
+        let mut lazy = TurboQuantIndex::from_bytes(&bytes).unwrap();
+        let mut eager = TurboQuantIndex::from_bytes(&bytes).unwrap();
+        let _ = eager.packed_codes(); // force materialization up front
+
+        // Front, middle, tail, then cross the 96->64 block boundary.
+        for idx in [0usize, 45, 97, 60, 33, 0] {
+            lazy.swap_remove(idx);
+            eager.swap_remove(idx);
+        }
+        assert!(
+            !lazy.packed_ready(),
+            "bits={bits}: removes must not force packed materialization"
+        );
+        assert_eq!(
+            lazy.to_bytes(),
+            eager.to_bytes(),
+            "bits={bits}: lazy-path serialization diverged"
+        );
+        assert_eq!(
+            lazy.packed_codes(),
+            eager.packed_codes(),
+            "bits={bits}: lazy packed reconstruction diverged after removes"
+        );
+
+        // Remove everything: the empty index must serialize identically.
+        while lazy.len() > 0 {
+            lazy.swap_remove(lazy.len() - 1);
+            eager.swap_remove(eager.len() - 1);
+        }
+        assert_eq!(lazy.to_bytes(), eager.to_bytes(), "bits={bits}: empty-index divergence");
+    }
+}
