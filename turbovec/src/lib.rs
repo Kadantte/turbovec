@@ -59,7 +59,7 @@ pub mod search;
 #[cfg(test)]
 mod kernel_tests;
 
-pub use error::{AddError, ConstructError, FromPartsError};
+pub use error::{AddError, ConstructError, FromPartsError, SearchError};
 pub use id_map::IdMapIndex;
 
 use std::path::Path;
@@ -87,6 +87,47 @@ const FLUSH_EVERY: usize = 256;
 /// magnitude above any realistic embedding value).
 const MAX_INPUT_MAGNITUDE: f32 = 1e16;
 
+/// See [`TurboQuantIndex::force_encode_panic`].
+#[cfg(test)]
+static FORCE_ENCODE_PANIC: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Norm at or below which a vector has no representable direction.
+///
+/// The encoder stores every vector as (unit direction, norm). At or
+/// below this threshold there is no meaningful direction to store, so
+/// the vector is encoded with scale 0 and scores exactly 0 against
+/// every query. This is documented behaviour, not an error: 0 is the
+/// conventional cosine similarity of a zero vector, so the slot is
+/// counted in `len()` and is returned by `search` only after every
+/// vector that does have a direction. Callers for whom a zero-norm
+/// embedding is a bug should reject it before `add`.
+pub const MIN_INPUT_NORM: f32 = 1e-10;
+
+/// The canonical Lloyd-Max codebook for `(bit_width, dim)` —
+/// `(boundaries, centroids)`. The codebook is a pure function of these
+/// two parameters; the v6 loader verifies a file's embedded codebook
+/// against this function and rejects any disagreement (#320), so
+/// callers serializing through the raw [`io`] writers must embed
+/// exactly these arrays (or use
+/// [`TurboQuantIndex::codebook_for_write`]).
+///
+/// # Panics
+///
+/// If `bit_width` is not 2, 3 or 4, or `dim` is not a positive
+/// multiple of 8 (the same bounds the index constructors enforce).
+pub fn expected_codebook(bit_width: usize, dim: usize) -> (Vec<f32>, Vec<f32>) {
+    assert!(
+        (2..=4).contains(&bit_width),
+        "bit_width must be 2, 3 or 4, got {bit_width}"
+    );
+    assert!(
+        dim >= 8 && dim % 8 == 0,
+        "dim must be a positive multiple of 8, got {dim}"
+    );
+    codebook::codebook(bit_width, dim)
+}
+
 /// Reject non-finite (NaN, +Inf, -Inf) or extremely-large input values.
 /// Returns the first offending vector/coord/value tuple, or `None` if
 /// the input is clean.
@@ -101,9 +142,19 @@ const MAX_INPUT_MAGNITUDE: f32 = 1e16;
 ///     top-k against every query.
 pub fn first_invalid_coord(values: &[f32], dim: usize) -> Option<(usize, usize, f32)> {
     // The parallel scan lives in encode.rs — one of the audited rayon
-    // chokepoint files (fork safety, issue #147); binding entry points
-    // reach it inside `with_pool`.
+    // chokepoint files (fork safety, issue #147). Binding entry points
+    // must reach it inside `with_pool` whenever
+    // [`validation_parallelizes`] is true; below that threshold the scan
+    // is a single chunk folded on the calling thread and touches no pool.
     encode::par_first_invalid_coord(values, dim, MAX_INPUT_MAGNITUDE)
+}
+
+/// True when [`first_invalid_coord`] on `len` values splits into more than
+/// one rayon chunk, i.e. injects work into the current pool. Callers that
+/// must control which pool that is (the Python binding, whose global pool
+/// is a fork-unsafe sentinel — issue #288) gate on this.
+pub fn validation_parallelizes(len: usize) -> bool {
+    len > encode::VALIDATE_CHUNK
 }
 
 /// SIMD-blocked cache derived from `packed_codes`.
@@ -115,6 +166,36 @@ pub fn first_invalid_coord(values: &[f32], dim: usize) -> Option<(usize, usize, 
 struct BlockedCache {
     data: Vec<u8>,
     n_blocks: usize,
+}
+
+/// State of an index's TQ+ per-coordinate calibration.
+///
+/// TQ+ fits a `(shift, scale)` pair per coordinate from the empirical
+/// quantiles of the vectors added to the index. The fit needs at least
+/// 1000 vectors to be stable, so an index that has seen fewer is still
+/// warming up: its rows are stored under an identity calibration and are
+/// re-encoded once the 1000th vector arrives.
+///
+/// Query it with [`TurboQuantIndex::calibration_state`] /
+/// [`IdMapIndex::calibration_state`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CalibrationState {
+    /// Fewer than 1000 vectors have been added and the raw rows are
+    /// still buffered. Search works (under identity calibration), and a
+    /// later add that brings the total to 1000 re-encodes every stored
+    /// row with a fitted calibration.
+    WarmingUp,
+    /// A calibration fitted from at least 1000 vectors is committed;
+    /// every stored row is encoded in it, and every later add reuses it.
+    Fitted,
+    /// The index is committed to identity calibration for good: no TQ+
+    /// recall gain, now or later. Reached by loading (or reconstructing
+    /// through [`TurboQuantIndex::from_parts`]) an index whose stored
+    /// rows were encoded under identity — including one saved while it
+    /// was still warming up, since a file carries no warm-up buffer.
+    /// Recovering the TQ+ gain requires rebuilding from the original
+    /// float32 vectors.
+    Identity,
 }
 
 /// Positional TurboQuant index.
@@ -153,6 +234,24 @@ pub struct TurboQuantIndex {
     /// no behaviour change vs the old encoding).
     tqplus_shift: Vec<f32>,
     tqplus_scale: Vec<f32>,
+
+    /// Warm-up buffer: the raw (un-encoded) float rows added so far while
+    /// the index has yet to see `TQPLUS_MIN_SAMPLES` vectors in total.
+    /// `Some` exactly while the index is in the warm-up phase — i.e. it
+    /// has never committed a fitted calibration and its stored codes (if
+    /// any) were all produced from rows still held here. `None` once a
+    /// calibration is committed for good.
+    ///
+    /// Rows are kept in slot order and mirror `swap_remove`, so the
+    /// buffer's row `i` is always the index's slot `i`. Bounded by
+    /// `TQPLUS_MIN_SAMPLES` rows at rest (the batch that reaches the
+    /// threshold is encoded immediately and the buffer dropped), i.e.
+    /// `< 1000 * dim * 4` bytes.
+    ///
+    /// See [`CalibrationState`] for what this buys: an index seeded with
+    /// a sub-threshold first add can still fit a real calibration once
+    /// enough vectors have arrived, by re-encoding those early rows.
+    warmup: Option<Vec<f32>>,
 
     // Thread-safe lazy caches. These are initialised from `&self` via
     // `OnceLock::get_or_init`, which allows `search` to take `&self`
@@ -287,6 +386,7 @@ impl TurboQuantIndex {
             scales: Vec::new(),
             tqplus_shift: Vec::new(),
             tqplus_scale: Vec::new(),
+            warmup: Some(Vec::new()),
             rotation: OnceLock::new(),
             boundaries: OnceLock::new(),
             centroids: OnceLock::new(),
@@ -313,6 +413,7 @@ impl TurboQuantIndex {
             scales: Vec::new(),
             tqplus_shift: Vec::new(),
             tqplus_scale: Vec::new(),
+            warmup: Some(Vec::new()),
             rotation: OnceLock::new(),
             boundaries: OnceLock::new(),
             centroids: OnceLock::new(),
@@ -336,6 +437,10 @@ impl TurboQuantIndex {
     ///   magnitude `>= 1e16`. Callers handling untrusted input should
     ///   prefer [`Self::add_2d`], which returns a typed
     ///   [`AddError::InvalidInputValue`] instead.
+    ///
+    /// A vector whose L2 norm is `<= 1e-10` ([`MIN_INPUT_NORM`]) is not
+    /// an error: it is stored with scale 0 and scores 0 against every
+    /// query. See that constant for the rationale.
     pub fn add(&mut self, vectors: &[f32]) {
         let dim = self.dim.expect(
             "TurboQuantIndex dim is not set; use add_2d(vectors, dim) on the \
@@ -365,6 +470,96 @@ impl TurboQuantIndex {
             );
         }
 
+        // Warm-up phase: the index has not yet seen enough vectors to fit
+        // a real TQ+ calibration. Keep the raw rows so that, once the
+        // total crosses the threshold, everything can be re-encoded in a
+        // properly fitted coordinate system rather than being frozen to
+        // identity by whatever the first add happened to contain.
+        if let Some(buffered) = self.warmup.as_ref().map(|b| b.len() / dim) {
+            if buffered + n < encode::TQPLUS_MIN_SAMPLES {
+                // Still below the threshold: buffer the rows and encode
+                // them under identity so the index stays fully
+                // searchable and serializable in the meantime. Declared
+                // calibration stays identity, which is exactly how these
+                // codes were produced.
+                // Encode FIRST. `encode_and_append` has an unwind guard
+                // that restores the index to its pre-call state without
+                // incrementing `n_vectors`, so extending the buffer
+                // before it would leave `warmup.len()/dim` ahead of
+                // `n_vectors` after a caught panic — permanently breaking
+                // "buffer row i is slot i" and resurrecting the failed
+                // batch's rows into the re-encode (#353).
+                self.encode_and_append(vectors, n, dim);
+                self.warmup
+                    .as_mut()
+                    .expect("warmup is Some in this branch")
+                    .extend_from_slice(vectors);
+                return;
+            }
+            // Threshold crossed. Leave warm-up for good.
+            let buffer = self.warmup.take().expect("warmup is Some in this branch");
+            if buffer.is_empty() {
+                // Nothing to re-encode — this batch alone fits the
+                // calibration, which is the plain bulk-add path.
+                self.encode_and_append(vectors, n, dim);
+                return;
+            }
+            // Fit the calibration up front so the buffered rows and this
+            // batch land in the same coordinate system, then re-encode
+            // the buffered rows (their identity-encoded codes are
+            // discarded) followed by this batch. Slot order is preserved,
+            // so external id maps stay valid.
+            //
+            // The fit sample is this batch when it alone clears the
+            // threshold (a copy of a potentially huge batch would be the
+            // only way to include the <1000 buffered rows, and they could
+            // not move the quantiles anyway); otherwise the concatenation
+            // of buffer + batch, which is at most ~2000 rows.
+            let rotation = self.rotation.get_or_init(|| rotation::Rotation::new(dim));
+            let mut scratch = std::mem::take(&mut self.encode_scratch);
+            let concat;
+            let (fit_src, fit_n): (&[f32], usize) = if n >= encode::TQPLUS_MIN_SAMPLES {
+                (vectors, n)
+            } else {
+                concat = [buffer.as_slice(), vectors].concat();
+                (concat.as_slice(), buffered + n)
+            };
+            let (shift, scale_tq) =
+                encode::fit_calibration(fit_src, fit_n, dim, rotation, &mut scratch);
+            self.encode_scratch = scratch;
+            // Drop the identity-encoded rows and commit the fitted
+            // calibration before re-encoding, so both encode calls below
+            // take the reuse path with the new calibration.
+            self.packed_codes = OnceLock::from(Vec::new());
+            self.scales.clear();
+            self.n_vectors = 0;
+            self.blocked = OnceLock::new();
+            self.tqplus_shift = shift;
+            self.tqplus_scale = scale_tq;
+            self.encode_and_append(&buffer, buffered, dim);
+            self.encode_and_append(vectors, n, dim);
+            return;
+        }
+
+        self.encode_and_append(vectors, n, dim);
+    }
+
+    /// Encode `n` rows and append them to the stored codes, using the
+    /// committed calibration when there is one and fitting (and
+    /// committing) a fresh one otherwise. Assumes the caller has already
+    /// validated `vectors` and resolved `dim`.
+    /// Test-only switch that makes the next `encode` call panic, so tests
+    /// can exercise the unwind guard below — and the ordering that guard
+    /// depends on (#353). Panics inside `encode` are otherwise only
+    /// reachable via a kernel invariant assert or a rayon worker fault,
+    /// neither of which is inducible through the public API. Compiled only
+    /// under `cfg(test)`, like `search::FORCE_SCALAR_FALLBACK`.
+    #[cfg(test)]
+    pub(crate) fn force_encode_panic(on: bool) {
+        FORCE_ENCODE_PANIC.store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn encode_and_append(&mut self, vectors: &[f32], n: usize, dim: usize) {
         let rotation = self
             .rotation
             .get_or_init(|| rotation::Rotation::new(dim));
@@ -427,6 +622,11 @@ impl TurboQuantIndex {
         let scales_len_before = scales_buf.len();
         let bit_width = self.bit_width;
         let encode_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            #[cfg(test)]
+            if FORCE_ENCODE_PANIC.load(std::sync::atomic::Ordering::Relaxed) {
+                FORCE_ENCODE_PANIC.store(false, std::sync::atomic::Ordering::Relaxed);
+                panic!("forced encode panic (test)");
+            }
             encode::encode(
                 vectors,
                 n,
@@ -466,11 +666,18 @@ impl TurboQuantIndex {
         self.encode_scratch = scratch;
         self.scales = scales_buf;
 
-        if self.n_vectors == 0 {
+        // Commit only what `encode` actually produced. It returns a
+        // non-empty pair exactly when it fitted one for this batch (i.e.
+        // `existing` was `None`); on the reuse path it returns empty
+        // vectors, and assigning those would declare identity
+        // calibration over codes encoded with the committed one —
+        // silently wrong scores, and an `n_calib = 0` trailer on the
+        // next write. That is what the old `n_vectors == 0` guard did
+        // after an index was drained to empty and re-added to (#284).
+        if !shift.is_empty() {
             self.tqplus_shift = shift;
             self.tqplus_scale = scale_tq;
         }
-        // else: tqplus_shift/scale unchanged — locked by the first add.
         let old_n = self.n_vectors;
         // `n_vectors` is published only once the store it must agree with
         // is consistent (below, per branch). Incrementing first would
@@ -539,6 +746,10 @@ impl TurboQuantIndex {
     /// index dim; on an already-dim'd index `dim` must match the index's
     /// existing dim.
     ///
+    /// A zero-row batch is a no-op: `dim` is still validated (and must
+    /// match an already-locked dim), but a lazy index stays lazy and its
+    /// serialized bytes are unchanged.
+    ///
     /// This is the form that bindings with shape information (e.g. the
     /// Python binding receiving a 2D numpy array) should use, since a
     /// flat `&[f32]` alone is ambiguous about its shape.
@@ -550,6 +761,9 @@ impl TurboQuantIndex {
     ///   to a dim that is not a multiple of 8.
     /// - [`AddError::InvalidInputValue`] if any coordinate is non-finite
     ///   or has magnitude `>= 1e16`.
+    ///
+    /// A vector whose L2 norm is `<= 1e-10` ([`MIN_INPUT_NORM`]) is
+    /// accepted and stored with scale 0 — see that constant.
     ///
     /// # Panics
     ///
@@ -597,6 +811,16 @@ impl TurboQuantIndex {
             0,
             "vectors length must be a multiple of dim"
         );
+        // A zero-row batch is a no-op (see the guard in `add`), so return
+        // before the lazy dim commit below. Committing first made a no-op
+        // permanently lock a lazy index's dim and change its serialized
+        // bytes (the `dim=0` sentinel became the batch's dim), which then
+        // survived save/load (#308). The dim validation above still runs,
+        // so a zero-row batch with a mismatched or malformed dim reports
+        // the same error it always did.
+        if vectors.is_empty() {
+            return Ok(());
+        }
         // Lazy commit happens via add() (which goes through `self.dim.expect`),
         // so re-do the dim assignment here for the lazy-first-add case.
         if self.dim.is_none() {
@@ -716,19 +940,30 @@ impl TurboQuantIndex {
                 m.len(),
                 self.n_vectors,
             );
-            let n_words = (self.n_vectors + 63) / 64;
-            let mut buf = vec![0u64; n_words];
-            for (i, &b) in m.iter().enumerate() {
-                if b {
-                    buf[i >> 6] |= 1u64 << (i & 63);
+            // Build word-at-a-time out of 64-bool chunks and count the
+            // allowed slots in the same pass. The byte-at-a-time form
+            // this replaces did one bounds-checked read-modify-write of
+            // `buf` per slot and then a second full pass to popcount,
+            // which is measurable (sub-millisecond but a double-digit
+            // share of masked-search time) at index sizes in the
+            // millions.
+            let n_words = self.n_vectors.div_ceil(64);
+            let mut buf = Vec::with_capacity(n_words);
+            let mut allowed = 0usize;
+            for chunk in m.chunks(64) {
+                let mut word = 0u64;
+                for (bit, &b) in chunk.iter().enumerate() {
+                    word |= (b as u64) << bit;
                 }
+                allowed += word.count_ones() as usize;
+                buf.push(word);
             }
-            buf
+            debug_assert_eq!(buf.len(), n_words);
+            (buf, allowed)
         });
 
-        let n_allowed = packed_mask.as_ref().map_or(self.n_vectors, |p| {
-            p.iter().map(|w| w.count_ones() as usize).sum::<usize>()
-        });
+        let n_allowed = packed_mask.as_ref().map_or(self.n_vectors, |p| p.1);
+        let packed_mask = packed_mask.map(|p| p.0);
         let effective_k = k.min(self.n_vectors).min(n_allowed);
 
         let (scores, indices) = search::search(
@@ -1026,6 +1261,12 @@ impl TurboQuantIndex {
                 } else {
                     OnceLock::new()
                 };
+                // Same identity-population / warm-up decision
+                // `from_parts` applies on the v5 arm — skipping it left
+                // a v6 file with an empty TQ+ trailer able to swallow a
+                // later add whole (#303).
+                let (tqplus_shift, tqplus_scale, warmup) =
+                    Self::normalize_calibration(dim_opt, n_vectors, tqplus_shift, tqplus_scale);
                 Ok(Self {
                     dim: dim_opt,
                     bit_width,
@@ -1034,6 +1275,7 @@ impl TurboQuantIndex {
                     scales,
                     tqplus_shift,
                     tqplus_scale,
+                    warmup,
                     encode_scratch: Vec::new(),
                     rotation: OnceLock::new(),
                     boundaries: boundaries_lock,
@@ -1071,6 +1313,12 @@ impl TurboQuantIndex {
                 } else {
                     OnceLock::new()
                 };
+                // Same identity-population / warm-up decision
+                // `from_parts` applies on the v5 arm — skipping it left
+                // a v6 file with an empty TQ+ trailer able to swallow a
+                // later add whole (#303).
+                let (tqplus_shift, tqplus_scale, warmup) =
+                    Self::normalize_calibration(dim_opt, n_vectors, tqplus_shift, tqplus_scale);
                 Ok(Self {
                     dim: dim_opt,
                     bit_width,
@@ -1079,6 +1327,7 @@ impl TurboQuantIndex {
                     scales,
                     tqplus_shift,
                     tqplus_scale,
+                    warmup,
                     encode_scratch: Vec::new(),
                     rotation: OnceLock::new(),
                     boundaries: boundaries_lock,
@@ -1086,6 +1335,39 @@ impl TurboQuantIndex {
                     blocked,
                 })
             }
+        }
+    }
+
+    /// Normalize the calibration state every construction path must
+    /// agree on, given the decoded `(tqplus_shift, tqplus_scale)` and the
+    /// number of stored vectors. Returns the calibration to store plus
+    /// the initial warm-up buffer.
+    ///
+    /// Two rules, both mandatory:
+    ///
+    /// - **Stored rows always come with a declared calibration.** A
+    ///   payload with `n_vectors > 0` and an empty TQ+ pair (the v2 wire
+    ///   shape, and what the public [`io`] writers permit) gets explicit
+    ///   identity. Left empty, the next `add` would see the lazy
+    ///   `existing = None` signal, fit a fresh calibration, encode the
+    ///   new rows in it and — before #285's commit-site fix — drop it,
+    ///   producing vectors that `len` counts but search can never
+    ///   return (#303).
+    /// - **Nothing stored and nothing declared means warm-up.** Such an
+    ///   index is indistinguishable from a fresh one, so it may still
+    ///   fit a real calibration from what arrives next.
+    fn normalize_calibration(
+        dim: Option<usize>,
+        n_vectors: usize,
+        tqplus_shift: Vec<f32>,
+        tqplus_scale: Vec<f32>,
+    ) -> (Vec<f32>, Vec<f32>, Option<Vec<f32>>) {
+        if !tqplus_shift.is_empty() {
+            return (tqplus_shift, tqplus_scale, None);
+        }
+        match dim {
+            Some(d) if n_vectors > 0 => (vec![0.0; d], vec![1.0; d], None),
+            _ => (tqplus_shift, tqplus_scale, Some(Vec::new())),
         }
     }
 
@@ -1302,28 +1584,11 @@ impl TurboQuantIndex {
             return Err(FromPartsError::InvalidTqplusScaleValue { coord: i, value: v });
         }
 
-        // v2 files (pre-TQ+) load with empty TQ+ vectors and a positive
-        // n_vectors. If we leave `tqplus_shift` empty, the next `add()`
-        // would see `existing = None` (the lazy-first-add signal),
-        // call `encode()` with `existing = None`, get a fresh fitted
-        // calibration back — and then silently drop it because
-        // `n_vectors != 0` takes the else branch that only extends
-        // `packed_codes` / `scales`. The new vectors would be encoded
-        // with that fitted calibration but searched against identity,
-        // producing silently-wrong scores.
-        //
-        // Populate explicit identity here so the "is the calibration
-        // committed?" check always agrees with the actual state of the
-        // stored vectors.
-        let (tqplus_shift, tqplus_scale) = if tqplus_shift.is_empty() && n_vectors > 0 {
-            let d = dim.expect(
-                "from_parts: n_vectors > 0 implies a committed dim — \
-                 mismatch indicates a corrupted side-car or a misuse",
-            );
-            (vec![0.0; d], vec![1.0; d])
-        } else {
-            (tqplus_shift, tqplus_scale)
-        };
+        // Identity-population / warm-up decision — see
+        // `normalize_calibration`. Shared with the v6 load arms so every
+        // construction path lands in the same calibration state.
+        let (tqplus_shift, tqplus_scale, warmup) =
+            Self::normalize_calibration(dim, n_vectors, tqplus_shift, tqplus_scale);
         Ok(Self {
             dim,
             bit_width,
@@ -1332,6 +1597,7 @@ impl TurboQuantIndex {
             scales,
             tqplus_shift,
             tqplus_scale,
+            warmup,
             rotation: OnceLock::new(),
             boundaries: OnceLock::new(),
             centroids: OnceLock::new(),
@@ -1365,6 +1631,22 @@ impl TurboQuantIndex {
     /// v2/identity index). Pairs with [`Self::from_parts`].
     pub fn tqplus_scale(&self) -> &[f32] {
         &self.tqplus_scale
+    }
+
+    /// Whether this index has a TQ+ calibration fitted, is still warming
+    /// up towards one, or is committed to identity for good. See
+    /// [`CalibrationState`].
+    pub fn calibration_state(&self) -> CalibrationState {
+        if self.warmup.is_some() {
+            return CalibrationState::WarmingUp;
+        }
+        let identity = self.tqplus_shift.iter().all(|&s| s == 0.0)
+            && self.tqplus_scale.iter().all(|&s| s == 1.0);
+        if identity {
+            CalibrationState::Identity
+        } else {
+            CalibrationState::Fitted
+        }
     }
 
     /// Remove the vector at `idx` in O(1) by swapping with the last vector.
@@ -1421,6 +1703,18 @@ impl TurboQuantIndex {
         self.scales.truncate(last);
         self.n_vectors -= 1;
 
+        // The warm-up buffer holds one raw row per slot in slot order,
+        // so it takes the same swap-remove. Keeping it aligned is what
+        // lets a later threshold-crossing add re-encode the survivors
+        // into their existing slots.
+        if let Some(buf) = self.warmup.as_mut() {
+            if idx != last {
+                let (head, tail) = buf.split_at_mut(last * dim);
+                head[idx * dim..(idx + 1) * dim].copy_from_slice(&tail[..dim]);
+            }
+            buf.truncate(last * dim);
+        }
+
         // Maintain the blocked cache with O(dim) lane ops: copy the last
         // vector's lane into the vacated slot, zero the vacated last lane
         // (serialization copies the cache verbatim — a stale lane would
@@ -1448,11 +1742,18 @@ impl TurboQuantIndex {
         self.n_vectors == 0
     }
 
-    /// Vector dimensionality, or `0` if this index was constructed lazily
-    /// and hasn't seen an add yet. `0` is a safe sentinel because the
-    /// eager constructor asserts `dim >= 8` (multiple of 8). Use
-    /// [`Self::dim_opt`] when you need to distinguish "not set" from a
-    /// (nonsensical) zero.
+    /// Vector dimensionality, or `0` for a lazy index that hasn't seen an
+    /// add yet.
+    ///
+    /// **Deprecated — prefer [`Self::dim_opt`].** The `0` is only safe for
+    /// comparisons, and callers do arithmetic with a dim: `buf.len() /
+    /// idx.dim()` divides by zero and `vec![0.0; idx.dim()]` silently
+    /// yields a zero-length buffer (#318). `dim_opt` makes the
+    /// uncommitted case impossible to ignore.
+    #[deprecated(
+        since = "0.10.0",
+        note = "returns 0 for a lazy index, which is unsafe to do arithmetic with; use dim_opt()"
+    )]
     pub fn dim(&self) -> usize {
         self.dim.unwrap_or(0)
     }
@@ -1547,7 +1848,7 @@ mod from_parts_tests {
             Vec::new(),
         )
         .unwrap();
-        assert_eq!(idx.dim(), 64);
+        assert_eq!(idx.dim_opt(), Some(64));
         assert_eq!(idx.len(), 2);
         // v2-shape input (empty TQ+) is populated with identity so the
         // committed-calibration check agrees with the stored vectors.

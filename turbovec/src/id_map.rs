@@ -41,15 +41,36 @@ use std::hash::{BuildHasherDefault, Hasher};
 /// Multiply-shift hasher for the external-id maps. Ids are caller-chosen
 /// u64s, not attacker-controlled protocol input, so SipHash's HashDoS
 /// resistance buys nothing here while costing a measurable slice of the
-/// O(1) remove path. Fibonacci multiply-shift mixes the input into both
-/// halves of the hash in one multiply — hashbrown derives the bucket
-/// index from the low bits and its 7-bit control tags from the top bits,
-/// and the multiply feeds entropy to both. Note the "not attacker
-/// controlled" premise is an application assumption: the hash is
-/// trivially invertible, so a service that lets untrusted callers choose
-/// ids inherits O(n) bucket-collision behavior on this map.
+/// O(1) remove path.
+///
+/// The multiply alone is not enough. hashbrown derives the bucket index
+/// from the **low** bits of the hash, and multiplication only propagates
+/// entropy upward: the low `t` bits of `id * K` depend solely on the low
+/// `t` bits of `id`. So any id scheme whose low bits are constant —
+/// `shard << 32 | seq` composite ids with `seq` starting at zero being
+/// the obvious benign one — lands every key in the same bucket region
+/// and the map degrades to linear probing over the whole table.
+///
+/// The finalizing xor-shift folds the high half back down, so the bucket
+/// index sees the entropy the multiply pushed up. Measured on 100k ids
+/// of the form `i << 32`: lookup went from 476 ms to 0.2 ms, i.e. from
+/// quadratic to flat, at no cost on sequential ids.
+///
+/// Note the "not attacker controlled" premise is still an application
+/// assumption: the hash remains trivially invertible, so a service that
+/// lets untrusted callers choose ids can still craft collisions.
 #[derive(Default)]
 pub(crate) struct IdHasher(u64);
+
+/// Fibonacci multiply plus an xor-shift finalizer (splitmix-style):
+/// mixes the input into both halves of the hash, then folds the high
+/// half into the low one so hashbrown's bucket index is well-distributed
+/// even for inputs whose low bits are constant.
+#[inline]
+fn mix(x: u64) -> u64 {
+    let z = x.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    z ^ (z >> 32)
+}
 
 impl Hasher for IdHasher {
     #[inline]
@@ -57,13 +78,13 @@ impl Hasher for IdHasher {
         // Only u64 keys are ever hashed by the id maps; this fallback
         // keeps the impl total for completeness.
         for &b in bytes {
-            self.0 = (self.0 ^ b as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            self.0 = mix(self.0 ^ b as u64);
         }
     }
 
     #[inline]
     fn write_u64(&mut self, i: u64) {
-        self.0 = i.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        self.0 = mix(i);
     }
 
     #[inline]
@@ -77,7 +98,7 @@ pub(crate) type IdBuildHasher = BuildHasherDefault<IdHasher>;
 use std::path::Path;
 
 use crate::io;
-use crate::{AddError, ConstructError, TurboQuantIndex};
+use crate::{AddError, ConstructError, SearchError, TurboQuantIndex};
 
 /// ID-addressed wrapper around [`TurboQuantIndex`].
 #[derive(Debug)]
@@ -317,7 +338,9 @@ impl IdMapIndex {
     /// as `scores.len() / nq` when `nq > 0` (a lazy-uninitialized index
     /// has no committed `dim` and returns empty results).
     pub fn search(&self, queries: &[f32], k: usize) -> (Vec<f32>, Vec<u64>) {
+        // Only the allowlist can produce a SearchError, and there is none.
         self.search_with_allowlist(queries, k, None)
+            .expect("search_with_allowlist cannot fail without an allowlist")
     }
 
     /// Search restricted to the given `allowlist` of external ids.
@@ -327,29 +350,33 @@ impl IdMapIndex {
     /// per query is `min(k, number of unique ids in allowlist)`, so repeated
     /// ids don't widen the result.
     ///
-    /// Panics if `allowlist` is empty or contains an id not currently
-    /// present in the index. Duplicate ids in the allowlist are accepted
-    /// and deduplicated.
+    /// Returns [`SearchError::AllowlistEmpty`] if `allowlist` is `Some`
+    /// and empty, or [`SearchError::UnknownId`] if it contains an id not
+    /// currently present in the index. Duplicate ids in the allowlist are
+    /// accepted and deduplicated.
     ///
-    /// Passing `allowlist = None` is equivalent to [`Self::search`].
+    /// Passing `allowlist = None` is equivalent to [`Self::search`] and
+    /// never returns an error.
     pub fn search_with_allowlist(
         &self,
         queries: &[f32],
         k: usize,
         allowlist: Option<&[u64]>,
-    ) -> (Vec<f32>, Vec<u64>) {
-        let mask_buf: Option<Vec<bool>> = allowlist.map(|ids| {
-            assert!(!ids.is_empty(), "allowlist is empty");
-            let mut mask = vec![false; self.inner.len()];
-            for &id in ids {
-                let slot = match self.ids().get(&id) {
-                    Some(&s) => s,
-                    None => panic!("id {id} in allowlist is not present in index"),
-                };
-                mask[slot] = true;
+    ) -> Result<(Vec<f32>, Vec<u64>), SearchError> {
+        let mask_buf: Option<Vec<bool>> = match allowlist {
+            Some(ids) => {
+                if ids.is_empty() {
+                    return Err(SearchError::AllowlistEmpty);
+                }
+                let mut mask = vec![false; self.inner.len()];
+                for &id in ids {
+                    let slot = *self.ids().get(&id).ok_or(SearchError::UnknownId(id))?;
+                    mask[slot] = true;
+                }
+                Some(mask)
             }
-            mask
-        });
+            None => None,
+        };
 
         let res = self
             .inner
@@ -366,7 +393,7 @@ impl IdMapIndex {
             let id = self.slot_to_id[slot as usize];
             ids.push(id);
         }
-        (res.scores, ids)
+        Ok((res.scores, ids))
     }
 
     /// True if the index currently contains a vector with this id.
@@ -382,10 +409,17 @@ impl IdMapIndex {
         self.slot_to_id.is_empty()
     }
 
-    /// Vector dimensionality, or `0` if the index is lazy and hasn't
-    /// seen an add yet (matches [`TurboQuantIndex::dim`] semantics).
+    /// Vector dimensionality, or `0` for a lazy index that hasn't seen an
+    /// add yet.
+    ///
+    /// **Deprecated — prefer [`Self::dim_opt`].** See
+    /// [`TurboQuantIndex::dim`] for why the `0` is a footgun (#318).
+    #[deprecated(
+        since = "0.10.0",
+        note = "returns 0 for a lazy index, which is unsafe to do arithmetic with; use dim_opt()"
+    )]
     pub fn dim(&self) -> usize {
-        self.inner.dim()
+        self.inner.dim_opt().unwrap_or(0)
     }
 
     /// Vector dimensionality as an [`Option`], where `None` means the
@@ -404,9 +438,25 @@ impl IdMapIndex {
         self.inner.prepare();
     }
 
+    /// TQ+ calibration state of the inner index. See
+    /// [`TurboQuantIndex::calibration_state`] and
+    /// [`CalibrationState`](crate::CalibrationState).
+    pub fn calibration_state(&self) -> crate::CalibrationState {
+        self.inner.calibration_state()
+    }
+
     /// See [`TurboQuantIndex::packed_ready`].
     pub fn packed_ready(&self) -> bool {
         self.inner.packed_ready()
+    }
+
+    /// True when the lazy id → slot map is already materialized. A v6 load
+    /// leaves it empty (see [`Self::ids`]), so the first `remove` after a
+    /// load pays an O(n) map build; callers that must not stall on that
+    /// (the Python binding, which would hold the GIL — issue #319) probe
+    /// this first. Like [`Self::packed_ready`] it only goes false → true.
+    pub fn slots_ready(&self) -> bool {
+        self.id_to_slot.get().is_some()
     }
 
     /// Serialize to a `.tvim` file — the inner quantized index plus the

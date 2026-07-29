@@ -178,6 +178,26 @@ appears under each surface it touches.
 
 #### Changed
 
+- **Breaking: `IdMapIndex::search_with_allowlist` returns
+  `Result<(Vec<f32>, Vec<u64>), SearchError>` (#318).** It previously
+  panicked on an empty allowlist and on an allowlist id missing from the
+  index. Both are input conditions — allowlists are built from the
+  caller's own metadata store, which drifts out of step with the index —
+  so in a service they killed the worker instead of returning an empty
+  page. They are now the new `SearchError::AllowlistEmpty` and
+  `SearchError::UnknownId(u64)` (`#[non_exhaustive]`, like the crate's
+  other error enums). The allowlist-free `IdMapIndex::search` is
+  unchanged and still returns the tuple directly. Migration: add `?` or
+  `.unwrap()` at `search_with_allowlist` call sites. The Python binding
+  already raised `ValueError` / `KeyError` for both and is unaffected.
+- **`TurboQuantIndex::dim()` / `IdMapIndex::dim()` are deprecated in favour
+  of `dim_opt()` (#318).** They still return `usize`, still return the `0`
+  sentinel for a lazy index, and still behave exactly as before on a
+  committed index — nothing breaks. The deprecation is the signal: `0` is
+  only safe for comparisons, but callers do arithmetic with a dim, so
+  `buf.len() / idx.dim()` divided by zero and `vec![0.0f32; idx.dim()]`
+  silently built a zero-length buffer. `dim_opt() -> Option<usize>` makes
+  the uncommitted case impossible to ignore.
 - **Stored per-vector scales may differ by ~1 ULP from earlier v5
   builds** for newly encoded vectors: the scale's f64 reconstruction
   inner product now accumulates through four fixed chains instead of
@@ -248,6 +268,39 @@ appears under each surface it touches.
 
 #### Fixed
 
+- **A zero-row `add_2d` no longer commits a lazy index's dim (#308).**
+  `add_2d` set `self.dim` before delegating to `add`, whose zero-row
+  no-op guard then returned — so an empty batch permanently locked the
+  dim of a lazy index, changed its serialized bytes (the `dim=0` sentinel
+  became the batch's dim) and survived save/load, making a later add of
+  the real dimensionality fail with `DimMismatch`.
+  `IdMapIndex::add_with_ids_2d` inherited it. A zero-row batch is now a
+  true no-op: `dim` is still validated (a mismatch against an
+  already-committed dim, or a malformed lazy first dim, reports the same
+  error as before), but nothing is committed and the serialized bytes are
+  byte-identical to a pristine lazy index. Realistic trigger: a lazily
+  constructed framework store where `add_texts([])` or a filtered-to-empty
+  batch preceded the first real batch.
+- **TQ+ calibration is now a warm-up lifecycle instead of hidden
+  first-add state (#107, #284, #285, #303, #317).** An index buffers its
+  raw rows until it has seen 1000 vectors, then fits the calibration and
+  re-encodes those rows with it, in slot order — so a first `add` of
+  1–999 vectors (or a stream of 500-vector batches, the default shape of
+  every framework integration) no longer locks identity calibration and
+  silently forfeits the TQ+ recall gain for the index's whole life. The
+  buffer is bounded by 1000 rows and mirrors `swap_remove`. Three further
+  entrances to a mis-declared calibration are closed with it: the commit
+  site now writes only a calibration `encode` actually fitted, so
+  draining an index to empty and re-adding no longer overwrites the
+  fitted calibration with identity (#284); both v6 load arms of
+  `from_loaded` route through the same identity-population `from_parts`
+  performs, so a v6 file with an empty TQ+ trailer plus a later `add` no
+  longer produces vectors that `len` counts but search can never return
+  (#303); and the new `TurboQuantIndex::calibration_state` /
+  `IdMapIndex::calibration_state` accessors make the state queryable
+  instead of invisible (#317). No file-format change: a stored index
+  always declares exactly the calibration its codes were encoded with,
+  and files written by earlier versions load unchanged.
 - **Declared MSRV corrected from 1.83 to 1.89 — the crate did not build
   on the version it advertised.** The AVX-512 search kernel added in the
   v6 cycle uses `_mm512_*` intrinsics and the `avx512f`/`avx512bw`
@@ -584,6 +637,75 @@ appears under each surface it touches.
 
 #### Fixed
 
+- **A zero-row `add` / `add_with_ids` no longer commits a lazy index's
+  dim (#308).** `TurboQuantIndex(bit_width=4)` followed by
+  `idx.add(np.zeros((0, 768), np.float32))` left `idx.dim == 768`, so the
+  next real batch of a different dimensionality raised
+  `ValueError: dim mismatch`, and the wedged dim survived
+  `write` / `load` and `to_bytes` / `from_bytes`. An empty batch is now
+  the documented no-op: `idx.dim` stays `None` and `to_bytes()` is
+  byte-identical to a pristine lazy index.
+- **Framework integrations: four parallel implementations of the same
+  semantics, brought back into line (#321, #302, #322, #301).** The
+  langchain / llama_index / haystack / agno stores each re-implement the
+  same store contract, so a fix landed on one has repeatedly been missed
+  on its siblings. This round closes four such gaps:
+  - **agno: a failed `insert` could destroy a pre-existing document.**
+    The other three stores capture the previous state before the
+    maps-first write and restore it when the index add raises; agno's
+    unwind popped the handle unconditionally, so when a corrupt
+    `next_u64` watermark reissued a live handle the unwind deleted the
+    *victim's* payload and unlinked the *new* document's id and name.
+    agno now captures and restores like its siblings, restoring the
+    "a failed add never destroys existing data" guarantee.
+  - **Persisted-store validation now checks the handle watermark.**
+    `check_persisted_handles` verified duplicate handles, count parity
+    and index membership, but never that `next_u64` sits at or above the
+    largest handle in use — so a stale, hand-edited or partially-written
+    side-car loaded cleanly and then failed every subsequent write with
+    a leaked internal handle id. All four stores inherit the check.
+  - **llama_index: `delete(None)` wiped every parentless node.** Nodes
+    with no SOURCE relationship stored `ref_doc_id = None`, so
+    `delete(node.ref_doc_id)` on a parentless node deleted all of them.
+    A parentless node is now filed under the literal `"None"`, matching
+    `SimpleVectorStore`: `delete(None)` is a no-op, `delete("None")`
+    targets them.
+  - **llama_index metadata filters: two divergences from
+    `SimpleVectorStore`.** `TEXT_MATCH` is case-**insensitive** again
+    (the reference lowercases both sides), and a **missing** metadata key
+    now fails `NE`/`NIN` as it already failed every other operator — the
+    reference returns `False` for all operators once the value is absent.
+    The previous behaviour was justified against
+    `vector_stores.utils.build_metadata_filter_fn`, which does not exist
+    in the supported llama-index-core range; `simple.py` holds the only
+    in-tree evaluator and is now the reference of record.
+  - **langchain: `dot_product` mode no longer fakes a `[0, 1]`
+    relevance.** The relevance mapping clamped, so every raw inner
+    product `>= 1.0` became exactly `1.0` — a `similarity_score_threshold`
+    retriever admitted unrelated documents, and the clamp also suppressed
+    the out-of-range warning `VectorStore` emits. In `dot_product` mode
+    the mapping is now unclamped and selecting a relevance fn emits a
+    `UserWarning`; cosine (the default) is unchanged and still clamped.
+  - **Reference-parity API gaps.** langchain gains
+    `similarity_search_with_score_by_vector` (and its `a`-prefixed
+    variant) — the only non-deprecated public method the
+    `InMemoryVectorStore` reference exposes and we lacked, so user code
+    got `AttributeError` rather than `NotImplementedError`. haystack's
+    `embedding_retrieval` now performs the reference's up-front
+    `ValueError("query_embedding should be a non-empty list of floats.")`
+    instead of returning `[]` on an empty store or reporting a dim
+    mismatch. `top_k=-1` still raises here where the reference returns
+    `n - 1` documents: a negative count is a caller bug, not a request.
+- **TQ+ calibration warm-up (#107, #284, #285, #303, #317).** See the
+  Rust-crate entry for the lifecycle change. On the Python side: both
+  index types gain a read-only `calibration_state` property
+  (`"warming_up"` / `"fitted"` / `"identity"`); saving an index that is
+  still warming up emits a one-shot `RuntimeWarning`, because a file
+  carries no warm-up buffer and the reloaded copy is committed to
+  identity calibration for good; and the interruptibility wrapper no
+  longer chunks an add into a warming-up index, since the calibrating
+  add must see its whole batch to stay bit-identical to an unchunked
+  one (it already made the same exception for the first add).
 - **Fork safety: turbovec no longer deadlocks in a `fork()`ed child.**
   rayon's thread pool does not survive `fork()` — its worker threads live
   only in the parent, so the first parallel op a forked child ran (a batch
