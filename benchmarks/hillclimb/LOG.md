@@ -213,4 +213,69 @@ machinery from search_single_query_block_parallel.
   regression signal. ST parity.
 - Target HM ≈ x1.03 (ARM MT x1.12, others ~1.0), no target cell
   regressing.
-- **Verdict: WIN** — committed. Streak resets to 0.
+- **Verdict: WIN** — committed (bf0f672). Streak resets to 0.
+- Post-commit clean-state x86 A/B (box recovered): MT exact parity
+  (66.9x vs 66.9x, 3 rounds), ST parity — verdict stands.
+
+### H11 — parallel duplicate-id sort at load (target: load)
+
+par_sort_unstable for the load-time duplicate check above 64k ids.
+A/B: ARM ~x1.03 (noise-level), x86 parity (10.7 vs 10.6). The coldload
+climb's H17 refuted the same idea ("sort is cheaper than estimated") —
+lesson: cross-check scratch/coldload_log.md + save_log.md before
+implementing backlog items; the load and save paths were exhaustively
+climbed in prior sessions (23 and 15 hypotheses respectively).
+- **Verdict: NON-WIN** — discarded. Streak 1.
+
+### H12 (probe) — batch/parallelize per-query search prep (target: search)
+
+A 13 ms serial-prep reading on a tiny index implicated query prep; on
+re-measurement the probe was a machine-state fluke — prep for 100
+queries is ~0.6 ms and already parallel (rotation par_chunks, LUT build
+par_iter). No code written.
+- **Verdict: NON-WIN (probe-refuted)**. Streak 2.
+
+### H13 (probe) — 8-query code passes on x86 (target: search)
+
+Thread-scaling probe: x86 MT search scales x1.92 (1→2), x1.87 (2→4),
+x1.05 (4→8) — the c3-standard-8 is 4 physical cores + SMT and the
+AVX-512 kernel is port-saturated, not bandwidth-bound. Halving code
+traffic (the octet idea) cannot help a compute-bound kernel — matches
+the ARM H9 result. x86 search is at its kernel roofline at this
+abstraction. No code written.
+- **Verdict: NON-WIN (probe-refuted)**. Streak 3.
+
+### Floor analysis (not hypotheses)
+
+save-x86: 388 ms measured vs ~375 ms device floor (77 MB at pd-balanced
+~205 MB/s) — ≤13 ms total CPU-side headroom; S16/S17/S19/S20 backlog
+items can't clear 1% even if perfect. save is DONE absent a format
+change (forbidden). load: at the copy_to_user / page-cache memcpy
+ceilings established by the 23-hypothesis coldload climb. DONE.
+
+### H14 — sharded parallel id→slot map build (target: delete)
+
+The first remove after a load builds the 200k-entry id→slot HashMap
+serially (3.7 ms of the 8 ms x86 delete cell, ~0.8 ms on ARM). Sharded
+map (16 IdHasher-keyed HashMaps routed by mixed-id bits 34..38, point
+ops still O(1)) with parallel per-shard build. x86 measured the
+parallel build consistently ~2.5% SLOWER (both the 16-scan and the
+two-phase u8-index variants — 4-core SPR task overhead beats the
+divided inserts), so the build is arch-gated: parallel on aarch64
+(x1.12 MT / x1.05 ST on the delete A/B), serial routed build on x86
+(byte-identical work to unsharded).
+- Four variants tested: (1) parallel build both arches — x86 x0.975
+  consistent regression; (2) two-phase u8-index build — same; (3)
+  arch-gated build, single-shard x86 — still x0.977 (the Vec-wrapped
+  layout itself costs SPR); (4) full cfg-split with a zero-cost x86
+  wrapper + single-lock readiness probes — steady-state removes STILL
+  +14% (280 ns/call) on x86 with no remaining mechanism (codegen-level).
+  ARM held x1.05–x1.21 across variants.
+- En route, the fork-safety guard test caught a real bug in variant 1:
+  post-H8 the first remove runs un-pooled, so the parallel build would
+  have fanned out on the global rayon pool (#147 violation). Fixed via
+  an id_map_ready probe routing the first id-consulting call through
+  with_pool — pattern kept for the record but reverted with the rest.
+- **Verdict: FAIL** — target cells regress on x86 in every variant;
+  ARM-only gain doesn't clear the no-regression bar. All changes
+  reverted. Streak 4.
