@@ -899,6 +899,29 @@ appears under each surface it touches.
 
 ### Benchmarks
 
+- **Official persistence cells, x86 insert re-measure, and ARM
+  re-baseline (#279, #280).** The published ARM benchmark environment
+  moved from an Apple M3 Max laptop to a **GCP c4a-standard-8 (Google
+  Axion, 8 vCPU)** instance — release build, idle box — and every ARM
+  cell (search, insert, remove, persist) was re-measured there. The x86
+  cells stay on the same GCP c3-standard-8 (Sapphire Rapids) box; the
+  x86 insert and persist cells were re-measured on a clean release build
+  at the PR base commit (fresh `target/` + `maturin develop --release`,
+  provenance verified after an earlier run reused a pre-#277 build). The
+  fresh clean-build run agreed with the committed x86 insert numbers
+  within measurement noise across all 8 cells, so the committed bytes
+  were retained: #277's encode speedup was measured on Cascade Lake and
+  does not move Sapphire-Rapids bulk insert. (The agreement is what the
+  ST≈MT single-add invariant confirms — single `add()` is serial, so a
+  cell's ST and MT single-add timings must match, and across the grid
+  they do.) All 16 `speed_persist_*` cells
+  (arm + x86, both threadings) are now recorded in `benchmarks/results/`
+  and `create_diagrams.py` renders matching
+  `docs/{arm,x86}_persist_{st,mt}.svg` save/load figures (save-warm and
+  load→first-search as precision-matched TurboQuant-vs-FAISS pairs; the
+  mutate→save→load→search round-trip, which FAISS has no measured
+  equivalent for, shown TurboQuant-only). README search prose (ARM now
+  16–24%) and the ARM figure labels were updated to the new environment.
 - **Persistence benchmarks join the suite** (#275): `speed_persist_*`
   for every (dim, bit width, arch, threading) cell, covering write in
   both states (warm blocked cache vs invalidated by a mutation — ~5x
