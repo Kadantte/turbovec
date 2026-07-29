@@ -472,7 +472,14 @@ impl TurboQuantIndex {
         }
         // else: tqplus_shift/scale unchanged — locked by the first add.
         let old_n = self.n_vectors;
-        self.n_vectors += n;
+        // `n_vectors` is published only once the store it must agree with
+        // is consistent (below, per branch). Incrementing first would
+        // leave the count ahead of the codes if the cache update panicked
+        // — and in the lazy window the blocked cache is the *only*
+        // authoritative store, so anything reading `n_vectors` against it
+        // afterwards (search, swap_remove, serialization) would index
+        // past its real length.
+        let new_n = old_n + n;
 
         if lazy_append {
             // packed stays unset (the lock was left empty by take());
@@ -486,11 +493,15 @@ impl TurboQuantIndex {
                 .get_mut()
                 .expect("lazy_append requires a blocked cache");
             pack::append_lanes(&mut cache.data, &packed_codes, old_n, n, bit_width, dim);
-            let (new_n_blocks, _, _) = pack::blocked_geometry(self.n_vectors, bit_width, dim);
+            let (new_n_blocks, _, _) = pack::blocked_geometry(new_n, bit_width, dim);
             cache.n_blocks = new_n_blocks;
+            self.n_vectors = new_n;
             return;
         }
+        // Eager path: the packed rows are authoritative and already carry
+        // the new vectors, so the count is correct as soon as they land.
         self.packed_codes = OnceLock::from(packed_codes);
+        self.n_vectors = new_n;
 
         // Maintain the blocked cache incrementally instead of discarding
         // it: appended rows only affect the (possibly partial) tail block
@@ -498,20 +509,25 @@ impl TurboQuantIndex {
         // the packed rows. A cold cache stays cold (first search builds
         // it). Rotation, boundaries, and centroids remain valid (they
         // only depend on `(dim, ROTATION_SEED)` and `(bit_width, dim)`).
-        if let Some(cache) = self.blocked.get_mut() {
+        if self.blocked.get().is_some() {
             let (new_n_blocks, n_byte_groups, _) =
-                pack::blocked_geometry(self.n_vectors, self.bit_width, dim);
+                pack::blocked_geometry(new_n, self.bit_width, dim);
             let block_bytes = n_byte_groups * BLOCK;
             let first_block = old_n / BLOCK;
-            cache.data.truncate(first_block * block_bytes);
-            cache.data.extend_from_slice(&pack::repack_block_range(
+            // Build the patch BEFORE touching the cache: `truncate` then
+            // compute would leave a short cache behind if the repack
+            // panicked, and the cache is serialized verbatim.
+            let patch = pack::repack_block_range(
                 self.packed_codes.get().expect("packed materialized in add"),
-                self.n_vectors,
+                new_n,
                 self.bit_width,
                 dim,
                 first_block,
                 new_n_blocks,
-            ));
+            );
+            let cache = self.blocked.get_mut().expect("blocked present");
+            cache.data.truncate(first_block * block_bytes);
+            cache.data.extend_from_slice(&patch);
             cache.n_blocks = new_n_blocks;
         }
     }
