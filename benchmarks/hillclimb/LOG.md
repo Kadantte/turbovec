@@ -101,4 +101,43 @@ avx2_post_flush_heap_update design.
 - Target HM (x1.024, x1.052, x1.0, x1.0) = x1.019 > x1.01, no target cell
   regressing. Raw-vs-baseline search-arm reads x0.97 due to the documented
   Mac drift; A/B is authoritative per protocol.
-- **Verdict: WIN** — committed.
+- **Verdict: WIN** — committed (59d11f0).
+
+### H4 — x86 AVX-512 inner-loop prefetch, 512 B ahead (target: search)
+
+_mm_prefetch(T0) of both interleaved code streams 16 groups ahead in the
+AVX-512 batch kernel inner loop. A/B (3 rounds): x86_st x1.013 (all rounds
+better), x86 MT x1.004, ARM untouched — target HM x1.004 < x1.01.
+- **Verdict: NON-WIN** (real but below threshold) — discarded. Streak 1.
+
+### H5 — same prefetch at 1 KB ahead (target: search)
+
+PF_GROUPS=32 variant of H4. A/B (2 rounds): ST parity (251.1 vs 251.6), MT
+x0.998. The HW prefetcher covers the streams at this distance; H4's margin
+was the ceiling.
+- **Verdict: NON-WIN** — discarded. Streak 2.
+
+### H6 — swap_remove via O(dim) lane ops; no forced packed materialization (target: delete)
+
+swap_remove forced the O(n·dim) packed materialization in the v6-load
+window and patched the blocked cache with two full 32-vector block repacks
+(~34 allocs each) per remove. Now: packed rows are maintained only if
+already materialized (blocked stays authoritative in the lazy window —
+the lazy rebuild reconstructs post-removal state on demand), and the
+blocked cache is updated by copying the last vector's lane into the
+vacated slot, zeroing the vacated lane, and truncating (x86: nibble-merge
+write through INV_PERM0, exact inverse of the pack_blocked interleave).
+
+- Correctness: new io_v6 test — lazy vs eager removes byte-identical
+  (to_bytes + reconstructed packed) for bits 2/3/4 incl. remove-to-empty;
+  full suite green on BOTH arches (the x86 nibble-merge path runs the
+  determinism suite on the box).
+- Soak (15 reps): delete x87.6 arm / x139.3 x86 / x270.5 arm_st / x151.5
+  x86_st — target HM x138.5. WHM x1.73. arm_st delete (7.0 ms) now beats
+  arm MT (19.7 ms): the remaining MT cost is the per-remove pool handoff
+  in the bindings (future hypothesis: batch remove / skip pool for O(dim)
+  ops).
+- Flags (save-arm x0.855, save-arm_st x0.607, load-arm_st x0.846,
+  load_search-x86 x0.935) — all in documented noise bands; none shares a
+  code path with this diff (swap_remove + pack lane helpers only).
+- **Verdict: WIN** — committed. Streak resets to 0.
