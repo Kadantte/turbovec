@@ -466,7 +466,21 @@ sub-threshold headroom and the one large untried idea (AVX-512 quantize
 with pinned-order accumulation — ROI now sub-threshold since encode is
 ~2.8 ms of a 15 ms cell) are documented above for any future climb.
 
-Streak stands at 6 of 20; the credible hypothesis pool (this session's
+### H32 — two-run backward merge instead of extend+sort in the deferred id window (target: insert)
+
+Real mechanism (O(n) merge vs re-sort of 201k ids per add), refuted by
+measurement: pdqsort already exploits the sorted prefix. ARM parity
+(6.35 vs 6.29 MT amid rising drift); x86 x1.010–1.012 mixed — target
+HM ~x1.008 < 1.01. **NON-WIN** — reverted. Streak 7.
+
+### H33 — tail written after codes instead of before (target: save)
+
+Pure syscall-order question; page cache absorbs it: 383.7 vs 383.6 ms.
+**NON-WIN** — discarded. Streak 8.
+
+## Loop state
+
+Streak stands at 8 of 20; the credible hypothesis pool (this session's
 probes, the 23-hypothesis coldload climb, and the 15-hypothesis save
 climb) is exhausted at every measured floor: search kernels are
 port-saturated on both arches, save is at device throughput, load is at
