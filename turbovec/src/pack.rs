@@ -224,9 +224,10 @@ pub(crate) fn seq_to_packed(seq: &[u8], n_vectors: usize, bits: usize, dim: usiz
     // `interleave_blocks_x86_in_place`).
     const PAR_THRESHOLD: usize = 4 * 1024 * 1024;
     const ROWS_PER_CHUNK: usize = 512 * BLOCK;
+    let lut = build_unpack_lut(bits);
     let unpack_rows = |first_vec: usize, rows: &mut [u8]| {
         for (r, row) in rows.chunks_exact_mut(bytes_per_row).enumerate() {
-            unpack_row(seq, first_vec + r, row, bits, n_byte_groups, bytes_per_plane);
+            unpack_row(seq, first_vec + r, row, bits, n_byte_groups, bytes_per_plane, &lut);
         }
     };
     if packed.len() >= PAR_THRESHOLD {
@@ -241,8 +242,36 @@ pub(crate) fn seq_to_packed(seq: &[u8], n_vectors: usize, bits: usize, dim: usiz
     packed
 }
 
+/// Per-group-byte unpack table: entry `lut[b]` holds, for each plane `p`,
+/// a `codes_per_byte`-bit field at offset `p * codes_per_byte` whose bit
+/// `codes_per_byte - 1 - c` is bit `p` of the byte's `c`-th code. One
+/// lookup replaces the bit-by-bit inner loop of the naive unpack — the
+/// fields land in dim order, so a plane's output byte is just the fields
+/// of its `8 / codes_per_byte` group bytes shifted into place.
+fn build_unpack_lut(bits: usize) -> [u16; 256] {
+    let codes_per_byte = 8 / bits;
+    let mut lut = [0u16; 256];
+    for (b, e) in lut.iter_mut().enumerate() {
+        for c in 0..codes_per_byte {
+            let shift = if bits == 3 {
+                (codes_per_byte - 1 - c) * 4
+            } else {
+                (codes_per_byte - 1 - c) * bits
+            };
+            let code = (b >> shift) & ((1usize << bits) - 1);
+            for p in 0..bits {
+                if code & (1 << p) != 0 {
+                    *e |= 1 << (p * codes_per_byte + (codes_per_byte - 1 - c));
+                }
+            }
+        }
+    }
+    lut
+}
+
 /// Unpack one vector's bit-plane row from the sequential blocked layout —
-/// the per-row body of [`seq_to_packed`].
+/// the per-row body of [`seq_to_packed`]. Branch-free: one LUT lookup per
+/// group byte, `8 / codes_per_byte` group bytes assembled per plane byte.
 #[inline]
 fn unpack_row(
     seq: &[u8],
@@ -251,30 +280,28 @@ fn unpack_row(
     bits: usize,
     n_byte_groups: usize,
     bytes_per_plane: usize,
+    lut: &[u16; 256],
 ) {
     let codes_per_byte = 8 / bits;
-    {
-        let block_idx = vec_idx / BLOCK;
-        let lane = vec_idx % BLOCK;
-        for g in 0..n_byte_groups {
-            let byte_val = seq[(block_idx * n_byte_groups + g) * BLOCK + lane];
-            let dim_start = g * codes_per_byte;
-            for c in 0..codes_per_byte {
-                let shift = if bits == 3 {
-                    (codes_per_byte - 1 - c) * 4
-                } else {
-                    (codes_per_byte - 1 - c) * bits
-                };
-                let code = (byte_val >> shift) & ((1u8 << bits) - 1);
-                let j = dim_start + c;
-                let byte_in_plane = j / 8;
-                let bit_in_byte = 7 - (j % 8);
-                for p in 0..bits {
-                    if code & (1 << p) != 0 {
-                        row[p * bytes_per_plane + byte_in_plane] |= 1 << bit_in_byte;
-                    }
-                }
+    let groups_per_out = 8 / codes_per_byte;
+    let field_mask = (1u16 << codes_per_byte) - 1;
+    let block_idx = vec_idx / BLOCK;
+    let lane = vec_idx % BLOCK;
+    let group_base = block_idx * n_byte_groups;
+    debug_assert_eq!(n_byte_groups, bytes_per_plane * groups_per_out);
+    for ob in 0..bytes_per_plane {
+        let mut acc = [0u8; 4]; // one accumulator per plane; bits <= 4
+        for q in 0..groups_per_out {
+            let g = ob * groups_per_out + q;
+            let byte_val = seq[(group_base + g) * BLOCK + lane];
+            let e = lut[byte_val as usize];
+            let sh = 8 - codes_per_byte * (q + 1);
+            for (p, a) in acc.iter_mut().enumerate().take(bits) {
+                *a |= (((e >> (p * codes_per_byte)) & field_mask) as u8) << sh;
             }
+        }
+        for (p, a) in acc.iter().enumerate().take(bits) {
+            row[p * bytes_per_plane + ob] = *a;
         }
     }
 }
@@ -558,7 +585,14 @@ mod tests {
     /// non-multiple-of-32 vector counts (padded tail lanes).
     #[test]
     fn repack_seq_roundtrips_through_seq_to_packed() {
-        for (n, bits, dim) in [(7usize, 4usize, 64usize), (32, 2, 64), (100, 4, 96), (33, 2, 128)] {
+        for (n, bits, dim) in [
+            (7usize, 4usize, 64usize),
+            (32, 2, 64),
+            (100, 4, 96),
+            (33, 2, 128),
+            (50, 3, 64),
+            (33, 3, 128),
+        ] {
             let packed = pseudo_random_packed(n, bits, dim);
             let seq = super::repack_seq(&packed, n, bits, dim);
             let back = super::seq_to_packed(&seq, n, bits, dim);
