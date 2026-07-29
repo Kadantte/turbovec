@@ -1561,7 +1561,7 @@ pub(crate) fn search(
         let n_ranges = if n_threads == 1 {
             1
         } else {
-            (n_threads * 3)
+            (n_threads * 4)
                 .div_ceil(n_quads)
                 .min(n_blocks.div_ceil(MIN_TILE_BLOCKS))
                 .max(1)
@@ -1828,7 +1828,7 @@ pub(crate) fn search(
         let n_ranges = if n_threads == 1 || mask.is_some() || !simd_ok || force_scalar_any {
             1
         } else {
-            (n_threads * 3)
+            (n_threads * 4)
                 .div_ceil(n_quads)
                 .min(n_blocks.div_ceil(MIN_TILE_BLOCKS))
                 .max(1)
