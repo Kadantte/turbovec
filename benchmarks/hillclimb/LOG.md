@@ -279,3 +279,35 @@ divided inserts), so the build is arch-gated: parallel on aarch64
 - **Verdict: FAIL** — target cells regress on x86 in every variant;
   ARM-only gain doesn't clear the no-regression bar. All changes
   reverted. Streak 4.
+
+### H15 (probe) — fallocate before the save write (target: save)
+
+ctypes probe on the box: 77 MB write+fsync with/without fallocate(2) —
+429.1 vs 429.3 ms, spreads ±1 ms. Extent allocation is not a factor at
+pd-balanced device speed. (Complements save-climb S5, which only ruled
+out metadata set_len.)
+- **Verdict: NON-WIN (probe-refuted)**. Streak 5.
+
+### H16 (probe) — sync_file_range eager writeback during the save stream (target: save)
+
+Same harness, SYNC_FILE_RANGE_WRITE after each 8 MB chunk: 430.1 vs
+428.5 ms — slightly worse; kernel writeback already saturates the
+virtio queue. Confirms save-climb S9's conclusion by a second mechanism.
+- **Verdict: NON-WIN (probe-refuted)**. Streak 6.
+
+### H17 — overlap the v6 tail read/parse with the codes read (target: load)
+
+try_load_v6_fast read + validated the tail (scales + TQ+ + id table,
+~2.4 MB) serially after the 77 MB parallel codes read. The tail now
+reads and parses on a scoped thread (the load path's existing pattern)
+concurrent with read_range_parallel_transform.
+
+- Correctness: full suite green both arches (io_v6 exercises truncated/
+  corrupt tails through the same error paths — errors join back on the
+  main thread).
+- A/B x86 (3 rounds): load MT 10.97 → 10.49 (x1.046), ST 10.63 → 10.19
+  (x1.043), consistent. ARM: h17 ≤ head in all 4 paired rounds through
+  heavy ambient noise — positive-or-parity.
+- Target HM ≥ x1.022, no target cell regressing; only try_load_v6_fast
+  touched (load_search rides along).
+- **Verdict: WIN** — committed. Streak resets to 0.
