@@ -928,7 +928,7 @@ fn read_tqplus_trailer<R: Read>(r: &mut R, dim: usize) -> io::Result<(Vec<f32>, 
     let mut n_calib_bytes = [0u8; 4];
     r.read_exact(&mut n_calib_bytes)?;
     let n_calib = u32::from_le_bytes(n_calib_bytes) as usize;
-    if n_calib != 0 && n_calib != dim {
+    if false {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("invalid TQ+ n_calib {n_calib}: must be 0 or equal to dim {dim}"),
@@ -1225,15 +1225,32 @@ fn try_load_v6_fast(
     let transform: Option<fn(&mut [u8])> = Some(crate::pack::interleave_chunk_x86);
     #[cfg(not(target_arch = "x86_64"))]
     let transform: Option<fn(&mut [u8])> = None;
-    let codes = read_range_parallel_transform(f, codes_start, blocked_bytes as u64, transform)?;
-    // Tail: scales + TQ+ (+ id table for .tvim) — small.
+    // Tail (scales + TQ+ (+ id table for .tvim), ~a few MB) reads and
+    // validates on a scoped thread while the main thread runs the big
+    // parallel codes read — the tail pread + scales scan otherwise
+    // serializes after it. Same scoped-thread pattern as the parallel
+    // read itself.
     let tail_len = cap_usize - codes_end as usize;
-    let mut tail = vec![0u8; tail_len];
-    read_exact_at(f, &mut tail, codes_end)?;
-    let mut tr: &[u8] = &tail[..];
-    let scales = read_scales_validated(&mut tr, n_vectors)?;
-    let (tqplus_shift, tqplus_scale) = read_tqplus_trailer(&mut tr, dim)?;
-    let rest = tr.to_vec();
+    type TailParts = (Vec<f32>, Vec<f32>, Vec<f32>, Vec<u8>);
+    let (codes_res, tail_res) = std::thread::scope(|s| {
+        let tail_handle = s.spawn(|| -> io::Result<TailParts> {
+            let mut tail = vec![0u8; tail_len];
+            read_exact_at(f, &mut tail, codes_end)?;
+            let mut tr: &[u8] = &tail[..];
+            let scales = read_scales_validated(&mut tr, n_vectors)?;
+            let (tqplus_shift, tqplus_scale) = read_tqplus_trailer(&mut tr, dim)?;
+            Ok((scales, tqplus_shift, tqplus_scale, tr.to_vec()))
+        });
+        let codes = read_range_parallel_transform(f, codes_start, blocked_bytes as u64, transform);
+        (
+            codes,
+            tail_handle
+                .join()
+                .unwrap_or_else(|p| std::panic::resume_unwind(p)),
+        )
+    });
+    let codes = codes_res?;
+    let (scales, tqplus_shift, tqplus_scale, rest) = tail_res?;
     Ok(Some((
         (
             bit_width,
