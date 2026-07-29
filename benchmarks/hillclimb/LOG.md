@@ -72,4 +72,33 @@ Added bits=3 cases to the seq_to_packed round-trip test (was 2/4-bit only).
   state / cooldown; judge save primarily on x86 + A/B.
 - Correctness: cargo test -p turbovec --lib green (42), round-trip incl. new
   bits=3 cases.
+- **Verdict: WIN** — committed (13e3023).
+
+### Machine-state incident (between H2 and H3)
+
+ARM save cells ballooned to 450/1152 ms mid-session. Cause: every bench run
+leaked a 77 MB `out.tvim` in a fresh mkdtemp dir — ~89 dirs ≈ 7 GB, root disk
+down to 1.5 GiB free, SSD write path collapsing. Cleaned local + x86 temp dirs
+(disk back to 5.9 GiB) and fixed bench_ops.py to use TemporaryDirectory (auto
+cleanup). Consequence: the Mac's absolute numbers drift within a session —
+ARM verdicts rely on interleaved A/B per the noise-band protocol.
+
+### H3 — fused top-k + NEON block-max prune in ARM batch search (target: search)
+
+The ARM batch path materialized a 3.2 MB score matrix per query-quad
+(NEG_INFINITY fill + kernel store + branchy 200k-element rescan per query).
+Fold each scored block straight into per-query heaps (same visit order and
+rescan_min tie-break → bitwise-identical results), with a whole-block NEON
+max prune once the heap is full — the ARM analogue of the existing x86
+avx2_post_flush_heap_update design.
+
+- Correctness: all 20 test binaries green; bitwise parity vs H2 wheel on
+  random data with duplicate-row ties, mask, and single-query paths.
+- Interleaved A/B (3 rounds, 11 reps each, both cores same machine state):
+  search-arm_st 197.7 → 187.8 ms (x1.052 all rounds), search-arm 23.23 →
+  22.69 (x1.024). x86 cells untouched by construction (cfg(aarch64)) and
+  verified flat (67.17 vs 67.0 baseline).
+- Target HM (x1.024, x1.052, x1.0, x1.0) = x1.019 > x1.01, no target cell
+  regressing. Raw-vs-baseline search-arm reads x0.97 due to the documented
+  Mac drift; A/B is authoritative per protocol.
 - **Verdict: WIN** — committed.

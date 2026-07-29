@@ -916,7 +916,7 @@ unsafe fn score_4query_block_neon(
     vec_scales: &[f32],
     base_vec: usize,
     n_vectors: usize,
-    rows: [*mut f32; 4],
+    out: &mut [[f32; BLOCK]; 4],
 ) {
     use std::arch::aarch64::*;
 
@@ -979,25 +979,92 @@ unsafe fn score_4query_block_neon(
         }
     }
 
-    // Write with vec_scales
+    // Write with vec_scales; padding lanes get NEG_INFINITY so callers can
+    // take a whole-block max without seeing garbage.
     let end = (base_vec + BLOCK).min(n_vectors);
     let vec_scales_ptr = vec_scales.as_ptr().add(base_vec);
 
     for q in 0..4 {
-        let rp = rows[q].add(base_vec);
+        let op = out[q].as_mut_ptr();
         if end - base_vec == BLOCK {
             for i in 0..8 {
                 let n = vld1q_f32(vec_scales_ptr.add(i * 4));
-                vst1q_f32(rp.add(i * 4), vmulq_f32(fa[q][i], n));
+                vst1q_f32(op.add(i * 4), vmulq_f32(fa[q][i], n));
             }
         } else {
             let mut buf = [0.0f32; BLOCK];
             for i in 0..8 {
                 vst1q_f32(buf.as_mut_ptr().add(i * 4), fa[q][i]);
             }
-            for lane in 0..(end - base_vec) {
-                *rp.add(lane) = buf[lane] * *vec_scales_ptr.add(lane);
+            for lane in 0..BLOCK {
+                *op.add(lane) = if lane < end - base_vec {
+                    buf[lane] * *vec_scales_ptr.add(lane)
+                } else {
+                    f32::NEG_INFINITY
+                };
             }
+        }
+    }
+}
+
+/// Fold one scored block into a query's running top-k — the ARM analogue
+/// of the x86 post-flush heap update. Insertion order is lane-ascending
+/// within block-ascending visits, so together with [`rescan_min`]'s
+/// evict-largest-index tie-break the results are identical to a flat
+/// index-order scan of a fully materialized score row.
+///
+/// `block_scores` must hold NEG_INFINITY in padding lanes (the kernels
+/// guarantee this) so the whole-block max prune can read all 32 lanes.
+#[cfg(target_arch = "aarch64")]
+#[inline]
+unsafe fn neon_block_topk_update(
+    block_scores: &[f32; BLOCK],
+    base_vec: usize,
+    end_lane: usize,
+    mask: Option<&[u64]>,
+    k: usize,
+    hs: &mut [f32],
+    hi: &mut [u64],
+    sz: &mut usize,
+    hmin: &mut f32,
+    hmi: &mut usize,
+) {
+    use std::arch::aarch64::*;
+
+    if *sz >= k {
+        // Whole-block prune: skip the lane loop when nothing can beat the
+        // current heap minimum (the overwhelmingly common case once the
+        // heap is warm).
+        let p = block_scores.as_ptr();
+        let mut m = vld1q_f32(p);
+        for i in 1..8 {
+            m = vmaxq_f32(m, vld1q_f32(p.add(i * 4)));
+        }
+        if vmaxvq_f32(m) <= *hmin {
+            return;
+        }
+    }
+    for (lane, &s) in block_scores.iter().enumerate().take(end_lane) {
+        if let Some(am) = mask {
+            if !mask_allows(am, base_vec + lane) {
+                continue;
+            }
+        }
+        if *sz < k {
+            hs[*sz] = s;
+            hi[*sz] = (base_vec + lane) as u64;
+            *sz += 1;
+            if *sz == k {
+                let (m, mi) = rescan_min(hs, hi, k);
+                *hmin = m;
+                *hmi = mi;
+            }
+        } else if s > *hmin {
+            hs[*hmi] = s;
+            hi[*hmi] = (base_vec + lane) as u64;
+            let (m, mi) = rescan_min(hs, hi, k);
+            *hmin = m;
+            *hmi = mi;
         }
     }
 }
@@ -1488,13 +1555,15 @@ pub(crate) fn search(
                 let qi_end = (qi_start + QBS).min(nq);
                 let batch_size = qi_end - qi_start;
 
-                // Materialize per-query scores rows so the 4-query kernel can
-                // write directly with offset = base_vec.
-                let mut scores_flat = vec![f32::NEG_INFINITY; QBS * n_vectors];
-                let rows: [*mut f32; QBS] = unsafe {
-                    let p = scores_flat.as_mut_ptr();
-                    [p, p.add(n_vectors), p.add(2 * n_vectors), p.add(3 * n_vectors)]
-                };
+                // Fused scoring + top-k: no per-quad score matrix. Each block's
+                // 32 scores live on the stack and fold straight into the
+                // per-query heaps (block-ascending, lane-ascending — the same
+                // visit order as the old flat scan, so results are identical).
+                let mut heap_s = vec![vec![f32::NEG_INFINITY; k]; batch_size];
+                let mut heap_i = vec![vec![0u64; k]; batch_size];
+                let mut heap_sz = [0usize; QBS];
+                let mut heap_min = [f32::NEG_INFINITY; QBS];
+                let mut heap_mi = [0usize; QBS];
 
                 if batch_size == QBS {
                     // Fast path: 4-query fused kernel
@@ -1516,21 +1585,30 @@ pub(crate) fn search(
                         query_luts[qi_start + 2].bias,
                         query_luts[qi_start + 3].bias,
                     ];
+                    let mut block_out = [[0.0f32; BLOCK]; QBS];
                     for block_idx in 0..n_blocks {
                         let base_vec = block_idx * BLOCK;
                         if !block_has_allowed(mask, base_vec) {
-                            // Mask leaves `scores_flat` at NEG_INFINITY for these
-                            // slots, so the per-query top-k scan below ignores them
-                            // and the skip is correctness-preserving for all 4
-                            // queries in the batch.
+                            // No allowed slot in the block: skipping it inserts
+                            // nothing, exactly like the old flat scan which left
+                            // NEG_INFINITY rows and mask-skipped every lane.
                             continue;
                         }
                         let block_offset = block_idx * n_byte_groups * BLOCK;
+                        let end_lane = (base_vec + BLOCK).min(n_vectors) - base_vec;
                         unsafe {
                             score_4query_block_neon(
                                 blocked_codes, lut_refs, block_offset, n_byte_groups,
-                                scales, biases, vec_scales, base_vec, n_vectors, rows,
+                                scales, biases, vec_scales, base_vec, n_vectors,
+                                &mut block_out,
                             );
+                            for q in 0..QBS {
+                                neon_block_topk_update(
+                                    &block_out[q], base_vec, end_lane, mask, k,
+                                    &mut heap_s[q], &mut heap_i[q], &mut heap_sz[q],
+                                    &mut heap_min[q], &mut heap_mi[q],
+                                );
+                            }
                         }
                     }
                 } else {
@@ -1538,61 +1616,36 @@ pub(crate) fn search(
                     for qi_off in 0..batch_size {
                         let qi = qi_start + qi_off;
                         let qlut = &query_luts[qi];
-                        let row_ptr = rows[qi_off];
                         for block_idx in 0..n_blocks {
                             let base_vec = block_idx * BLOCK;
                             if !block_has_allowed(mask, base_vec) {
                                 continue;
                             }
                             let block_offset = block_idx * n_byte_groups * BLOCK;
-                            let end = (base_vec + BLOCK).min(n_vectors);
+                            let end_lane = (base_vec + BLOCK).min(n_vectors) - base_vec;
                             let mut block_out = [0.0f32; BLOCK];
                             unsafe {
                                 score_4bit_block_neon(
                                     blocked_codes, &qlut.uint8_luts, block_offset, n_byte_groups,
                                     qlut.scale, qlut.bias, vec_scales, base_vec, n_vectors, &mut block_out,
                                 );
-                                for lane in 0..(end - base_vec) {
-                                    *row_ptr.add(base_vec + lane) = block_out[lane];
-                                }
+                                neon_block_topk_update(
+                                    &block_out, base_vec, end_lane, mask, k,
+                                    &mut heap_s[qi_off], &mut heap_i[qi_off],
+                                    &mut heap_sz[qi_off], &mut heap_min[qi_off],
+                                    &mut heap_mi[qi_off],
+                                );
                             }
                         }
                     }
                 }
 
-                // Per-query top-k scan over the materialized scores row.
+                // Sort each query's heap into descending-score order.
                 (0..batch_size)
                     .map(|qi_off| {
-                        let row_start = qi_off * n_vectors;
-                        let row = &scores_flat[row_start..row_start + n_vectors];
-                        let mut heap_s = vec![f32::NEG_INFINITY; k];
-                        let mut heap_i = vec![0u64; k];
-                        let mut heap_sz = 0usize;
-                        let mut heap_min = f32::NEG_INFINITY;
-                        let mut heap_mi = 0usize;
-                        for (i, &s) in row.iter().enumerate() {
-                            if let Some(m) = mask {
-                                if !mask_allows(m, i) { continue; }
-                            }
-                            if heap_sz < k {
-                                heap_s[heap_sz] = s;
-                                heap_i[heap_sz] = i as u64;
-                                heap_sz += 1;
-                                if heap_sz == k {
-                                    let (m, mi) = rescan_min(&heap_s, &heap_i, k);
-                                    heap_min = m;
-                                    heap_mi = mi;
-                                }
-                            } else if s > heap_min {
-                                heap_s[heap_mi] = s;
-                                heap_i[heap_mi] = i as u64;
-                                let (m, mi) = rescan_min(&heap_s, &heap_i, k);
-                                heap_min = m;
-                                heap_mi = mi;
-                            }
-                        }
-                        let mut pairs: Vec<(f32, u64)> = heap_s[..heap_sz].iter()
-                            .zip(heap_i[..heap_sz].iter())
+                        let sz = heap_sz[qi_off];
+                        let mut pairs: Vec<(f32, u64)> = heap_s[qi_off][..sz].iter()
+                            .zip(heap_i[qi_off][..sz].iter())
                             .map(|(&s, &i)| (s, i)).collect();
                         pairs.sort_unstable_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal).then_with(|| a.1.cmp(&b.1)));
                         let s: Vec<f32> = pairs.iter().map(|p| p.0).collect();
