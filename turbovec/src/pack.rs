@@ -217,8 +217,34 @@ pub(crate) fn blocked_geometry(n_vectors: usize, bits: usize, dim: usize) -> (us
     (n_blocks, n_byte_groups, n_blocks * n_byte_groups * BLOCK)
 }
 
+/// Per-plane-byte extraction table: `lut[p][b]` scatters the 8 bits of
+/// plane `p`'s byte `b` (dim-descending bit order) into the up-to-4
+/// group bytes an 8-dim chunk produces, as a little-endian u32 — one
+/// lookup per plane byte replaces the bit-by-bit gather (the mirror of
+/// [`build_unpack_lut`] on the packing side).
+fn build_extract_lut(bits: usize) -> [[u32; 256]; 4] {
+    let codes_per_byte = 8 / bits;
+    let field = if bits == 3 { 4 } else { bits };
+    let mut lut = [[0u32; 256]; 4];
+    for (p, plane) in lut.iter_mut().enumerate().take(bits) {
+        for (b, e) in plane.iter_mut().enumerate() {
+            let mut acc = 0u32;
+            for j in 0..8usize {
+                if b & (1 << (7 - j)) != 0 {
+                    let out_byte = j / codes_per_byte;
+                    let shift_in_byte = (codes_per_byte - 1 - (j % codes_per_byte)) * field;
+                    acc |= 1u32 << (out_byte * 8 + shift_in_byte + p);
+                }
+            }
+            *e = acc;
+        }
+    }
+    lut
+}
+
 /// Extract per-vector code bytes (one byte per byte-group) from the
 /// bit-plane packed rows — step 1 of every packed→blocked conversion.
+/// Branch-free: each 8-dim chunk is `bits` LUT lookups OR-ed together.
 fn extract_codes_flat(
     packed_codes: &[u8],
     n_vectors: usize,
@@ -229,32 +255,18 @@ fn extract_codes_flat(
     let codes_per_byte = 8 / bits;
     let n_byte_groups = dim / codes_per_byte;
     let bytes_per_row = bits * bytes_per_plane;
+    let n_out = 8 / codes_per_byte;
+    let lut = build_extract_lut(bits);
     let mut codes_flat = vec![vec![0u8; n_byte_groups]; n_vectors];
     for (vec_idx, row) in codes_flat.iter_mut().enumerate() {
-        for (g, byte_out) in row.iter_mut().enumerate() {
-            let dim_start = g * codes_per_byte;
-            let mut byte_val = 0u8;
-            for c in 0..codes_per_byte {
-                let j = dim_start + c;
-                let byte_in_plane = j / 8;
-                let bit_in_byte = 7 - (j % 8);
-                let mask = 1u8 << bit_in_byte;
-                let mut code = 0u8;
-                for p in 0..bits {
-                    let plane_byte =
-                        packed_codes[vec_idx * bytes_per_row + p * bytes_per_plane + byte_in_plane];
-                    if plane_byte & mask != 0 {
-                        code |= 1 << p;
-                    }
-                }
-                let shift = if bits == 3 {
-                    (codes_per_byte - 1 - c) * 4
-                } else {
-                    (codes_per_byte - 1 - c) * bits
-                };
-                byte_val |= code << shift;
+        let base = vec_idx * bytes_per_row;
+        for c in 0..bytes_per_plane {
+            let mut acc = 0u32;
+            for (p, plane) in lut.iter().enumerate().take(bits) {
+                acc |= plane[packed_codes[base + p * bytes_per_plane + c] as usize];
             }
-            *byte_out = byte_val;
+            let le = acc.to_le_bytes();
+            row[c * n_out..c * n_out + n_out].copy_from_slice(&le[..n_out]);
         }
     }
     codes_flat
