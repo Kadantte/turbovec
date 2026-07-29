@@ -499,9 +499,11 @@ impl TurboQuantIndex {
             return;
         }
         // Eager path: the packed rows are authoritative and already carry
-        // the new vectors, so the count is correct as soon as they land.
+        // the new vectors. The count is still published last (below), so
+        // that a panic in the cache patch cannot leave `n_vectors` ahead
+        // of a cache that is serialized verbatim — same rule as the lazy
+        // branch. Everything between uses `new_n` explicitly.
         self.packed_codes = OnceLock::from(packed_codes);
-        self.n_vectors = new_n;
 
         // Maintain the blocked cache incrementally instead of discarding
         // it: appended rows only affect the (possibly partial) tail block
@@ -530,6 +532,7 @@ impl TurboQuantIndex {
             cache.data.extend_from_slice(&patch);
             cache.n_blocks = new_n_blocks;
         }
+        self.n_vectors = new_n;
     }
 
     /// Add `vectors` of dimension `dim`. On a lazy index this locks the
