@@ -1596,7 +1596,12 @@ pub(crate) fn search(
         // identical work and visit order to the serial scan.
         const QBS: usize = 4;
         const MIN_TILE_BLOCKS: usize = 1024;
-        let n_quads = nq.div_ceil(QBS);
+        // `.max(1)`: an empty query batch (nq == 0) is a legal no-op —
+        // main returns empty results for it — but it would otherwise be
+        // the divisor below and panic with a divide-by-zero. The tile
+        // loop is empty at nq == 0 either way, so the merge yields the
+        // same empty result.
+        let n_quads = nq.div_ceil(QBS).max(1);
         let n_threads = rayon::current_num_threads().max(1);
         let n_ranges = if n_threads == 1 {
             1
@@ -1865,7 +1870,12 @@ pub(crate) fn search(
         #[cfg(not(test))]
         let force_scalar_any = false;
         const MIN_TILE_BLOCKS: usize = 1024;
-        let n_quads = nq.div_ceil(NQ_BATCH);
+        // `.max(1)`: an empty query batch (nq == 0) is a legal no-op —
+        // main returns empty results for it — but it would otherwise be
+        // the divisor below and panic with a divide-by-zero. The tile
+        // loop is empty at nq == 0 either way, so the merge yields the
+        // same empty result.
+        let n_quads = nq.div_ceil(NQ_BATCH).max(1);
         let n_threads = rayon::current_num_threads().max(1);
         let n_ranges = if n_threads == 1 || mask.is_some() || !simd_ok || force_scalar_any {
             1
