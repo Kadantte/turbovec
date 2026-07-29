@@ -310,4 +310,38 @@ concurrent with read_range_parallel_transform.
   heavy ambient noise — positive-or-parity.
 - Target HM ≥ x1.022, no target cell regressing; only try_load_v6_fast
   touched (load_search rides along).
+- **Verdict: WIN** — committed (ad35a84 + fix 60574e6 — the commit
+  accidentally swept a transient concurrent working-tree edit that
+  disabled the v5 n_calib check ('if false'); io_versioning caught it on
+  a clean x86 checkout and the follow-up commit restored it. PROCESS
+  RULE from here: `git diff` every file immediately before staging —
+  the working tree has a concurrent editor this session.)
+  Streak resets to 0.
+
+### H18 — block-repack bulk in append_lanes (target: insert)
+
+Route all block-aligned appended rows through repack_block_range instead
+of per-lane writes. ARM parity (lane writes were already byte stores);
+x86 parity-to-worse — pack_blocked's x86 path is the same scalar nibble
+loop, so the work merely reshuffled.
+- **Verdict: NON-WIN** — reverted. Streak 1.
+
+### H19 — fused warm-cache write: native borrow + per-chunk deinterleave in writer threads (target: save)
+
+tmpfs probe first: save-x86 = 44 ms CPU + ~347 ms device — the CPU side
+(whole-payload native_to_seq + 77 MB intermediate) ran serially before
+the parallel positioned writes. Now the write borrows the warm blocked
+cache directly; on x86 each writer thread deinterleaves its chunk into
+thread-local scratch before pwrite (transform is block-local → bytes
+identical, covered by a new cold-vs-warm file-byte test); on ARM the
+cache IS the sequential layout, so the 77 MB materialization copy
+disappears entirely (the save-climb's S3, now measurable via x86).
+
+- Suite green both arches (20 binaries); pytest 634 passed (llama-index
+  failure pre-existing).
+- A/B x86 (3 rounds): save MT 389.4 → 385.5 (x1.010), ST 405.3 → 385.8
+  (x1.051 — the serial deinterleave no longer bottlenecks the
+  rayon-independent writer threads). ARM: no systematic difference
+  through drift (mechanically a strict copy removal).
+- Target HM ≈ x1.015, no target cell regressing.
 - **Verdict: WIN** — committed. Streak resets to 0.

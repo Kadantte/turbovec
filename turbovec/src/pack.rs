@@ -566,6 +566,18 @@ fn deinterleave_chunk_x86(blocked: &[u8], out: &mut [u8]) {
 }
 
 /// SAFETY: caller must ensure SSSE3 is available. Inverse of
+/// Per-chunk native→sequential transform for the fused write path:
+/// deinterleave a block-aligned chunk of the native cache into `out`
+/// (resized to match). Chunk-local because the perm0 interleave never
+/// crosses a 32-byte block, so per-chunk output is byte-identical to the
+/// same range of a whole-buffer `native_to_seq`.
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn deinterleave_chunk_into(chunk: &[u8], out: &mut Vec<u8>) {
+    debug_assert_eq!(chunk.len() % BLOCK, 0);
+    out.resize(chunk.len(), 0);
+    deinterleave_blocks_x86(chunk, out);
+}
+
 /// [`interleave_chunk_ssse3`]: `ba = ((hi&0x0F)<<4) | (lo&0x0F)`,
 /// `bb = (hi&0xF0) | (lo>>4)`, scattered back through `INV_PERM0`.
 #[cfg(target_arch = "x86_64")]

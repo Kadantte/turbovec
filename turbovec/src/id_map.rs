@@ -357,6 +357,41 @@ impl IdMapIndex {
     ) -> std::io::Result<()> {
         // Mirror TurboQuantIndex::write: dim=0 means lazy-uninitialized.
         let (boundaries, centroids) = self.inner.codebook_for_write();
+        // Warm blocked cache: borrow it (fused per-chunk deinterleave in
+        // the x86 writer threads; direct borrow elsewhere) — see
+        // TurboQuantIndex::write_with_durability.
+        if let Some(native) = self.inner.blocked_native_for_write() {
+            #[cfg(target_arch = "x86_64")]
+            return io::write_id_map_native_with_durability(
+                path,
+                self.inner.bit_width(),
+                self.inner.dim_opt().unwrap_or(0),
+                self.inner.len(),
+                native,
+                &boundaries,
+                &centroids,
+                self.inner.scales(),
+                self.inner.tqplus_shift(),
+                self.inner.tqplus_scale(),
+                &self.slot_to_id,
+                durability,
+            );
+            #[cfg(not(target_arch = "x86_64"))]
+            return io::write_id_map_with_durability(
+                path,
+                self.inner.bit_width(),
+                self.inner.dim_opt().unwrap_or(0),
+                self.inner.len(),
+                native,
+                &boundaries,
+                &centroids,
+                self.inner.scales(),
+                self.inner.tqplus_shift(),
+                self.inner.tqplus_scale(),
+                &self.slot_to_id,
+                durability,
+            );
+        }
         io::write_id_map_with_durability(
             path,
             self.inner.bit_width(),
