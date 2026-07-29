@@ -95,10 +95,14 @@ pub struct IdMapIndex {
     /// `id_to_slot` is unset: the load already sorts the ids to validate
     /// uniqueness, and keeping the result lets post-load adds validate
     /// new ids by binary search instead of forcing the O(n) map build
-    /// into the add path. Cleared (and thereafter ignored) once the map
-    /// materializes — `ids_mut` is the only place the map goes live on a
-    /// loaded index.
-    sorted_ids: Vec<u64>,
+    /// into the add path. Freed the moment the map materializes (in
+    /// [`Self::ids`], so a load+search-only index doesn't carry it), and
+    /// ignored thereafter.
+    ///
+    /// `Mutex` purely for that free: materialization happens behind
+    /// `&self`. Mutating callers hold `&mut self` and use `get_mut`, so
+    /// they never lock; the one `lock` is the map build itself.
+    sorted_ids: std::sync::Mutex<Vec<u64>>,
 }
 
 impl IdMapIndex {
@@ -110,7 +114,7 @@ impl IdMapIndex {
             inner: TurboQuantIndex::new(dim, bit_width)?,
             slot_to_id: Vec::new(),
             id_to_slot: std::sync::OnceLock::from(HashMap::default()),
-            sorted_ids: Vec::new(),
+            sorted_ids: std::sync::Mutex::new(Vec::new()),
         })
     }
 
@@ -122,7 +126,7 @@ impl IdMapIndex {
             inner: TurboQuantIndex::new_lazy(bit_width)?,
             slot_to_id: Vec::new(),
             id_to_slot: std::sync::OnceLock::from(HashMap::default()),
-            sorted_ids: Vec::new(),
+            sorted_ids: std::sync::Mutex::new(Vec::new()),
         })
     }
 
@@ -130,19 +134,22 @@ impl IdMapIndex {
     /// load. Loads validated id uniqueness, so the sizes always agree.
     fn ids(&self) -> &HashMap<u64, usize, IdBuildHasher> {
         self.id_to_slot.get_or_init(|| {
-            self.slot_to_id
+            let map = self
+                .slot_to_id
                 .iter()
                 .enumerate()
                 .map(|(slot, &id)| (id, slot))
-                .collect()
+                .collect();
+            // The map is authoritative from here on; release the
+            // load-time sorted copy (8 bytes/vector) rather than carry
+            // it for the index's lifetime.
+            *self.sorted_ids.lock().expect("sorted_ids lock poisoned") = Vec::new();
+            map
         })
     }
 
     fn ids_mut(&mut self) -> &mut HashMap<u64, usize, IdBuildHasher> {
         self.ids();
-        // The map is authoritative from here on; the load-time sorted
-        // copy is dead weight (and would go stale).
-        self.sorted_ids = Vec::new();
         self.id_to_slot.get_mut().expect("ids just materialized")
     }
 
@@ -205,14 +212,18 @@ impl IdMapIndex {
         let deferred = self.id_to_slot.get().is_none();
         let mut seen_this_call: std::collections::HashSet<u64, IdBuildHasher> =
             std::collections::HashSet::with_capacity_and_hasher(n, IdBuildHasher::default());
-        for &id in ids {
-            let present = if deferred {
-                self.sorted_ids.binary_search(&id).is_ok()
-            } else {
-                self.ids().contains_key(&id)
-            };
-            if present || !seen_this_call.insert(id) {
-                return Err(AddError::IdAlreadyPresent(id));
+        if deferred {
+            let sorted = self.sorted_ids.get_mut().expect("sorted_ids lock poisoned");
+            for &id in ids {
+                if sorted.binary_search(&id).is_ok() || !seen_this_call.insert(id) {
+                    return Err(AddError::IdAlreadyPresent(id));
+                }
+            }
+        } else {
+            for &id in ids {
+                if self.ids().contains_key(&id) || !seen_this_call.insert(id) {
+                    return Err(AddError::IdAlreadyPresent(id));
+                }
             }
         }
 
@@ -229,8 +240,27 @@ impl IdMapIndex {
             // Keep the sorted table current for the next add's binary
             // searches; the map itself stays unset (a later lazy build
             // reads the extended slot_to_id and includes these rows).
-            self.sorted_ids.extend_from_slice(ids);
-            self.sorted_ids.sort_unstable();
+            // Two-run backward merge — O(old + new) per add, so a chatty
+            // post-load pattern (many small adds) never pays a full
+            // re-sort of the table.
+            let mut new_sorted = ids.to_vec();
+            new_sorted.sort_unstable();
+            let sorted = self.sorted_ids.get_mut().expect("sorted_ids lock poisoned");
+            let old_len = sorted.len();
+            sorted.resize(old_len + new_sorted.len(), 0);
+            let (mut i, mut j) = (old_len, new_sorted.len());
+            for k in (0..sorted.len()).rev() {
+                if j == 0 {
+                    break; // remaining prefix is already in place
+                }
+                if i > 0 && sorted[i - 1] > new_sorted[j - 1] {
+                    sorted[k] = sorted[i - 1];
+                    i -= 1;
+                } else {
+                    sorted[k] = new_sorted[j - 1];
+                    j -= 1;
+                }
+            }
         } else {
             self.ids_mut().reserve(n);
             for (i, &id) in ids.iter().enumerate() {
@@ -239,7 +269,6 @@ impl IdMapIndex {
         }
         self.slot_to_id.reserve(n);
         self.slot_to_id.extend_from_slice(ids);
-        let _ = base_slot;
 
         Ok(())
     }
@@ -523,7 +552,69 @@ impl IdMapIndex {
             inner,
             slot_to_id,
             id_to_slot: std::sync::OnceLock::new(),
-            sorted_ids: sorted,
+            sorted_ids: std::sync::Mutex::new(sorted),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn loaded_index() -> IdMapIndex {
+        let dim = 64usize;
+        let mut src = IdMapIndex::new(dim, 4).unwrap();
+        let vectors: Vec<f32> = (0..100 * dim).map(|i| (i % 97) as f32 / 97.0).collect();
+        let ids: Vec<u64> = (0..100u64).map(|i| 1000 + i * 7).collect();
+        src.add_with_ids(&vectors, &ids).unwrap();
+        let mut bytes = Vec::new();
+        src.write_to_writer(&mut bytes).unwrap();
+        IdMapIndex::from_bytes(&bytes).unwrap()
+    }
+
+    fn sorted_len(ix: &IdMapIndex) -> usize {
+        ix.sorted_ids.lock().expect("sorted_ids lock").len()
+    }
+
+    /// The load-time sorted table is released as soon as the id → slot
+    /// map materializes — including via a read-only path (`contains`),
+    /// so a load+search-only index never carries both.
+    #[test]
+    fn sorted_ids_freed_when_map_materializes() {
+        let ix = loaded_index();
+        assert_eq!(sorted_len(&ix), 100, "load should keep the sorted table");
+        assert!(ix.contains(1000), "sanity: id present");
+        assert_eq!(
+            sorted_len(&ix),
+            0,
+            "materializing the map must release the sorted table"
+        );
+    }
+
+    /// Deferred-window adds keep the sorted table sorted (the merge is
+    /// the only thing later binary searches can rely on).
+    #[test]
+    fn deferred_adds_keep_sorted_ids_sorted_and_reject_duplicates() {
+        let dim = 64usize;
+        let mut ix = loaded_index();
+        let more: Vec<f32> = (0..10 * dim).map(|i| (i % 31) as f32 / 31.0).collect();
+        // Interleaves with the loaded ids (which step by 7 from 1000).
+        let new_ids: Vec<u64> = vec![1, 1003, 1500, 999_999, 2, 1004, 1600, 3, 4, 5];
+        ix.add_with_ids(&more, &new_ids).unwrap();
+        assert_eq!(sorted_len(&ix), 110);
+        {
+            let s = ix.sorted_ids.lock().expect("lock");
+            assert!(s.windows(2).all(|w| w[0] <= w[1]), "merge left it unsorted");
+        }
+        // A duplicate from the loaded set and one from the merged set are
+        // both caught by the binary search, without building the map.
+        for dup in [1000u64, 1500] {
+            let err = ix.add_with_ids(&more[..dim], &[dup]).unwrap_err();
+            assert!(matches!(err, AddError::IdAlreadyPresent(d) if d == dup));
+        }
+        assert!(
+            ix.id_to_slot.get().is_none(),
+            "adds must not force the map build"
+        );
     }
 }
