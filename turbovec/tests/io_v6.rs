@@ -624,3 +624,23 @@ fn lazy_add_defers_packed_and_stays_byte_identical() {
         );
     }
 }
+
+/// The fused warm-cache write (native borrow; per-chunk deinterleave in
+/// the x86 writer threads) must emit files byte-identical to the cold
+/// write path, for both formats.
+#[test]
+fn warm_cache_file_write_matches_cold_bytes() {
+    let dir = temp_dir("warm-write-bytes");
+    let idx = build_index();
+    let cold_path = dir.join("cold.tv");
+    idx.write(&cold_path).unwrap(); // cache may be cold: repack path
+    idx.prepare(); // warm the blocked cache
+    let warm_path = dir.join("warm.tv");
+    idx.write(&warm_path).unwrap(); // fused native-borrow path
+    assert_eq!(
+        std::fs::read(&cold_path).unwrap(),
+        std::fs::read(&warm_path).unwrap(),
+        "warm fused write diverged from cold write"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}

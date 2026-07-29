@@ -791,6 +791,43 @@ impl TurboQuantIndex {
         // (the constructor asserts dim % 8 == 0 with dim >= 8), so this
         // doesn't collide with any valid eager index.
         let (boundaries, centroids) = self.codebook_for_write();
+        // Warm blocked cache: borrow it instead of materializing the
+        // sequential payload. On x86 the per-chunk deinterleave runs
+        // inside the writer threads (overlapping device writes); on other
+        // arches the cache IS the sequential layout, so this skips the
+        // whole-payload copy. Bytes are identical either way.
+        if self.n_vectors > 0 && self.dim.is_some() {
+            if let Some(cache) = self.blocked.get() {
+                #[cfg(target_arch = "x86_64")]
+                return io::write_native_with_durability(
+                    path,
+                    self.bit_width,
+                    self.dim.unwrap_or(0),
+                    self.n_vectors,
+                    &cache.data,
+                    &boundaries,
+                    &centroids,
+                    &self.scales,
+                    &self.tqplus_shift,
+                    &self.tqplus_scale,
+                    durability,
+                );
+                #[cfg(not(target_arch = "x86_64"))]
+                return io::write_with_durability(
+                    path,
+                    self.bit_width,
+                    self.dim.unwrap_or(0),
+                    self.n_vectors,
+                    &cache.data,
+                    &boundaries,
+                    &centroids,
+                    &self.scales,
+                    &self.tqplus_shift,
+                    &self.tqplus_scale,
+                    durability,
+                );
+            }
+        }
         io::write_with_durability(
             path,
             self.bit_width,
@@ -804,6 +841,16 @@ impl TurboQuantIndex {
             &self.tqplus_scale,
             durability,
         )
+    }
+
+    /// Borrow the warm native blocked cache for a fused write, if one
+    /// exists. `None` for empty/lazy indexes or a cold cache (callers
+    /// fall back to [`Self::codes_blocked_seq`]).
+    pub(crate) fn blocked_native_for_write(&self) -> Option<&[u8]> {
+        if self.n_vectors == 0 || self.dim.is_none() {
+            return None;
+        }
+        self.blocked.get().map(|c| c.data.as_slice())
     }
 
     /// The v6 file payload: codes in the arch-neutral sequential blocked
