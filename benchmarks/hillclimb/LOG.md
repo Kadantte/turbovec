@@ -379,4 +379,31 @@ eventual map, no observable change.
 - A/B insert (3 rounds each): ARM MT 4.99 → 4.55 (x1.10), ST 11.77 →
   10.87 (x1.08); x86 MT 10.3 → 7.75 (x1.33), ST 19.2 → 17.0 (x1.13).
 - Target HM x1.152, no cell regressing.
-- **Verdict: WIN** — committed. Streak 0.
+- **Verdict: WIN** — committed (66bff30). Streak 0.
+
+### H22 — x86 writer-thread cap 8 vs 4 post-fusion (target: save)
+
+S13 pinned 4 writer threads pre-fusion; with the deinterleave now in
+the writers, retest 8. A/B (3 rounds): parity-to-slightly-worse
+(387.9 vs 386.7 MT). The virtio queue, not CPU, still bounds it.
+- **Verdict: NON-WIN** — discarded. Streak 1.
+
+### H23 — fixed 8 MB write chunks vs len/4 (target: save)
+
+Finer chunks for transform/IO pipelining. A/B: MT x1.004, ST x1.008 —
+consistent direction, below the 1% bar (like H4).
+- **Verdict: NON-WIN** — discarded. Streak 2.
+
+### Incident: H10's code was never committed
+
+bf0f672 ("2D tile parallelism") contains only LOG.md — the concurrent
+working-tree editor reverted search.rs between the A/B and the git add,
+so the measured win silently vanished from the branch (found when a
+tile-constant sweep discovered no tiling in the tree). Audited every
+win commit: all others contain their code. Reconstructed the tiling
+exactly from the session record; all 20 test binaries green on both
+arches and bitwise parity against the ORIGINAL H10-era saved outputs
+(small + 200k index, both arches) — the reconstruction is behaviorally
+identical to what was measured, so H10's verdicts stand. Committed for
+real this time, with commit-content verification added to the loop's
+process (git show --stat before push).
