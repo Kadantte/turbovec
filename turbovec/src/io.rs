@@ -1317,25 +1317,41 @@ fn try_load_v6_fast(
     // parallel codes read — the tail pread + scales scan otherwise
     // serializes after it. Same scoped-thread pattern as the parallel
     // read itself.
+    //
+    // Gated on the codes payload being large enough to hide the spawn
+    // (~20-30 µs), like the sibling size gates on the parallel read and
+    // write paths: a small index's whole load is shorter than that, so
+    // an unconditional spawn made small loads ~1.2x slower. Swept on a
+    // c4a-standard-8: the crossover sits between 160 KB (neutral) and
+    // 640 KB (already a 0.80x win), so gate at 256 KB — 1 MB was too
+    // coarse and gave back the win at ~20k vectors.
+    const TAIL_OVERLAP_MIN: usize = 256 * 1024;
     let tail_len = cap_usize - codes_end as usize;
     type TailParts = (Vec<f32>, Vec<f32>, Vec<f32>, Vec<u8>);
-    let (codes_res, tail_res) = std::thread::scope(|s| {
-        let tail_handle = s.spawn(|| -> io::Result<TailParts> {
-            let mut tail = vec![0u8; tail_len];
-            read_exact_at(f, &mut tail, codes_end)?;
-            let mut tr: &[u8] = &tail[..];
-            let scales = read_scales_validated(&mut tr, n_vectors)?;
-            let (tqplus_shift, tqplus_scale) = read_tqplus_trailer(&mut tr, dim)?;
-            Ok((scales, tqplus_shift, tqplus_scale, tr.to_vec()))
-        });
+    let read_tail = || -> io::Result<TailParts> {
+        let mut tail = vec![0u8; tail_len];
+        read_exact_at(f, &mut tail, codes_end)?;
+        let mut tr: &[u8] = &tail[..];
+        let scales = read_scales_validated(&mut tr, n_vectors)?;
+        let (tqplus_shift, tqplus_scale) = read_tqplus_trailer(&mut tr, dim)?;
+        Ok((scales, tqplus_shift, tqplus_scale, tr.to_vec()))
+    };
+    let (codes_res, tail_res) = if blocked_bytes >= TAIL_OVERLAP_MIN {
+        std::thread::scope(|s| {
+            let tail_handle = s.spawn(read_tail);
+            let codes =
+                read_range_parallel_transform(f, codes_start, blocked_bytes as u64, transform);
+            (
+                codes,
+                tail_handle
+                    .join()
+                    .unwrap_or_else(|p| std::panic::resume_unwind(p)),
+            )
+        })
+    } else {
         let codes = read_range_parallel_transform(f, codes_start, blocked_bytes as u64, transform);
-        (
-            codes,
-            tail_handle
-                .join()
-                .unwrap_or_else(|p| std::panic::resume_unwind(p)),
-        )
-    });
+        (codes, read_tail())
+    };
     let codes = codes_res?;
     let (scales, tqplus_shift, tqplus_scale, rest) = tail_res?;
     Ok(Some((
