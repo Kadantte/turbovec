@@ -397,6 +397,34 @@ appears under each surface it touches.
 
 #### Added
 
+- **Interruptible long search/add (#216).** A large batch `search` / `add`
+  / `add_with_ids` is now processed one row-slice at a time (default
+  `turbovec.BATCH_CHUNK_SIZE = 1000`, overridable per call with
+  `chunk_size=`), so control returns to Python between slices and a queued
+  Ctrl-C is serviced there instead of at the end of the call. The GIL was
+  already released (#186), but Python delivers signals on the main thread —
+  the one parked inside the Rust kernel — so a Ctrl-C used to be queued
+  until the whole call returned. Measured on a ~7.2 s batch search: the
+  Ctrl-C delay dropped from ~5.4 s (queued to the end) to ~10 ms (within
+  one slice). Pure-Python wrappers over the native kernels — no core
+  change. Chunked results are identical to a single call (each `search`
+  slice reads one coherent snapshot of the query array, preserving the
+  mid-search-mutation guarantee; each `add` slice is committed atomically).
+  Throughput cost is asymmetric: `search` is unaffected (~0 %), but a
+  chunked `add` / `add_with_ids` pays a snapshot, per-slice validation and
+  dispatch, and (`add_with_ids`) an O(n) pre-existing-id check — measured
+  at roughly 2–7× the unchunked wall time at the default `chunk_size=1000`
+  (the base add is fast, so fixed per-slice overhead dominates the ratio;
+  it varies with dim/batch/machine). The absolute overhead is small, on the
+  order of ~1–10 µs/vector. For a throughput-critical one-shot bulk load,
+  pass `chunk_size=0` to run the add whole at full speed. A cancelled `add` commits the completed slices and raises — the
+  index stays consistent and queryable at that count. Two calls stay
+  indivisible and deaf to Ctrl-C by design: a single huge query
+  (`nq == 1`) and the *first* add into an empty index (it fits and locks
+  the TQ+ calibration from its batch, so slicing it would change the whole
+  index's quantization). Making those interruptible needs a core
+  cancellation poll (`PyErr::CheckSignals` in the hot loops) — the deferred
+  follow-up.
 - `write(path, durable=False)` on `TurboQuantIndex` and `IdMapIndex`:
   keeps atomic-replace semantics but skips fsync (not power-loss-safe) —
   see the Rust-surface entry for details and measurements (#274).
@@ -871,6 +899,29 @@ appears under each surface it touches.
 
 ### Benchmarks
 
+- **Official persistence cells, x86 insert re-measure, and ARM
+  re-baseline (#279, #280).** The published ARM benchmark environment
+  moved from an Apple M3 Max laptop to a **GCP c4a-standard-8 (Google
+  Axion, 8 vCPU)** instance — release build, idle box — and every ARM
+  cell (search, insert, remove, persist) was re-measured there. The x86
+  cells stay on the same GCP c3-standard-8 (Sapphire Rapids) box; the
+  x86 insert and persist cells were re-measured on a clean release build
+  at the PR base commit (fresh `target/` + `maturin develop --release`,
+  provenance verified after an earlier run reused a pre-#277 build). The
+  fresh clean-build run agreed with the committed x86 insert numbers
+  within measurement noise across all 8 cells, so the committed bytes
+  were retained: #277's encode speedup was measured on Cascade Lake and
+  does not move Sapphire-Rapids bulk insert. (The agreement is what the
+  ST≈MT single-add invariant confirms — single `add()` is serial, so a
+  cell's ST and MT single-add timings must match, and across the grid
+  they do.) All 16 `speed_persist_*` cells
+  (arm + x86, both threadings) are now recorded in `benchmarks/results/`
+  and `create_diagrams.py` renders matching
+  `docs/{arm,x86}_persist_{st,mt}.svg` save/load figures (save-warm and
+  load→first-search as precision-matched TurboQuant-vs-FAISS pairs; the
+  mutate→save→load→search round-trip, which FAISS has no measured
+  equivalent for, shown TurboQuant-only). README search prose (ARM now
+  16–24%) and the ARM figure labels were updated to the new environment.
 - **Persistence benchmarks join the suite** (#275): `speed_persist_*`
   for every (dim, bit width, arch, threading) cell, covering write in
   both states (warm blocked cache vs invalidated by a mutation — ~5x
