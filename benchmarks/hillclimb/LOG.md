@@ -140,4 +140,26 @@ write through INV_PERM0, exact inverse of the pack_blocked interleave).
 - Flags (save-arm x0.855, save-arm_st x0.607, load-arm_st x0.846,
   load_search-x86 x0.935) — all in documented noise bands; none shares a
   code path with this diff (swap_remove + pack lane helpers only).
-- **Verdict: WIN** — committed. Streak resets to 0.
+- **Verdict: WIN** — committed (1c2802e). Streak resets to 0.
+
+### H7 — lazy-append add: no packed materialization in the v6-load window (target: insert)
+
+add() forced the O(n·dim) packed materialization before every append (the
+H1/H2 wins made it fast; this removes it). When packed is unset and the
+blocked cache is present, encode the new rows into a temp buffer and
+append them to the cache as direct lane writes (pack::append_lanes —
+fresh blocks zero-padded, existing tail-block lanes carried by the
+exact-bytes invariant; x86 lane writes nibble-merge through INV_PERM0).
+packed stays unset; the lazy rebuild reconstructs the full post-append
+state on demand. Eager path unchanged, unwind guard split per path.
+
+- Correctness: new io_v6 test — lazy vs eager adds byte-identical
+  (serialization, reconstructed packed, search) for bits 2/3/4 across
+  partial/full/spilling tail blocks and mixed add/remove; suite green on
+  both arches.
+- Soak (15 reps): insert x291.2 arm / x268.0 x86 / x138.6 arm_st / x150.0
+  x86_st — target HM x190.1. WHM x1.749.
+- Flags all cleared by interleaved H6-vs-H7 A/B (search/save/load_search
+  statistically identical across 3 rounds; save wobble 83–97 ms on both
+  cores = documented Mac drift).
+- **Verdict: WIN** — committed.

@@ -557,3 +557,70 @@ fn lazy_swap_remove_defers_packed_and_stays_byte_identical() {
         assert_eq!(lazy.to_bytes(), eager.to_bytes(), "bits={bits}: empty-index divergence");
     }
 }
+
+/// add() in the v6-load window must append via the blocked cache without
+/// materializing packed, and stay byte-identical to an eagerly
+/// materialized clone — serialization, reconstructed packed rows, and
+/// search — for every bit width, across block-boundary batch sizes and
+/// mixed add/remove sequences.
+#[test]
+fn lazy_add_defers_packed_and_stays_byte_identical() {
+    for bits in [2usize, 3, 4] {
+        let dim = 64usize;
+        let mut src = TurboQuantIndex::new(dim, bits).unwrap();
+        src.add(&lcg_vectors(100, dim, 0xABBA + bits as u64));
+        let bytes = src.to_bytes();
+
+        let mut lazy = TurboQuantIndex::from_bytes(&bytes).unwrap();
+        let mut eager = TurboQuantIndex::from_bytes(&bytes).unwrap();
+        let _ = eager.packed_codes(); // force materialization up front
+
+        // Batch sizes that leave the tail partial, exactly full, and
+        // spilling into fresh blocks: 100 -> 101 -> 128 -> 161 -> 200.
+        let mut step = 0u64;
+        for n_add in [1usize, 27, 33, 39] {
+            let vecs = lcg_vectors(n_add, dim, 0xC0DE + step);
+            step += 1;
+            lazy.add(&vecs);
+            eager.add(&vecs);
+        }
+        assert!(
+            !lazy.packed_ready(),
+            "bits={bits}: adds must not force packed materialization"
+        );
+        assert_eq!(
+            lazy.to_bytes(),
+            eager.to_bytes(),
+            "bits={bits}: lazy-append serialization diverged"
+        );
+
+        // Mixed removes + adds while still lazy.
+        for idx in [0usize, 150, 75] {
+            lazy.swap_remove(idx);
+            eager.swap_remove(idx);
+        }
+        let more = lcg_vectors(40, dim, 0xF00D);
+        lazy.add(&more);
+        eager.add(&more);
+        assert!(!lazy.packed_ready(), "bits={bits}: still lazy after mixed ops");
+        assert_eq!(
+            lazy.to_bytes(),
+            eager.to_bytes(),
+            "bits={bits}: mixed add/remove serialization diverged"
+        );
+
+        let queries = lcg_vectors(4, dim, QUERY_SEED);
+        let a = lazy.search(&queries, 7);
+        let b = eager.search(&queries, 7);
+        assert_eq!(a.scores, b.scores, "bits={bits}: search scores diverged");
+        assert_eq!(a.indices, b.indices, "bits={bits}: search indices diverged");
+
+        // Forcing packed AFTER the whole lazy history must reconstruct
+        // exactly the eager rows.
+        assert_eq!(
+            lazy.packed_codes(),
+            eager.packed_codes(),
+            "bits={bits}: lazy packed reconstruction diverged"
+        );
+    }
+}
