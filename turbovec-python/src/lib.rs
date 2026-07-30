@@ -1,4 +1,10 @@
-use numpy::{IntoPyArray, PyArray2, PyReadonlyArray1, PyReadonlyArray2};
+// `PyArrayMethods` / `PyUntypedArrayMethods` are needed for `data()` and
+// `is_c_contiguous()` / `len()` in `mask_bytes`. Without the latter in
+// scope, `len()` silently resolves to `PyAnyMethods::len` instead.
+use numpy::{
+    IntoPyArray, PyArray2, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray2,
+    PyUntypedArrayMethods,
+};
 
 mod par_copy;
 use par_copy::{par_copy_into, PAR_COPY_MIN_LEN};
@@ -65,12 +71,62 @@ fn extract_u64_1d<'py>(
 }
 
 /// Extract a 1-D bool array; see [`extract_f32_2d`].
+///
+/// **The elements of the returned array must not be read as `bool`.**
+/// Building this wrapper only validates the dtype and registers a
+/// borrow; it does not touch the buffer. Use [`mask_bytes`] to read it —
+/// see there for why.
 fn extract_bool_1d<'py>(
     name: &str,
     obj: &Bound<'py, PyAny>,
 ) -> PyResult<PyReadonlyArray1<'py, bool>> {
     obj.extract()
         .map_err(|_| array_type_err(name, "1-D bool", obj))
+}
+
+/// Copy a validated 1-D numpy `bool` mask into a `Vec<bool>` by reading
+/// its raw bytes.
+///
+/// numpy stores `bool_` in one byte and does **not** constrain that byte
+/// to 0 or 1, and it treats every non-zero byte as true. Such a buffer
+/// is reachable from ordinary numpy — `np.frombuffer(buf, dtype=bool)`
+/// over arbitrary bytes, `np.uint8` data through `.view(bool)`, or even
+/// an uninitialised `np.empty(n, dtype=bool)` — so this needs no
+/// deliberate byte-forging. A Rust `bool` may only ever hold 0 or 1, so
+/// forming *any* `&bool`, `&[bool]` or `ArrayView<bool>` over one is
+/// undefined behavior, and it mis-filtered searches concretely: up to
+/// returning none of the selected slots and only unselected ones — a
+/// total filter bypass (#349). So the bytes are read through a raw
+/// pointer as `u8` and compared `!= 0`, matching numpy's truthiness.
+///
+/// Nothing here calls into Python, deliberately. Reaching the bytes
+/// through the array's own `view("uint8")` would let an `np.ndarray`
+/// subclass overriding `view` decide which buffer the mask is read from
+/// — the caller's *type* would choose which slots are searched, which is
+/// the very leak this function exists to close. `data()` is a field of
+/// the C-level array struct, so no Python method lookup is involved and
+/// no subclass can influence it.
+fn mask_bytes(name: &str, arr: &PyReadonlyArray1<'_, bool>) -> PyResult<Vec<bool>> {
+    // Same rejection (and message) the previous `as_slice()` produced.
+    if !arr.is_c_contiguous() {
+        return Err(not_contiguous_err(name));
+    }
+    let n = arr.len();
+    if n == 0 {
+        // Skip the pointer entirely: an empty array need not carry a
+        // dereferenceable one.
+        return Ok(Vec::new());
+    }
+    // SAFETY: `arr` is a live, C-contiguous, 1-D numpy array of `n`
+    // `bool_` elements, and numpy's `bool_` is one byte wide, so `n`
+    // bytes from the data pointer lie inside the array's own allocation.
+    // The GIL is held and the readonly borrow is registered for the
+    // whole read, so nothing can resize or free the buffer underneath
+    // it. `*mut bool -> *const u8` casts between two one-byte types
+    // with the same alignment, and no `bool` reference is ever formed —
+    // which is the entire point (see above).
+    let bytes = unsafe { std::slice::from_raw_parts(arr.data() as *const u8, n) };
+    Ok(bytes.iter().map(|&b| b != 0).collect())
 }
 
 /// Whether `obj` is integer-valued: a Python `int` of any magnitude, or
@@ -207,6 +263,29 @@ fn extract_bytes(name: &str, obj: &Bound<'_, PyAny>) -> PyResult<Vec<u8>> {
 /// arguments) rather than `OSError`.
 fn from_bytes_err(e: std::io::Error) -> PyErr {
     pyo3::exceptions::PyValueError::new_err(e.to_string())
+}
+
+/// Shared body of both indexes' `__reduce__`: rebuild through the
+/// object's own `from_bytes` classmethod applied to its `to_bytes()`
+/// payload.
+///
+/// `pickle`, `copy.copy` and `copy.deepcopy` therefore all inherit the
+/// documented `.tv` persistence contract unchanged — the same payload
+/// `write` produces, the same load-time validation, and the same
+/// warm-up warning when an index that has not yet fitted its TQ+
+/// calibration is serialized (see `warn_if_warming_up`). Nothing here
+/// widens or narrows what `to_bytes` carries; a reconstructed index is
+/// exactly what `from_bytes(to_bytes())` has always produced, and is
+/// fully independent of the original (#340).
+///
+/// Reducing to the public classmethod rather than a private rebuild
+/// helper keeps `to_bytes`/`from_bytes` the single serialization path
+/// (docs/api.md) and keeps the pickle stream readable.
+fn reduce_via_bytes<'py>(
+    slf: &Bound<'py, PyAny>,
+    payload: Bound<'py, PyBytes>,
+) -> PyResult<(Bound<'py, PyAny>, (Bound<'py, PyBytes>,))> {
+    Ok((slf.get_type().getattr("from_bytes")?, (payload,)))
 }
 
 /// Map an `io::Error` from `load` or `write` to Python:
@@ -402,7 +481,14 @@ fn retain_snap(snap: &mut Vec<f32>, prev: &std::sync::atomic::AtomicUsize, want:
     }
 }
 
-#[pyclass(frozen)]
+// `module` makes `__module__` report the extension module the class
+// actually lives in, so a class reference round-trips through pickle and
+// through any registry that records `f"{cls.__module__}.{cls.__name__}"`
+// (it read `builtins.TurboQuantIndex` before, which resolves nowhere).
+// `weakref` lets an index sit in a `weakref.WeakValueDictionary` — the
+// standard way to key a per-tenant cache without pinning the memory
+// (#340). Both classes carry the same options.
+#[pyclass(frozen, module = "turbovec._turbovec", weakref)]
 struct TurboQuantIndex {
     /// Reusable GIL-safety snapshot buffer for `add`. Purely scratch:
     /// contents are meaningless between calls; kept so repeated adds
@@ -565,13 +651,12 @@ impl TurboQuantIndex {
         // source arrays mid-search. Validation runs on the snapshot so
         // the searched data is exactly the data that was validated.
         let q_owned = q_slice.to_vec();
-        let mask_owned: Option<Vec<bool>> = match mask.as_ref().map(|m| m.as_array()).as_ref() {
-            Some(m_arr) => Some(
-                m_arr
-                    .as_slice()
-                    .ok_or_else(|| not_contiguous_err("mask"))?
-                    .to_vec(),
-            ),
+        // Read as bytes, never as `bool`: every non-zero byte is true,
+        // as numpy defines it (see `mask_bytes`). Same position in the
+        // call as the old `as_slice().to_vec()`, so the contiguity error
+        // still fires after the query's.
+        let mask_owned: Option<Vec<bool>> = match mask.as_ref() {
+            Some(m) => Some(mask_bytes("mask", m)?),
             None => None,
         };
 
@@ -741,6 +826,18 @@ impl TurboQuantIndex {
         })
     }
 
+    /// Support ``pickle``, ``copy.copy`` and ``copy.deepcopy`` by
+    /// reducing to ``from_bytes(to_bytes())`` — so an index can cross a
+    /// ``spawn`` process boundary (the default start method on macOS and
+    /// Windows) and a user container holding one can be deep-copied.
+    /// See [`reduce_via_bytes`] for what that inherits.
+    fn __reduce__<'py>(
+        slf: &Bound<'py, Self>,
+    ) -> PyResult<(Bound<'py, PyAny>, (Bound<'py, PyBytes>,))> {
+        let payload = slf.get().to_bytes(slf.py())?;
+        reduce_via_bytes(slf.as_any(), payload)
+    }
+
     /// Warm up the search caches (rotation matrix, Lloyd-Max centroids,
     /// SIMD-blocked code layout) so the first `search` call does not pay
     /// the one-time initialisation cost.
@@ -860,7 +957,8 @@ impl TurboQuantIndex {
     }
 }
 
-#[pyclass(frozen)]
+// See `TurboQuantIndex` for `module` / `weakref`.
+#[pyclass(frozen, module = "turbovec._turbovec", weakref)]
 struct IdMapIndex {
     /// See `TurboQuantIndex::snap`.
     snap: std::sync::Mutex<Vec<f32>>,
@@ -1253,6 +1351,14 @@ impl IdMapIndex {
             snap_prev: std::sync::atomic::AtomicUsize::new(0),
             warmup_warned: std::sync::atomic::AtomicBool::new(false),
         })
+    }
+
+    /// See ``TurboQuantIndex.__reduce__``.
+    fn __reduce__<'py>(
+        slf: &Bound<'py, Self>,
+    ) -> PyResult<(Bound<'py, PyAny>, (Bound<'py, PyBytes>,))> {
+        let payload = slf.get().to_bytes(slf.py())?;
+        reduce_via_bytes(slf.as_any(), payload)
     }
 
     fn __len__(&self, py: Python<'_>) -> usize {
