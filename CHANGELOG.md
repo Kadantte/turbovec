@@ -317,8 +317,10 @@ appears under each surface it touches.
   unreleased, so no published index is affected.
 - `add` on a populated index no longer holds allocation-sized
   intermediates: encode appends in place and reuses a per-index scratch
-  buffer, which is shrunk whenever it exceeds 4x the current batch's
-  need.
+  buffer. The buffer is retained at the previous call's demand plus half
+  again, and only shrunk when its capacity exceeds twice that — so
+  repeated, growing and jittering batch sizes keep their warm allocation,
+  while a one-shot bulk load has no previous demand and releases outright.
 - **`MAX_DIM` lowered from 65536 to 16384.** A loaded `.tv`/`.tvim`
   header declaring a huge `dim` drives allocations (codebook, blocked
   layout, per-query rotate scratch) not bounded by the file's own size,
@@ -342,6 +344,36 @@ appears under each surface it touches.
   Linux x86_64 wheel from ~1.8 MB to ~42 MB. (#206)
 
 #### Fixed
+
+- **A one-shot bulk `add()` no longer pins its rotated-batch scratch for
+  the index's lifetime (#333).** The encode scratch only shrank when
+  `capacity > 4 x this call's length` — a test the call that *grew* the
+  buffer can never pass, since growing leaves capacity and length equal.
+  So the batch that allocated the buffer was exactly the one that could
+  not release it, and a copy-paste `index.add(embeddings)` kept a full
+  rotated copy of the batch until the index was dropped. (A later,
+  smaller add *did* release it; retention was permanent only for the
+  common shape where no smaller add follows.)
+  Retention is now sized from the previous call's demand plus half again,
+  and only applied when capacity exceeds twice that. The slack preserves
+  the amortized growth headroom a growing or jittering batch size relies
+  on, and the hysteresis keeps ordinary shapes from shrinking at all;
+  a one-shot bulk add has no previous demand and so releases outright.
+  There is no retention floor — `Vec::reserve` from zero capacity
+  allocates once, so a floor has no allocation cascade to prevent.
+  Measured with a counting global allocator, dim 768 at 2-bit, single
+  thread: a 200k one-shot add retains **623.3 MB before, 37.4 MB after**
+  against a 36.6 MB index, and the total allocation count over a run is
+  unchanged to within one — 520 -> 521 for twelve equal 50k adds,
+  743 -> 744 for twenty adds growing 5% each, 740 -> 741 for twenty
+  jittering between 45k and 55k. Add throughput is unchanged at default
+  threads and at `RAYON_NUM_THREADS=1`.
+  Note the numbers above are live heap. On macOS this does not show up in
+  RSS at all: `ps` reports the same resident size with and without the
+  fix, for reasons not fully established — the freed spans stay resident
+  even in a sequential build-and-drop loop where they ought to be reused.
+  The allocator-level win is solid; the resident-size win is unverified
+  on any platform.
 
 - **Deferred-window adds no longer cost O(n) when the new ids sort below
   the retained id table (#383).** After a load, `IdMapIndex` keeps the
@@ -812,6 +844,17 @@ appears under each surface it touches.
   unchanged. (#167)
 
 #### Fixed
+
+- **A one-shot bulk `add()` / `add_with_ids()` no longer pins its
+  GIL-safety snapshot for the index's lifetime (#333).** The snapshot
+  buffer carried the same unsatisfiable shrink condition as the core's
+  encode scratch and now follows the same policy — retain the previous
+  call's length plus half again, and only shrink when capacity exceeds
+  twice that. Together with the core fix this drops both copies of a bulk
+  batch that an index used to hold after `add()` returned.
+  As with the core entry, the measured win is in live heap and does not
+  appear in macOS RSS, for reasons not fully established; treat the
+  resident-size effect as unverified.
 
 - **The JSON side-car no longer writes data it cannot read back
   (#350).** ⚠️ **Breaking for stores holding non-finite floats
