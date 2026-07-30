@@ -385,3 +385,100 @@ def test_durability_shortfall_surfaces_as_a_runtime_warning(tmp_path):
         assert path.exists(), "the rename committed, so the file must be there"
     finally:
         os.chmod(d, 0o700)
+
+
+# That durability warning is emitted by the core from *inside*
+# `write_with_durability`, i.e. while the binding still holds the index
+# read guard — and it reaches Python through a user-replaceable
+# `showwarning`. A handler that touches the same index then asks for the
+# write lock while the save read-holds it: deadlock, the same defect the
+# warm-up warning had (#360, whose fix left this path unguarded). Runs in
+# a fresh interpreter under a hard timeout — a regression would otherwise
+# hang pytest itself, and it wedges the *pool* thread that emits the
+# warning, so it cannot be unwound in-process.
+_REENTRANT_DURABILITY_HANDLER = r'''
+import os
+import stat
+import sys
+import tempfile
+import warnings
+
+import numpy as np
+import turbovec
+
+DIM = 32
+rng = np.random.default_rng(0)
+idx = turbovec.TurboQuantIndex(DIM, 4)
+idx.add(rng.standard_normal((10, DIM), dtype=np.float32))
+extra = rng.standard_normal((5, DIM), dtype=np.float32)
+
+seen = []
+
+
+def showwarning(message, category, filename, lineno, file=None, line=None):
+    seen.append(str(message))
+    idx.add(extra)          # re-enters the index the save is holding
+
+
+d = tempfile.mkdtemp()
+warnings.simplefilter("always")
+warnings.showwarning = showwarning
+os.chmod(d, stat.S_IWUSR | stat.S_IXUSR)   # writable+traversable, not readable
+try:
+    idx.write(os.path.join(d, "index.tv"), durable=True)
+finally:
+    os.chmod(d, 0o700)
+
+assert any("power loss" in s for s in seen), seen
+assert len(idx) == 20, len(idx)             # 10 + 2 handlers x 5
+print("RESULT: PASS")
+'''
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX directory permissions")
+def test_durability_warning_handler_may_reenter_the_index(tmp_path):
+    import subprocess
+    import sys
+
+    # Decide whether this environment can provoke the warning at all
+    # *before* launching the payload, using the same probe as the sibling
+    # test above: strip read permission and check that reading is really
+    # refused. Under root it is not, the core's `File::open(dir)` succeeds,
+    # and no durability warning is ever emitted.
+    #
+    # This discriminator is environmental and runs in the parent, so it
+    # cannot absorb a failure of the payload's own assertions. Grepping the
+    # child's stderr for "AssertionError" could — and did: a build that
+    # queues the durability warning and never flushes it fails
+    # `assert any("power loss" in s for s in seen)`, which that grep turned
+    # into a skip, i.e. a green CI run for a broken queue.
+    probe = tmp_path / "no-read"
+    probe.mkdir()
+    os.chmod(probe, 0o300)
+    try:
+        try:
+            os.listdir(probe)
+        except PermissionError:
+            pass
+        else:
+            pytest.skip("directory mode not enforced (running as root?)")
+    finally:
+        os.chmod(probe, 0o700)
+
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-c", _REENTRANT_DURABILITY_HANDLER],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+    except subprocess.TimeoutExpired:
+        pytest.fail(
+            "the durability-shortfall warning DEADLOCKED: it ran user Python "
+            "while the save held the index read lock, so the handler's add "
+            "blocked forever on the write lock (#360)"
+        )
+    assert proc.returncode == 0, (
+        f"payload exited {proc.returncode}\nstdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
+    )
+    assert "RESULT: PASS" in proc.stdout, f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
