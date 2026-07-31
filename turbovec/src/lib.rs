@@ -723,6 +723,21 @@ impl TurboQuantIndex {
             // not move the quantiles anyway); otherwise the concatenation
             // of buffer + batch, which is at most ~2000 rows.
             let rotation = self.rotation.get_or_init(|| rotation::Rotation::new(dim));
+            // The fit anchors on the codebook's outermost centroid (#454),
+            // so the same cached codebook the encode path uses has to be
+            // in hand before fitting. Seed both locks from the one solve,
+            // as `encode_and_append` does: this closure is dead today
+            // (reaching here needs a non-empty warm-up buffer, and
+            // buffering went through `encode_and_append`, which already
+            // seeded both), but if a refactor ever makes it live, filling
+            // only `centroids` would leave the `encode_and_append` below
+            // to re-run the Lloyd-Max solve for `boundaries`.
+            if self.centroids.get().is_none() || self.boundaries.get().is_none() {
+                let (b, c) = codebook::codebook(self.bit_width, dim);
+                let _ = self.boundaries.set(b);
+                let _ = self.centroids.set(c);
+            }
+            let centroids = self.centroids.get().expect("seeded above");
             let mut scratch = std::mem::take(&mut self.encode_scratch);
             let concat;
             let (fit_src, fit_n): (&[f32], usize) = if n >= encode::TQPLUS_MIN_SAMPLES {
@@ -744,7 +759,7 @@ impl TurboQuantIndex {
                 if FORCE_FIT_PANIC.with(|f| f.replace(false)) {
                     panic!("forced calibration fit panic (test)");
                 }
-                encode::fit_calibration(fit_src, fit_n, dim, rotation, &mut scratch)
+                encode::fit_calibration(fit_src, fit_n, dim, rotation, centroids, &mut scratch)
             }));
             self.encode_scratch = scratch;
             let (shift, scale_tq) = match fitted {

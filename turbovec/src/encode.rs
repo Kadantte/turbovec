@@ -13,9 +13,11 @@
 //! Beta((d-1)/2, (d-1)/2) marginal that Lloyd-Max was fit against. In
 //! practice, anisotropic data leaves residual deviation per coord, and
 //! the shared codebook then mis-fits. TQ+ corrects this with two free
-//! parameters per coord — a `shift` and a `scale` — chosen to map the
-//! empirical 5/95% quantiles of that coord onto the canonical Beta
-//! marginal's 5/95% quantiles:
+//! parameters per coord — a `shift` and a `scale` — chosen to map that
+//! coord's empirical quantiles onto the codebook's outermost centroids.
+//! The probability level is taken from the codebook itself (see
+//! [`tqplus_anchor`]) rather than fixed, because the level the outermost
+//! centroid sits at moves with bit width:
 //!
 //! ```text
 //! u_calibrated[d] = (u_rot[d] + shift[d]) * scale_tq[d]
@@ -327,9 +329,35 @@ fn build_recon_table(
     table
 }
 
-/// Quantile pair used to fit per-coord `(shift, scale)`.
-const TQPLUS_P_LO: f64 = 0.05;
-const TQPLUS_P_HI: f64 = 0.95;
+/// Probability level the per-coord fit anchors on, derived from the
+/// codebook rather than fixed.
+///
+/// The fit maps the empirical `p`-quantile of a coordinate onto the
+/// canonical marginal's `p`-quantile. When the data already has the
+/// canonical *shape* every `p` gives the same answer, so the choice only
+/// bites on heavy-tailed coordinates — and there it decides which part of
+/// the distribution is fitted exactly and which is sacrificed. Values past
+/// the outermost centroid all collapse into one bucket with unbounded
+/// error, so the right anchor is the point where the codebook stops:
+/// `P(|x| <= c_outer)`, with `c_outer` the largest centroid magnitude.
+///
+/// That point moves with bit width — ~0.933 at 2 bits, ~0.984 at 3,
+/// ~0.996 at 4 — which is why this cannot be a constant. The previous
+/// fixed 0.95 was right only at 2 bits; at 3 and 4 it fitted an interior
+/// quantile and stretched the tails far past the codebook's last level.
+/// On lastfm-64 (per-coord kurtosis 26) the 4-bit fit scaled the data
+/// 2x too far, putting the 99.9th percentile at |x| ~ 1.33 against an
+/// outermost centroid of 0.313 and dropping R@10 from 0.4835 (identity)
+/// to 0.1439; anchoring here gives 0.6022. See #454.
+///
+/// Returns `(p_lo, p_hi, qc_lo, qc_hi)`: the two probability levels and
+/// the canonical values they are mapped onto (the codebook's edges).
+fn tqplus_anchor(beta: &Beta, centroids: &[f32]) -> (f64, f64, f32, f32) {
+    let c_outer = centroids.iter().fold(0.0f32, |acc, &c| acc.max(c.abs()));
+    // Beta lives on [0, 1]; the canonical marginal is it shifted to [-1, 1].
+    let p_hi = beta.cdf((f64::from(c_outer) + 1.0) / 2.0);
+    (1.0 - p_hi, p_hi, -c_outer, c_outer)
+}
 
 /// Below this many input vectors, per-coord quantile estimates are too
 /// noisy to be useful — fall back to identity calibration. Empirical
@@ -337,6 +365,21 @@ const TQPLUS_P_HI: f64 = 0.95;
 /// (4-bit vs 2-bit stddev becomes statistically indistinguishable). At
 /// ~1000 samples calibration is stable enough that the 4-bit gain
 /// reasserts itself; pick 1000 with a small safety margin.
+///
+/// That floor was measured under the old fixed 5%/95% anchor. Since #454
+/// the anchor tracks the codebook, so at 4 bits it sits at ~0.996 and
+/// rests on roughly the 4th order statistic from each tail at n = 1000 —
+/// a noisier estimate than 0.95 gave (variance scales as p(1-p)/f(q)^2,
+/// ~7x here). Measured rather than assumed: R@10 at 4 bits, fit from
+/// exactly 1000 rows vs from all 100k, i.i.d. order, three seeds —
+/// gte-small-384 0.9034/0.9027/0.9056 against 0.9083/0.9082/0.9082,
+/// OpenAI-1536 0.9655 vs 0.9661, GloVe-200 0.8746 vs 0.8757, SIFT-128
+/// 0.8537 vs 0.8514. So the wider anchor does cost a consistent ~0.3-0.5
+/// pp on the most anisotropic case and nothing measurable elsewhere,
+/// against the up-to-46 pp the old anchor lost on heavy-tailed data.
+/// Worth knowing, not worth raising the constant for: the fit-sample
+/// question is superseded by the per-block design in #455, where the
+/// sample is the block rather than the first 1000 rows.
 pub(crate) const TQPLUS_MIN_SAMPLES: usize = 1000;
 
 /// Rotate `n` rows of `vectors` into `rotated_scratch` (resized to
@@ -414,10 +457,11 @@ pub(crate) fn fit_calibration(
     n: usize,
     dim: usize,
     rotation: &Rotation,
+    centroids: &[f32],
     rotated_scratch: &mut Vec<f32>,
 ) -> (Vec<f32>, Vec<f32>) {
     let _norms = rotate_batch_into(vectors, n, dim, rotation, rotated_scratch);
-    compute_tqplus_calibration(rotated_scratch, n, dim)
+    compute_tqplus_calibration(rotated_scratch, n, dim, centroids)
 }
 
 /// Encode n vectors of dimension dim.
@@ -497,7 +541,7 @@ pub(crate) fn encode(
             (s, sc)
         }
         None => {
-            fitted = compute_tqplus_calibration(rotated, n, dim);
+            fitted = compute_tqplus_calibration(rotated, n, dim, centroids);
             (&fitted.0, &fitted.1)
         }
     };
@@ -645,14 +689,15 @@ fn quantize_batch<const BITS: usize>(
 }
 
 /// Per-coordinate TQ+ calibration. For each of the `dim` rotated coordinates,
-/// computes `(shift, scale)` such that `(x + shift) * scale` maps the empirical
-/// (P_LO, P_HI) quantiles onto the canonical Beta((dim-1)/2, (dim-1)/2)
-/// marginal's quantiles. When the batch is too small or a coord is
+/// computes `(shift, scale)` such that `(x + shift) * scale` maps the
+/// empirical quantiles at [`tqplus_anchor`]'s probability levels onto the
+/// codebook's outermost centroids. When the batch is too small or a coord is
 /// degenerate (constant or near-constant), falls back to identity.
 fn compute_tqplus_calibration(
     rotated: &[f32],
     n: usize,
     dim: usize,
+    centroids: &[f32],
 ) -> (Vec<f32>, Vec<f32>) {
     let mut shift = vec![0.0f32; dim];
     let mut scale = vec![1.0f32; dim];
@@ -666,13 +711,16 @@ fn compute_tqplus_calibration(
 
     let a = (dim as f64 - 1.0) / 2.0;
     let beta = Beta::new(a, a).expect("Beta(a, a) is valid for a > 0");
-    // Beta is on [0, 1]; canonical marginal is shifted to [-1, 1].
-    let qc_lo = (2.0 * beta.inverse_cdf(TQPLUS_P_LO) - 1.0) as f32;
-    let qc_hi = (2.0 * beta.inverse_cdf(TQPLUS_P_HI) - 1.0) as f32;
+    let (p_lo, p_hi, qc_lo, qc_hi) = tqplus_anchor(&beta, centroids);
     let qc_span = qc_hi - qc_lo;
 
-    let lo_idx = ((n as f64) * TQPLUS_P_LO) as usize;
-    let hi_idx = (((n as f64) * TQPLUS_P_HI) as usize).min(n - 1);
+    let lo_idx = ((n as f64) * p_lo) as usize;
+    // `hi_idx > lo_idx` is what makes the second select below well-formed
+    // (it partitions `hi_idx - lo_idx - 1` of the right side). The two
+    // probabilities are far enough apart that only a pathological
+    // codebook could collapse them, but the clamp makes that structural
+    // rather than incidental.
+    let hi_idx = (((n as f64) * p_hi) as usize).min(n - 1).max(lo_idx + 1);
 
     // Coords are independent, but gathering one column at a time strides
     // `dim * 4` bytes per element — every read is a fresh cache line, and
@@ -1748,6 +1796,99 @@ mod simd_identity_tests {
                 );
                 assert_eq!(first_invalid_in_chunk(&v, 1e16), Some(pos));
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod anchor_tests {
+    use super::*;
+    use crate::codebook;
+
+    /// Heavy-tailed rotated coordinates: a Gaussian bulk with a small
+    /// fraction of far outliers, which is what real embeddings with
+    /// kurtosis >> 3 look like per coordinate (lastfm-64 measures ~26).
+    fn heavy_tailed(n: usize, dim: usize, seed: u64) -> Vec<f32> {
+        let mut x = seed;
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x as f64 / u64::MAX as f64
+        };
+        let sd = 1.0 / (dim as f64).sqrt();
+        (0..n * dim)
+            .map(|_| {
+                let u = next();
+                let g = (next() - 0.5) * 2.0;
+                // 2% of samples get a 12x tail kick.
+                let scale = if u < 0.02 { 12.0 } else { 1.0 };
+                (g * sd * scale) as f32
+            })
+            .collect()
+    }
+
+    /// Overload — how far the calibrated tail runs past the outermost
+    /// centroid — must not get *worse* as bits are added.
+    ///
+    /// More bits mean a finer codebook, so spending them should reduce
+    /// distortion. Under the fixed 5%/95% anchor the fitted scale was
+    /// the same at every bit width, so the calibrated values were the
+    /// same while the codebook's reach barely moved: the 99.9th
+    /// percentile stayed ~4x past the last level at 4 bits. Anchoring on
+    /// the codebook makes the ratio non-increasing.
+    #[test]
+    fn overload_does_not_worsen_with_more_bits() {
+        let (n, dim) = (4000usize, 64usize);
+        let rotated = heavy_tailed(n, dim, 0xC0FFEE_99);
+        let mut prev = f32::INFINITY;
+        for bits in [2usize, 3, 4] {
+            let (_, centroids) = codebook::codebook(bits, dim);
+            let c_outer = centroids.iter().fold(0.0f32, |a, &c| a.max(c.abs()));
+            let (shift, scale) = compute_tqplus_calibration(&rotated, n, dim, &centroids);
+
+            let mut cal: Vec<f32> = Vec::with_capacity(n * dim);
+            for i in 0..n {
+                for d in 0..dim {
+                    cal.push(((rotated[i * dim + d] + shift[d]) * scale[d]).abs());
+                }
+            }
+            cal.sort_by(|a, b| a.partial_cmp(b).expect("values are finite"));
+            let p999 = cal[(cal.len() as f64 * 0.999) as usize];
+            let ratio = p999 / c_outer;
+            assert!(
+                ratio <= prev,
+                "bits={bits}: tail overload ratio rose to {ratio} from {prev} — \
+                 adding bits made the fit worse, which is the #454 failure mode"
+            );
+            prev = ratio;
+        }
+    }
+
+    /// The anchor probability is a function of the codebook, so it must
+    /// move with bit width — that is the whole content of #454. Pinning
+    /// the ordering (not the values, which depend on `dim`) keeps a
+    /// future "simplify this to a constant" from passing silently.
+    #[test]
+    fn the_anchor_probability_widens_with_bit_width() {
+        let dim = 1536usize;
+        let a = (dim as f64 - 1.0) / 2.0;
+        let beta = Beta::new(a, a).expect("Beta(a, a) is valid for a > 0");
+        let mut prev = 0.0f64;
+        for bits in [2usize, 3, 4] {
+            let (_, centroids) = codebook::codebook(bits, dim);
+            let (p_lo, p_hi, qc_lo, qc_hi) = tqplus_anchor(&beta, &centroids);
+            assert!(
+                p_hi > prev,
+                "bits={bits}: anchor probability {p_hi} did not widen past {prev}"
+            );
+            assert!((p_lo + p_hi - 1.0).abs() < 1e-12, "anchor must stay symmetric");
+            assert_eq!(qc_lo, -qc_hi, "canonical targets must stay symmetric");
+            // The targets are the codebook's own edges, not an interior
+            // quantile of the marginal.
+            let c_outer = centroids.iter().fold(0.0f32, |a, &c| a.max(c.abs()));
+            assert_eq!(qc_hi, c_outer);
+            prev = p_hi;
         }
     }
 }

@@ -14,14 +14,18 @@
 //!
 //! Such changes are routine, not exotic:
 //!
-//! * `statrs` decides the TQ+ calibration. `Beta` does not override
-//!   `ContinuousCDF::inverse_cdf`, so `encode::compute_tqplus_calibration`
-//!   gets the trait default — a fixed 16-step bisection on `[-2, 2]`,
-//!   resolution 6.1e-5, whose own doc comment calls it "ill-behaved". A
-//!   release adding a specialised `inverse_cdf` — an obvious upstream
-//!   improvement — moves `tqplus_shift`/`tqplus_scale` by ~5e-4
-//!   relative, which flips ~0.1% of all codes and changes every stored
-//!   scale. Nothing failed (#346). The dependency is now exact-pinned
+//! * `statrs` decides the TQ+ calibration. It used to reach it through
+//!   `ContinuousCDF::inverse_cdf`, which `Beta` does not override — a
+//!   fixed 16-step bisection on `[-2, 2]`, resolution 6.1e-5, whose own
+//!   doc comment calls it "ill-behaved". A release adding a specialised
+//!   `inverse_cdf` moved `tqplus_shift`/`tqplus_scale` by ~5e-4
+//!   relative, flipping ~0.1% of all codes and changing every stored
+//!   scale, and nothing failed (#346). Since #454 the fit anchors on the
+//!   codebook's outermost centroid, so `inverse_cdf` is no longer called
+//!   from production code at all and the calibration's drift surface is
+//!   `Beta::cdf` — the same function the centroids column already
+//!   depends on. The exposure is unchanged in kind, only in which
+//!   function carries it. The dependency is now exact-pinned
 //!   (`=0.17.1`), so that upgrade can no longer arrive on its own — but
 //!   the pin only decides *which* version is compiled, not what the
 //!   resulting bytes are, and it is one line that a deliberate bump or a
@@ -77,14 +81,14 @@ use fingerprint::Fingerprint;
 /// cross-checked against the three-OS `Encode fingerprint` CI artifacts.
 #[rustfmt::skip]
 const GOLDEN: &[(usize, usize, u64, u64, u64, u64, u64, u64)] = &[
-    (200, 2, 0x4fb0378dc1d86d75, 0xd43ff8712da19915, 0xd8954c04d5e32446, 0x51ac5b5fbac6015c, 0xce80807762595093, 0x137431c3add9674c),
-    (600, 3, 0xdbf9f4cb38e0530d, 0xa0f02ffec44b5951, 0x316048f03777b58a, 0x45fb17ac805e46cc, 0xb243f721db7dd1b2, 0x5e6354595068485e),
-    (768, 4, 0x27273d875c560161, 0x09704dad5b65a00d, 0x6184f0f5fa718399, 0x710f98173ad7adf4, 0x9e91401ca53d0e56, 0xad08bf26820cc759),
-    (1000, 4, 0xdc246fa18e79015d, 0xa632bd47c9e9628d, 0x61ca5a892223c472, 0x66b01c252d992e2f, 0x701dc14d71a883e8, 0x76f8ca3dc628094d),
-    (1024, 3, 0xd9eeefae66c34fd1, 0xfcf5342e5aefb105, 0x4535808217e71fd1, 0x08de3afa38a7811f, 0x995c29a6a7552d50, 0x3d583d1804f887f1),
-    (1536, 2, 0xb1a97993603c7dcd, 0x1348c9ae60bbdc3d, 0x634e4556860350de, 0xe08d570fb5d95def, 0x5c196d53c48adb99, 0x6d782eb0a2206256),
-    (1536, 4, 0x05f7a92f87aba9a1, 0x84f2c25cecbf6761, 0x258d63b4ed365a8b, 0x6ea28fd7af0b94ea, 0x90a0225c11099389, 0x73373deb1ffdc8c3),
-    (3072, 4, 0x9a1b3dca8251faad, 0x6a56a1738e12e62d, 0xb2d6299eaeeaf100, 0x759066303c3fbad1, 0x1364e4f49709a1f6, 0x6910e8598ad1badf),
+    (200, 2, 0x4fb0378dc1d86d75, 0xd43ff8712da19915, 0x1974331dac161d9b, 0x122b777da643eba6, 0x467e7fc11cbd63c8, 0xd07be139f458e0d0),
+    (600, 3, 0xdbf9f4cb38e0530d, 0xa0f02ffec44b5951, 0x45a9253a5394ef8e, 0x2ade4149a0363781, 0x1f1a60f658173d8d, 0x842a61645187f26b),
+    (768, 4, 0x27273d875c560161, 0x09704dad5b65a00d, 0x675c5a5d5de10558, 0x2b6e66a18e412461, 0xe19782114e0d4434, 0x0810f334b41c8bd1),
+    (1000, 4, 0xdc246fa18e79015d, 0xa632bd47c9e9628d, 0xe2a3800eca61b130, 0xe02d8df20dcb1dde, 0xd0700a74a602a059, 0x7df5fdc882668100),
+    (1024, 3, 0xd9eeefae66c34fd1, 0xfcf5342e5aefb105, 0x570b4b3ef83a267d, 0x06a3982646ab3fb9, 0x647e88ac939e606e, 0xfe0bad3ec8ade36b),
+    (1536, 2, 0xb1a97993603c7dcd, 0x1348c9ae60bbdc3d, 0x5d9700e531f98c58, 0x65d6c36402627280, 0xd71c40bb564b1fcf, 0x9948dd9f53243a28),
+    (1536, 4, 0x05f7a92f87aba9a1, 0x84f2c25cecbf6761, 0x90eec90ef20017f3, 0xe06d3facabb1be0e, 0x9023d9253dbebb3a, 0x813da547c184fed1),
+    (3072, 4, 0x9a1b3dca8251faad, 0x6a56a1738e12e62d, 0x8bb12d4a388dfa70, 0x2dbc750011989ee3, 0xc2155ee6e517cced, 0xb7119034334f0e43),
 ];
 
 /// Which stage a drifted column implicates. Printed on failure, because
@@ -103,10 +107,11 @@ fn diagnosis(column: &str) -> &'static str {
              suspect. Every stored scale is computed against these."
         }
         "calibration" => {
-            "TQ+ shift/scale, from `Beta::inverse_cdf` (the unspecialised \
-             16-step bisection) and TQPLUS_P_LO/HI. This is the exact \
-             drift #346 is about: a `statrs` patch release specialising \
-             `inverse_cdf` lands here and nowhere else upstream."
+            "TQ+ shift/scale, from `Beta::cdf` via the codebook-derived \
+             anchor (`tqplus_anchor`, #454). If `centroids` also moved, \
+             fix that first — both columns read the same `statrs` \
+             function, so a shared drift shows in both. This column \
+             moving alone means the anchor derivation changed."
         }
         "codes" => {
             "packed codes — the rotation, the codebook boundary scan, the \
@@ -351,8 +356,9 @@ fn the_tqplus_fit_threshold_is_exactly_where_it_has_always_been() {
 
 /// The anchor is only worth anything if the calibration it pins is a
 /// *fitted* one. Below `TQPLUS_MIN_SAMPLES` the calibration is the
-/// identity, which pins nothing about `statrs::Beta::inverse_cdf` — the
-/// single most exposed input in the pipeline (#346).
+/// identity, which pins nothing about `statrs::Beta::cdf` — the single
+/// most exposed input in the pipeline (#346, and the anchor derivation
+/// added in #454).
 ///
 /// `fingerprint()` asserts this per cell; this test states the precondition
 /// as its own named failure so a fixture change that drops `N` below the
