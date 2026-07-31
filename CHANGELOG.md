@@ -617,6 +617,30 @@ appears under each surface it touches.
 
 #### Fixed
 
+- **Serializing a warming-up index that has been drained to zero no
+  longer commits the reloaded copy to identity calibration forever
+  (#418).** A sub-threshold `add` commits an explicit *non-empty
+  identity* `(shift, scale)` pair for the rows it stores. Removing every
+  one of those rows — the "delete all the documents" sequence the
+  integration stores expose — left that pair committed beside an empty
+  warm-up buffer. In memory the index stayed recoverable, but the payload
+  it wrote carried a full-length identity trailer, so
+  `normalize_calibration` took its `!tqplus_shift.is_empty()` early
+  return, `warmup` came back `None`, and every later `add` of any size
+  saw `existing = Some(identity)` and reused it. The reloaded index was
+  `Identity` for the rest of its life while holding zero vectors, and the
+  existing serialization warning could not flag it because that warning
+  returns early on `len == 0`. An exactly-identity pair declares no
+  transform and `n_vectors == 0` means no rows are encoded under it, so
+  such a payload is indistinguishable from a fresh index; it now
+  normalizes to the same empty pair and warm-up buffer a fresh index has.
+  Reachable through `to_bytes`/`from_bytes`, `write`/`load` and every
+  store's `copy.copy` / `pickle`. **No format change** — this is only how
+  an already-legal payload is interpreted on load, at the single
+  chokepoint `from_parts` and both v6 load arms share, so files written
+  by older versions are recovered too. A drained *fitted* index is
+  unaffected: its trailer holds a real fit, not identity, so it keeps its
+  calibration on reload exactly as it does in memory (#284).
 - **`rename_atomic` retries `ERROR_ACCESS_DENIED` as well as
   `ERROR_SHARING_VIOLATION` on Windows (#415).** The Rust writer had the
   same too-narrow whitelist as the Python one: a rename onto a
@@ -1354,6 +1378,16 @@ appears under each surface it touches.
 
 #### Fixed
 
+- **Copying or saving a warming-up index that has been drained to zero
+  no longer commits the copy to identity calibration forever (#418).**
+  Deleting every document from a store that never reached 1000 vectors
+  and then persisting or copying it — `dump()`, `persist()`,
+  `copy.copy(store)`, `pickle` — produced an index reporting
+  `calibration_state == "identity"` with `len == 0`, which no later
+  ingest of any size could ever move off identity. It now comes back
+  `"warming_up"`, so the next corpus gets a real fit. See the Rust crate
+  entry for the mechanism. A drained *fitted* index still keeps its
+  calibration across the same round trip (#284).
 - **Concurrent saves to one path no longer intermittently raise
   `PermissionError` on Windows (#415).** `atomic_save` retried the
   `os.replace` that publishes each artifact, but only for

@@ -317,10 +317,16 @@ fn calibration_state_name(state: turbovec_core::CalibrationState) -> &'static st
     }
 }
 
-/// Warn when an index is serialized while still warming up: a file
-/// carries no warm-up buffer, so the loaded copy is committed to
-/// identity calibration for good and loses the TQ+ recall gain no matter
-/// how many vectors are added later.
+/// Warn when an index holding at least one vector is serialized while
+/// still warming up: a file carries no warm-up buffer, so the loaded
+/// copy is committed to identity calibration for good and loses the TQ+
+/// recall gain no matter how many vectors are added later.
+///
+/// The `len == 0` early return below is not an oversight. The only
+/// index that reaches it is one that is *still warming up* and holds no
+/// rows, which has nothing encoded under identity — so it round-trips
+/// back into warm-up and forfeits nothing (#418), and there is no
+/// warning to give.
 ///
 /// `warned` is the calling index's own one-shot latch — it is a field on
 /// the pyclass, not a process-global. A service holding one small store
@@ -367,11 +373,6 @@ fn calibration_state_name(state: turbovec_core::CalibrationState) -> &'static st
 /// per-tenant case (#366) would collapse to one warning per call site
 /// unconditionally rather than conditionally. Keeping `len` plus a
 /// per-index latch is the combination that loses the least.
-///
-/// Note the `len == 0` guard below is a third blind spot, and a
-/// deliberate one here: an index drained to zero has no rows to forfeit
-/// *in memory*, but serializing it does write a permanent identity
-/// trailer. That is #418, not this function's to fix.
 fn warn_if_warming_up(
     py: Python<'_>,
     warned: &std::sync::atomic::AtomicBool,
@@ -731,14 +732,21 @@ impl TurboQuantIndex {
     /// but skips fsync — faster, not power-loss-safe.
     ///
     /// A file carries no warm-up buffer, so saving while
-    /// ``calibration_state`` is still ``"warming_up"`` (fewer than 1000
-    /// vectors added) commits the *reloaded* index to ``"identity"``
+    /// ``calibration_state`` is still ``"warming_up"`` (between 1 and
+    /// 999 vectors stored) commits the *reloaded* index to ``"identity"``
     /// calibration for its whole life: it never fits a TQ+ calibration
     /// however many vectors are added afterwards, and gives up the TQ+
     /// recall gain (most of it at 2 bits). This index keeps its buffer
     /// and is unaffected. Add at least 1000 vectors before saving, or
     /// rebuild the reloaded index from the original float32 vectors. A
     /// ``RuntimeWarning`` flags it once per index.
+    ///
+    /// An index holding **zero** vectors is the exception — it has
+    /// nothing encoded under identity, so it reloads as ``"warming_up"``
+    /// and the next add can still fit a calibration. That is the state
+    /// deleting every document from a small store leaves behind. An index
+    /// that had reached ``"fitted"`` before being drained is *not* covered:
+    /// it writes its real calibration and reloads ``"fitted"``.
     #[pyo3(signature = (path, *, durable = true))]
     fn write(&self, py: Python<'_>, path: &str, durable: bool) -> PyResult<()> {
         let durability = if durable {
@@ -796,8 +804,9 @@ impl TurboQuantIndex {
     /// pickling) without a filesystem round-trip.
     ///
     /// A payload carries no warm-up buffer, so serializing while
-    /// ``calibration_state`` is still ``"warming_up"`` commits the
-    /// deserialized index to ``"identity"`` calibration for good — see
+    /// ``calibration_state`` is still ``"warming_up"`` and at least one
+    /// vector is stored commits the deserialized index to ``"identity"``
+    /// calibration for good — see
     /// ``write``. This is the path ``pickle``, ``copy.copy`` and
     /// ``copy.deepcopy`` take, so a copy of a sub-1000-vector index is
     /// permanently weaker than the original it was copied from, which
@@ -1260,14 +1269,21 @@ impl IdMapIndex {
     /// but skips fsync — faster, not power-loss-safe.
     ///
     /// A file carries no warm-up buffer, so saving while
-    /// ``calibration_state`` is still ``"warming_up"`` (fewer than 1000
-    /// vectors added) commits the *reloaded* index to ``"identity"``
+    /// ``calibration_state`` is still ``"warming_up"`` (between 1 and
+    /// 999 vectors stored) commits the *reloaded* index to ``"identity"``
     /// calibration for its whole life: it never fits a TQ+ calibration
     /// however many vectors are added afterwards, and gives up the TQ+
     /// recall gain (most of it at 2 bits). This index keeps its buffer
     /// and is unaffected. Add at least 1000 vectors before saving, or
     /// rebuild the reloaded index from the original float32 vectors. A
     /// ``RuntimeWarning`` flags it once per index.
+    ///
+    /// An index holding **zero** vectors is the exception — it has
+    /// nothing encoded under identity, so it reloads as ``"warming_up"``
+    /// and the next add can still fit a calibration. That is the state
+    /// deleting every document from a small store leaves behind. An index
+    /// that had reached ``"fitted"`` before being drained is *not* covered:
+    /// it writes its real calibration and reloads ``"fitted"``.
     #[pyo3(signature = (path, *, durable = true))]
     fn write(&self, py: Python<'_>, path: &str, durable: bool) -> PyResult<()> {
         let durability = if durable {
@@ -1327,8 +1343,9 @@ impl IdMapIndex {
     /// (caches, databases, pickling) without a filesystem round-trip.
     ///
     /// A payload carries no warm-up buffer, so serializing while
-    /// ``calibration_state`` is still ``"warming_up"`` commits the
-    /// deserialized index to ``"identity"`` calibration for good — see
+    /// ``calibration_state`` is still ``"warming_up"`` and at least one
+    /// vector is stored commits the deserialized index to ``"identity"``
+    /// calibration for good — see
     /// ``write``. This is the path ``pickle``, ``copy.copy`` and
     /// ``copy.deepcopy`` take, so a copy of a sub-1000-vector index is
     /// permanently weaker than the original it was copied from, which
