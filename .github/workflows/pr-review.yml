@@ -45,6 +45,20 @@ jobs:
     # comment that belongs to a PR (issue_comment fires for issues too). The
     # fork check happens in the guard step below, because issue_comment
     # payloads carry no head-repo information.
+    #
+    # The reviewer account is excluded from the mention path by actor id
+    # (turbovec-bot = 309383466, pinned numerically for the same reason
+    # claude.yml does it: logins can be renamed or reclaimed). Its comments
+    # are PAT-authored, so they DO fire `issue_comment` — and this job posts
+    # a comment of its own when a run produces no output. Without the
+    # exclusion, any wording of that warning containing the trigger token
+    # would start another review run, whose own silence would post warning
+    # #2, and so on unbounded: `SINCE` is re-sampled per run so the previous
+    # warning always predates the window and is never counted, and
+    # `cancel-in-progress: false` serializes the chain rather than breaking
+    # it. The warning body below also avoids the literal token, so the loop
+    # is closed twice over — the body could be reworded by someone who does
+    # not know it is load-bearing, and the actor guard survives that.
     if: |
       github.event_name == 'workflow_dispatch' ||
       (github.event_name == 'pull_request' &&
@@ -52,6 +66,7 @@ jobs:
        github.event.pull_request.draft == false) ||
       (github.event_name == 'issue_comment' &&
        github.event.issue.pull_request != null &&
+       github.actor_id != '309383466' &&
        contains(github.event.comment.body, '/review') &&
        contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association))
     runs-on: ubuntu-latest
@@ -113,6 +128,13 @@ jobs:
         if: steps.guard.outputs.ok == 'true'
         run: sudo apt-get update && sudo apt-get install -y libopenblas-dev pkg-config
 
+      # Watermark for the did-it-post-anything check below. Taken before the
+      # agent runs so the comparison covers exactly this run's output, and
+      # a comment left by an earlier round cannot be mistaken for this one's.
+      - id: review_started
+        if: steps.guard.outputs.ok == 'true'
+        run: echo "at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+
       - id: review
         if: steps.guard.outputs.ok == 'true'
         uses: anthropics/claude-code-action@be7b93b1907a4abad570368f3c74b6fe3807510b # v1.0.183
@@ -154,8 +176,15 @@ jobs:
       # The action reports `is_error: true` without ever surfacing the reason —
       # every claude.yml failure so far has been an opaque 1-turn rejection.
       # Dump the execution log so the next failure explains itself.
-      - name: Dump execution log on failure
-        if: failure()
+      # Always, not just on failure. A run can succeed having reviewed
+      # nothing (#451), and that is the case most in need of explaining —
+      # but the action sets `show_full_output: false`, so the job log holds
+      # only the init and result blocks, and nothing is uploaded as an
+      # artifact. Four such runs were unrecoverable after the fact for
+      # exactly this reason. Dumping unconditionally costs a few log lines
+      # and makes the next one diagnosable.
+      - name: Dump execution log
+        if: always()
         run: |
           f="${RUNNER_TEMP}/claude-execution-output.json"
           if [ -f "$f" ]; then
@@ -164,6 +193,70 @@ jobs:
             echo "::endgroup::"
           else
             echo "no execution output at $f"
+          fi
+
+      # A run can finish green having posted nothing at all — no issue
+      # comment, no review, no inline comments (#451). On the pull request
+      # that is indistinguishable from "reviewed, found nothing", and since
+      # a clear review is the merge gate, it reads as approval. Four such
+      # runs happened in one day; one PR merged with its head unreviewed
+      # because a re-request produced another silent run.
+      #
+      # Counting all three surfaces is deliberate: the review arrives on a
+      # different one from round to round — a formal review with inline
+      # comments in one round, a plain issue comment in the next — so
+      # checking a single surface would raise false alarms.
+      # `guard.outputs.ok` is required, not just `pr`: a fork PR is skipped
+      # deliberately, and warning that it went unreviewed would be noise
+      # about a decision the workflow made on purpose.
+      - name: Warn if the review posted nothing
+        if: success() && steps.guard.outputs.ok == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.CLAUDE_BOT_TOKEN }}
+          PR: ${{ steps.guard.outputs.pr }}
+          RUN: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          SINCE: ${{ steps.review_started.outputs.at }}
+        run: |
+          set -euo pipefail
+          repo="$GITHUB_REPOSITORY"
+          # Only the reviewer's own output counts. Counting every comment
+          # would let an unrelated human remark posted during the run mask a
+          # silent one — which is exactly what happened while testing this.
+          # Resolved from the token rather than hardcoded, so it stays right
+          # if the machine account is ever renamed or replaced.
+          bot=$(gh api user --jq .login)
+          echo "reviewer account: $bot"
+          # Every one of these three surfaces is paginated, and GitHub
+          # returns them OLDEST first — so an unpaginated call sees the
+          # first 30 items and none of the newest. On any PR that has
+          # crossed 30 items on the surface the review lands on, the
+          # window items are on a later page, the count comes back 0, and
+          # the check posts "unreviewed" about a review that did post.
+          # Exactly inverted, and it gets more likely the more a PR is
+          # iterated on — i.e. on the PRs that are reviewed most.
+          #
+          # `--paginate` walks every page and emits one JSON array per
+          # page, so `jq -s` collects them into an array of arrays —
+          # hence `.[][]`, page then item. (`gh api --slurp` would do the
+          # collecting, but it is rejected in combination with `--jq`.)
+          # `per_page=100` keeps it to a single request in the common
+          # case. Reviews carry `submitted_at` where the two comment
+          # surfaces carry `created_at`, and an unsubmitted (pending)
+          # review has a null `submitted_at`, which fails the comparison
+          # — correctly, since it is not visible on the PR either.
+          count_since() {
+            gh api --paginate -X GET "$1" -f per_page=100 \
+              | jq -s "[.[][] | select((.created_at // .submitted_at) > \"$SINCE\"
+                                       and .user.login == \"$bot\")] | length"
+          }
+          n=0
+          n=$(( n + $(count_since "repos/$repo/issues/$PR/comments") ))
+          n=$(( n + $(count_since "repos/$repo/pulls/$PR/reviews") ))
+          n=$(( n + $(count_since "repos/$repo/pulls/$PR/comments") ))
+          echo "items posted by $bot since $SINCE: $n"
+          if [ "$n" -eq 0 ]; then
+            gh pr comment "$PR" --repo "$repo" --body \
+              "⚠️ **Automated review produced no output** — the run finished successfully but posted no comment, review, or inline finding, so this pull request is **unreviewed**. This is not the same as a clean review. Re-request with the review command, and see #451. [View run]($RUN)"
           fi
 
       # A reaction is too easy to miss. Say plainly on the PR that the review
