@@ -76,21 +76,123 @@ fn ids_at_every_scale(dim: usize, bits: usize) {
     idx.add(&db);
     idx.prepare();
 
+    // `ORDER_TOL` is the width of the band inside which this kernel does
+    // not decide an ordering (see the scale loop below). It is ~6x the
+    // 1.7e-4 LUT resolution measured at dim=768 bits=2 — deliberate
+    // slack, not a measurement, because the resolution varies with the
+    // per-sub-table span and this test covers four configs with one
+    // constant. The cost of the slack is that a genuine ranking bug
+    // swapping vectors closer than 1e-3 apart would pass here; the
+    // recall suites are what cover that.
+    const ORDER_TOL: f32 = 1e-3;
+
     let base = idx.search(&q, k);
     let base_ids: Vec<Vec<i64>> = (0..nq)
         .map(|qi| base.indices_for_query(qi).to_vec())
         .collect();
+    let base_scores: Vec<Vec<f32>> = (0..nq)
+        .map(|qi| base.scores_for_query(qi).to_vec())
+        .collect();
+
+    // How much of each query's top-k is decidable at all.
+    //
+    // Whether the vector at rank k or the one at rank k+1 lands in the
+    // result is LUT noise when their scores sit within `ORDER_TOL`, so
+    // for those queries the top-k id *set* legitimately differs across
+    // scales. Asserting it unconditionally would test the fixture, not
+    // the kernel — the same disease the exact-order assertion had. This
+    // fixture really does contain such queries (dim=256 bits=2 query 10:
+    // rank-10 gap 6.2e-4), so rather than re-roll a seed until they
+    // disappear, each query is checked over the prefix that *is* decided:
+    // the leading ranks whose scores stand clear of the rank-(k+1) score
+    // by more than `ORDER_TOL`.
+    let base_k1 = idx.search(&q, k + 1);
+    let stable: Vec<usize> = (0..nq)
+        .map(|qi| {
+            let row = base_k1.scores_for_query(qi);
+            let span = row[0].abs().max(f32::MIN_POSITIVE);
+            let cutoff = row[k];
+            let mut m = (0..k)
+                .take_while(|&r| (row[r] - cutoff) / span > ORDER_TOL)
+                .count();
+            // Clearing the rank-(k+1) score is necessary but not
+            // sufficient: `cutoff + TOL` is an arbitrary level, and the
+            // two ranks straddling it can sit arbitrarily close to *each
+            // other* while both satisfy the condition above. If that pair
+            // transposes under scaling, the scaled prefix contains rank m
+            // where the base prefix had rank m-1, and the set assertion
+            // fires on behaviour this test has itself declared
+            // undecidable. This fixture contains such a pair (dim=256
+            // bits=2 query 50, m=9, boundary gap 6.8e-4 against a 1e-3
+            // tolerance). Shrinking until the boundary itself is
+            // separated makes the prefix minimum clear the non-prefix
+            // maximum by more than TOL, which is the sufficient condition
+            // for the top-m set to be noise-stable. `m == k` needs no
+            // shrink: the `take_while` already separated rank k-1 from
+            // the cutoff.
+            while m > 0 && m < k && (row[m - 1] - row[m]) / span <= ORDER_TOL {
+                m -= 1;
+            }
+            m
+        })
+        .collect();
+    // With every query decidable only at rank 0 the test would pass
+    // vacuously, so require the fixture to still have teeth.
+    let total: usize = stable.iter().sum();
+    assert!(
+        total >= nq * k / 2,
+        "dim={dim} bits={bits}: only {total} of {} ranks are decidable — the fixture \
+         has degenerated and the assertions below would be near-vacuous; re-roll the seed",
+        nq * k
+    );
 
     for &c in SCALES {
         let scaled: Vec<f32> = q.iter().map(|v| v * c).collect();
         let r = idx.search(&scaled, k);
         for (qi, expected) in base_ids.iter().enumerate() {
             let got = r.indices_for_query(qi);
+            let scores = &base_scores[qi];
+            let m = stable[qi];
+            // Same ids, over the decidable prefix: that is the guarantee
+            // #335 is about — a small query must not collapse the LUT and
+            // destroy the result set.
+            let (mut a, mut b) = (got[..m].to_vec(), expected[..m].to_vec());
+            a.sort_unstable();
+            b.sort_unstable();
             assert_eq!(
-                got,
-                expected.as_slice(),
-                "dim={dim} bits={bits} query {qi} returned different ids at scale {c:e}"
+                a, b,
+                "dim={dim} bits={bits} query {qi} returned a different id SET over its \
+                 decidable prefix ({m} of {k}) at scale {c:e}"
             );
+            // Order, only where the scores are far enough apart to
+            // decide it. `c` is not a power of two, so `q * c` perturbs
+            // every component by up to an f32 ulp; the query LUT then
+            // quantizes to u8, which amplifies that to ~1e-4 relative on
+            // a score. Two database vectors closer together than that
+            // are genuinely not ordered by this kernel, and asserting
+            // otherwise pins an accident of the fixture rather than a
+            // property of the design. Measured instance: at dim=768
+            // bits=2 the pair (1978, 432) sits 5.8e-5 apart relative to
+            // the top score and transposes at c=1e-2.
+            let span = scores[0].abs().max(f32::MIN_POSITIVE);
+            for (i, (&g, &e)) in got[..m].iter().zip(expected[..m].iter()).enumerate() {
+                if g == e {
+                    continue;
+                }
+                // The set assertion above passed, so every id in
+                // `got[..m]` is somewhere in `expected[..m]`.
+                let ge = expected
+                    .iter()
+                    .position(|&x| x == g)
+                    .expect("set equality over the prefix was asserted above");
+                let gap = (scores[i] - scores[ge]).abs() / span;
+                assert!(
+                    gap <= ORDER_TOL,
+                    "dim={dim} bits={bits} query {qi} reordered ids {e} and {g} at scale \
+                     {c:e}, but their scores differ by {gap:e} (> {ORDER_TOL:e}) — that is a \
+                     ranking change, not LUT-resolution noise"
+                );
+            }
         }
     }
 }
