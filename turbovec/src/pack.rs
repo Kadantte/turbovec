@@ -299,7 +299,7 @@ pub(crate) fn extract_codes_flat(
 /// arch-neutral form the v6 file format persists: vectors in order inside
 /// each 32-vector block, one code byte per lane. On non-x86 this is also
 /// the layout the search kernel consumes.
-fn pack_blocked_sequential(
+pub(crate) fn pack_blocked_sequential(
     n: usize,
     n_blocks: usize,
     n_byte_groups: usize,
@@ -480,6 +480,18 @@ pub(crate) fn repack_block_range(
     let range_blocks = block_end - block_start;
     let blocked_size = range_blocks * n_byte_groups * BLOCK;
     pack_blocked_native!(n_range, range_blocks, n_byte_groups, blocked_size, &codes_flat)
+}
+
+/// Byte `group` of lane `lane` in the sequential-blocked block starting
+/// at `base` — the O(dim) row gather the non-x86 `seq_row` arm uses.
+/// Kept cfg-free so every arch compiles and unit-tests the exact
+/// arithmetic; x86's `seq_row` uses the nibble de-interleave instead.
+// On x86 the lib target never calls this (`seq_row` de-interleaves
+// nibbles instead); it exists there for the cross-arch unit test.
+#[cfg_attr(target_arch = "x86_64", allow(dead_code))]
+#[inline]
+pub(crate) fn seq_lane_byte(data: &[u8], base: usize, group: usize, lane: usize) -> u8 {
+    data[base + group * BLOCK + lane]
 }
 
 /// Native search layout → sequential blocked layout — [`seq_into_native`]'s
@@ -816,5 +828,32 @@ mod tests {
     #[test]
     fn pseudo_random_helper_is_deterministic() {
         assert_eq!(pseudo_random_packed(3, 4, 64), pseudo_random_packed(3, 4, 64));
+    }
+}
+
+#[cfg(test)]
+mod seq_lane_tests {
+    use super::{seq_lane_byte, BLOCK};
+
+    /// The lane gather's exact arithmetic, pinned on a synthetic
+    /// two-block buffer where every byte encodes its own coordinates —
+    /// any sign, stride, or operator slip lands on a different value.
+    #[test]
+    fn lane_gather_addresses_exactly() {
+        let groups = 5;
+        let block_bytes = groups * BLOCK;
+        let data: Vec<u8> = (0..2 * block_bytes).map(|i| (i % 251) as u8).collect();
+        for block in 0..2 {
+            let base = block * block_bytes;
+            for lane in [0usize, 1, 17, 31] {
+                for g in 0..groups {
+                    assert_eq!(
+                        seq_lane_byte(&data, base, g, lane),
+                        ((base + g * BLOCK + lane) % 251) as u8,
+                        "block {block} lane {lane} group {g}"
+                    );
+                }
+            }
+        }
     }
 }

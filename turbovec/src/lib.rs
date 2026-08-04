@@ -65,6 +65,7 @@ pub mod encode;
 pub mod error;
 pub mod id_map;
 pub mod io;
+mod io_v7;
 pub mod pack;
 pub mod rotation;
 pub mod search;
@@ -351,6 +352,25 @@ pub struct TurboQuantIndex {
     /// the retention target in [`retain_scratch`], so a buffer is only
     /// kept while the adds around it are still using one that big.
     encode_scratch_prev: usize,
+    /// Cursor into the last-synced v7 file, when this index has one:
+    /// the commit the file holds, so `sync` writes only the delta.
+    sync_cursor: Option<io_v7::SyncCursor>,
+    /// The path the cursor belongs to. Syncing to a different path
+    /// writes full and rebinds.
+    sync_path: Option<std::path::PathBuf>,
+    /// Slots whose redo ops ride the last-committed header: declared
+    /// there, not yet materialized into their units. The next sync
+    /// either materializes them (their live bytes ARE the committed
+    /// bytes) or carries them forward if their unit got dirtied again.
+    sync_pending: std::collections::HashSet<usize>,
+    /// Disk-committed slots dirtied since the last sync. No value is
+    /// captured — a redo op is an absolute write, so the live row at
+    /// plan time is the op.
+    sync_fresh: std::collections::HashSet<usize>,
+    /// Bumped by every committed `calibrate`; a mismatch with the cursor
+    /// forces the next sync to compact, since a refit rewrites every
+    /// stored code.
+    calib_gen: u64,
 }
 
 /// Release a reused scratch buffer that is far larger than the adds
@@ -549,6 +569,11 @@ impl TurboQuantIndex {
             blocked: OnceLock::new(),
             encode_scratch: Vec::new(),
             encode_scratch_prev: 0,
+            sync_cursor: None,
+            sync_path: None,
+            sync_pending: std::collections::HashSet::new(),
+            sync_fresh: std::collections::HashSet::new(),
+            calib_gen: 0,
         })
     }
 
@@ -576,6 +601,11 @@ impl TurboQuantIndex {
             blocked: OnceLock::new(),
             encode_scratch: Vec::new(),
             encode_scratch_prev: 0,
+            sync_cursor: None,
+            sync_path: None,
+            sync_pending: std::collections::HashSet::new(),
+            sync_fresh: std::collections::HashSet::new(),
+            calib_gen: 0,
         })
     }
 
@@ -1343,6 +1373,344 @@ impl TurboQuantIndex {
         });
     }
 
+    /// First row NOT covered by the synced file's committed whole
+    /// blocks — slots below this live in units on disk.
+    pub(crate) fn sync_watermark(&self) -> usize {
+        self.sync_cursor
+            .map(|c| (c.n_synced as usize) / BLOCK * BLOCK)
+            .unwrap_or(0)
+    }
+
+    /// Mark a disk-committed slot as diverged. No bytes are captured —
+    /// the redo op serialized at the next sync reads the live row.
+    fn mark_dirty(&mut self, slot: usize) {
+        if slot < self.sync_watermark() {
+            self.sync_fresh.insert(slot);
+        }
+    }
+
+    /// The plan the next incremental sync would run, without running
+    /// it — the crash harness tears these batches at every byte.
+    #[cfg(test)]
+    pub(crate) fn plan_next_sync(&mut self, kind: u8, ids: Option<&[u64]>) -> io_v7::SyncPlan {
+        let dim = self.dim.expect("plan_next_sync on a lazy index");
+        if self.blocked.get().is_none() {
+            self.packed();
+        }
+        if self.boundaries.get().is_none() || self.centroids.get().is_none() {
+            let (b, c) = codebook::codebook(self.bit_width, dim);
+            let _ = self.boundaries.set(b);
+            let _ = self.centroids.set(c);
+        }
+        let seq_blocks = |from: usize, to: usize| self.seq_blocks_range(from, to);
+        let row_codes = |idx: usize| self.seq_row(idx);
+        let source = io_v7::SyncSource {
+            kind,
+            dim,
+            bit_width: self.bit_width,
+            n_vectors: self.n_vectors,
+            seq_blocks: &seq_blocks,
+            row_codes: &row_codes,
+            scales: &self.scales,
+            ids,
+            tqplus_shift: &self.tqplus_shift,
+            tqplus_scale: &self.tqplus_scale,
+            boundaries: self.boundaries.get().expect("seeded above"),
+            centroids: self.centroids.get().expect("seeded above"),
+        };
+        io_v7::plan_incremental(
+            &source,
+            self.sync_cursor.expect("plan_next_sync on an unbound index"),
+            &self.sync_pending,
+            &self.sync_fresh,
+        )
+        .expect("plan_next_sync: ops exceed the header capacity")
+    }
+
+    /// This row's codes in the arch-neutral sequential layout (one byte
+    /// per byte-group), read from whichever in-memory layout is live —
+    /// O(dim), no whole-index materialization.
+    fn seq_row(&self, idx: usize) -> Vec<u8> {
+        let dim = self.dim.expect("seq_row on a dim-less index");
+        // Two different strides: packed rows are bit-packed
+        // (`dim * bits / 8`), the sequential-blocked layout stores one
+        // byte per group (`dim / (8 / bits)`). They agree for 2- and
+        // 4-bit but NOT for 3-bit, whose codes occupy 4-bit fields.
+        let packed_row = dim * self.bit_width / 8;
+        let (_, row_bytes, _) = pack::blocked_geometry(1, self.bit_width, dim);
+        if let Some(packed) = self.packed_codes.get() {
+            return pack::extract_codes_flat(
+                &packed[idx * packed_row..(idx + 1) * packed_row],
+                1,
+                self.bit_width,
+                dim,
+            );
+        }
+        // O(dim) straight off the blocked cache — removal capture must
+        // not pay for the other 31 rows of the block. Off x86 the
+        // native layout IS sequential-blocked, so this is a stride-32
+        // gather; on x86 each byte de-interleaves from its nibble
+        // planes (the primitive the scalar search fallback uses).
+        let cache = self.blocked.get().expect("no code layout materialized");
+        let block_bytes = row_bytes * BLOCK;
+        let base = (idx / BLOCK) * block_bytes;
+        let lane = idx % BLOCK;
+        #[cfg(target_arch = "x86_64")]
+        return (0..row_bytes)
+            .map(|g| pack::deinterleave_x86_code_byte(&cache.data, base + g * BLOCK, lane))
+            .collect();
+        #[cfg(not(target_arch = "x86_64"))]
+        (0..row_bytes)
+            .map(|g| pack::seq_lane_byte(&cache.data, base, g, lane))
+            .collect()
+    }
+
+    /// Sequential-blocked codes for rows `[from, to)` — whole 32-row
+    /// blocks only. O(range), not O(index), from either layout.
+    fn seq_blocks_range(&self, from: usize, to: usize) -> Vec<u8> {
+        debug_assert!(from.is_multiple_of(BLOCK) && to.is_multiple_of(BLOCK) && from <= to);
+        let dim = self.dim.expect("seq_blocks_range on a dim-less index");
+        let packed_row = dim * self.bit_width / 8;
+        let (_, row_bytes, _) = pack::blocked_geometry(1, self.bit_width, dim);
+        if let Some(packed) = self.packed_codes.get() {
+            let flat = pack::extract_codes_flat(
+                &packed[from * packed_row..to * packed_row],
+                to - from,
+                self.bit_width,
+                dim,
+            );
+            let n = to - from;
+            return pack::pack_blocked_sequential(
+                n,
+                n / BLOCK,
+                row_bytes,
+                n / BLOCK * row_bytes * BLOCK,
+                &flat,
+            );
+        }
+        let cache = self.blocked.get().expect("no code layout materialized");
+        let block_bytes = row_bytes * BLOCK;
+        pack::native_to_seq(&cache.data[from / BLOCK * block_bytes..to / BLOCK * block_bytes])
+    }
+
+    /// Persist this index's changes to `path` incrementally.
+    ///
+    /// The first sync of a path — or any sync after a
+    /// [`Self::calibrate`] call, or to a different path than last time —
+    /// writes the whole index as a fresh sync container (temp file + atomic
+    /// rename, so a previous file at `path` survives a crash). Every
+    /// other sync appends only what changed since the last one: the rows
+    /// added, one small patch record per removal, and a commit record —
+    /// kilobytes, where [`Self::write`] rewrites the whole file.
+    ///
+    /// Crash safety: appended bytes are made durable before the commit
+    /// header that adopts them flips, and a removal never touches
+    /// committed bytes during the sync that commits it — it rides the
+    /// header as a redo op, materialized idempotently by a later sync.
+    /// A crash at any byte of a sync recovers the previous commit
+    /// exactly: a torn commit header fails its checksum and load falls
+    /// back to the previous one. Damage from outside the writer (bit
+    /// rot, mangled copies) is out of scope, as it is for `write`.
+    ///
+    /// [`Self::write`] / [`Self::load`] keep their meaning; `load`
+    /// recognises both formats, and the first `sync` to a v6 file's
+    /// path replaces it with the sync container.
+    ///
+    /// Single writer: one process syncs a given path at a time. Each
+    /// full write stamps the file with a fresh random nonce, so if
+    /// another process does replace the file, the next sync here
+    /// reports it as foreign rather than corrupting it — but two
+    /// processes syncing the same path concurrently is unsupported.
+    pub fn sync(&mut self, path: impl AsRef<Path>) -> std::io::Result<()> {
+        self.sync_v7_impl(path.as_ref(), 0, None)
+    }
+
+    /// The shared v7 sync engine. `IdMapIndex` drives it with `kind` 1
+    /// and the id table (redo ops and appended units read ids from it).
+    pub(crate) fn sync_v7_impl(
+        &mut self,
+        path: &Path,
+        kind: u8,
+        ids_full: Option<&[u64]>,
+    ) -> std::io::Result<()> {
+        let Some(dim) = self.dim else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "cannot sync a lazy index that has never seen an add or calibrate",
+            ));
+        };
+        if self.blocked.get().is_none() {
+            self.packed();
+        }
+        if self.boundaries.get().is_none() || self.centroids.get().is_none() {
+            let (b, c) = codebook::codebook(self.bit_width, dim);
+            let _ = self.boundaries.set(b);
+            let _ = self.centroids.set(c);
+        }
+        let geo = io_v7::Geo {
+            kind,
+            dim,
+            bit_width: self.bit_width,
+            n_calib: self.tqplus_shift.len(),
+        };
+        // The identity check runs whenever this index is BOUND to the
+        // path — including when a calibrate has queued a compaction.
+        // Deciding "full rewrite" without opening the file would skip
+        // the nonce comparison, and a compaction that renames over a
+        // file another writer has taken over destroys their commits.
+        let bound = matches!(
+            (&self.sync_cursor, &self.sync_path),
+            (Some(_), Some(p)) if p == path
+        );
+        let state = if bound {
+            let c = self.sync_cursor.as_ref().expect("checked above");
+            io_v7::cursor_state(path, c, &geo)?
+        } else {
+            io_v7::CursorState::Replaced
+        };
+        let incremental = bound && {
+            let c = self.sync_cursor.as_ref().expect("checked above");
+            c.calib_gen == self.calib_gen
+        };
+        if matches!(state, io_v7::CursorState::Foreign) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "the v7 file at {} no longer matches this index's last sync \
+                     (another writer advanced or replaced it); load() the file to \
+                     adopt its state, or choose a different path",
+                    path.display()
+                ),
+            ));
+        }
+        let result = {
+            let seq_blocks = |from: usize, to: usize| self.seq_blocks_range(from, to);
+            let row_codes = |idx: usize| self.seq_row(idx);
+            let source = io_v7::SyncSource {
+                kind,
+                dim,
+                bit_width: self.bit_width,
+                n_vectors: self.n_vectors,
+                seq_blocks: &seq_blocks,
+                row_codes: &row_codes,
+                scales: &self.scales,
+                ids: ids_full,
+                tqplus_shift: &self.tqplus_shift,
+                tqplus_scale: &self.tqplus_scale,
+                boundaries: self.boundaries.get().expect("seeded above"),
+                centroids: self.centroids.get().expect("seeded above"),
+            };
+            match state {
+                io_v7::CursorState::Intact if incremental => {
+                    let c = self.sync_cursor.expect("checked above");
+                    // `None` when the carried ops exceed the header's
+                    // capacity — a mass removal — where a full rewrite
+                    // is proportionate.
+                    match io_v7::plan_incremental(
+                        &source,
+                        c,
+                        &self.sync_pending,
+                        &self.sync_fresh,
+                    ) {
+                        Some(plan) => {
+                            io_v7::run_sync(path, &plan).map(|c| (c, plan.carried))
+                        }
+                        None => io_v7::write_full(path, &source, self.calib_gen)
+                            .map(|c| (c, Vec::new())),
+                    }
+                }
+                _ => io_v7::write_full(path, &source, self.calib_gen)
+                    .map(|c| (c, Vec::new())),
+            }
+        };
+        match result {
+            Ok((cursor, carried)) => {
+                self.sync_pending = carried.into_iter().collect();
+                self.sync_fresh.clear();
+                self.sync_cursor = Some(io_v7::SyncCursor {
+                    calib_gen: self.calib_gen,
+                    ..cursor
+                });
+                self.sync_path = Some(path.to_path_buf());
+                Ok(())
+            }
+            // A failed sync may still have landed bytes — including a
+            // complete, self-verifying commit header (write and fsync
+            // errors surface after bytes reach the OS, and after a
+            // failed fsync the page cache can no longer be trusted).
+            // If the cursor stayed bound, a landed header would make
+            // every retry report "another writer advanced this file"
+            // forever. Drop the binding: the next sync takes the full
+            // write path (temp file + atomic rename), which is correct
+            // from any on-disk state.
+            Err(e) => {
+                self.sync_cursor = None;
+                self.sync_path = None;
+                Err(e)
+            }
+        }
+    }
+
+    /// Load a v7 file written by [`Self::sync`]; the reloaded index is
+    /// bound to `path` as its sync target, so the next `sync` writes
+    /// only the delta.
+    ///
+    /// Lands in the same state a v6 load lands in: only the SIMD-blocked
+    /// search layout is seeded — `packed_codes` stays unset, and adds
+    /// take the lazy-append branch — so a synced-file load holds one copy of the
+    /// codes, not two. This is the RAM property #471 exists for.
+    fn load_v7(path: &Path) -> std::io::Result<Self> {
+        let l = io_v7::load(path, 0, 0)?;
+        Self::from_v7(l, path)
+    }
+
+    /// Assemble an index from a v7 payload — the shared tail of
+    /// [`Self::load_v7`] and `IdMapIndex`'s v7 loader.
+    pub(crate) fn from_v7(l: io_v7::V7Load, path: &Path) -> std::io::Result<Self> {
+        let n_blocks = l.n_vectors.div_ceil(BLOCK);
+        // The units already hold the seq-blocked layout; one platform
+        // transform in place (identity off x86) and it IS the search
+        // cache.
+        let native = pack::seq_into_native(l.seq_blocked);
+        let (tqplus_shift, tqplus_scale) =
+            Self::normalize_calibration(l.tqplus_shift, l.tqplus_scale);
+        let (boundaries, centroids) = codebook::codebook(l.bit_width, l.dim);
+        let blocked = OnceLock::new();
+        let boundaries_lock = OnceLock::new();
+        let centroids_lock = OnceLock::new();
+        let packed_codes = if l.n_vectors == 0 {
+            OnceLock::from(Vec::new())
+        } else {
+            let _ = blocked.set(BlockedCache {
+                data: native,
+                n_blocks,
+            });
+            let _ = boundaries_lock.set(boundaries);
+            let _ = centroids_lock.set(centroids);
+            OnceLock::new()
+        };
+        Ok(Self {
+            dim: Some(l.dim),
+            bit_width: l.bit_width,
+            n_vectors: l.n_vectors,
+            packed_codes,
+            scales: l.scales,
+            tqplus_shift,
+            tqplus_scale,
+            rotation: OnceLock::new(),
+            boundaries: boundaries_lock,
+            centroids: centroids_lock,
+            blocked,
+            encode_scratch: Vec::new(),
+            encode_scratch_prev: 0,
+            sync_cursor: Some(l.cursor),
+            sync_path: Some(path.to_path_buf()),
+            sync_pending: l.pending_slots.iter().copied().collect(),
+            sync_fresh: std::collections::HashSet::new(),
+            calib_gen: 0,
+        })
+    }
+
     /// Save the index to `path` in the `.tv` format.
     ///
     /// The write is atomic with respect to `path`: the bytes go to a
@@ -1626,6 +1994,9 @@ impl TurboQuantIndex {
     /// first [`Self::search`]. After a v6 load that is the rotation
     /// alone — not the O(n·dim) repack the v5 path still pays.
     pub fn load(path: impl AsRef<Path>) -> std::io::Result<Self> {
+        if io_v7::is_v7(path.as_ref()) {
+            return Self::load_v7(path.as_ref());
+        }
         Self::from_loaded(io::load(path)?)
     }
 
@@ -1704,6 +2075,11 @@ impl TurboQuantIndex {
                     tqplus_scale,
                     encode_scratch: Vec::new(),
                     encode_scratch_prev: 0,
+            sync_cursor: None,
+            sync_path: None,
+            sync_pending: std::collections::HashSet::new(),
+            sync_fresh: std::collections::HashSet::new(),
+            calib_gen: 0,
                     rotation: OnceLock::new(),
                     boundaries: boundaries_lock,
                     centroids: centroids_lock,
@@ -1754,6 +2130,11 @@ impl TurboQuantIndex {
                     tqplus_scale,
                     encode_scratch: Vec::new(),
                     encode_scratch_prev: 0,
+            sync_cursor: None,
+            sync_path: None,
+            sync_pending: std::collections::HashSet::new(),
+            sync_fresh: std::collections::HashSet::new(),
+            calib_gen: 0,
                     rotation: OnceLock::new(),
                     boundaries: boundaries_lock,
                     centroids: centroids_lock,
@@ -2026,6 +2407,11 @@ impl TurboQuantIndex {
             blocked: OnceLock::new(),
             encode_scratch: Vec::new(),
             encode_scratch_prev: 0,
+            sync_cursor: None,
+            sync_path: None,
+            sync_pending: std::collections::HashSet::new(),
+            sync_fresh: std::collections::HashSet::new(),
+            calib_gen: 0,
         })
     }
 
@@ -2221,6 +2607,10 @@ impl TurboQuantIndex {
         }
         self.tqplus_shift = shift;
         self.tqplus_scale = scale_tq;
+        // Every commit re-encodes (or newly governs) the stored codes,
+        // so a synced file's segments are stale: force the next sync to
+        // compact.
+        self.calib_gen += 1;
         Ok(())
     }
 
@@ -2373,6 +2763,18 @@ impl TurboQuantIndex {
             "index {idx} out of bounds (n_vectors = {})",
             self.n_vectors
         );
+        // Divergence marking for the sync journal: a removal diverges up
+        // to two slots — the hole (`idx`, which takes the filler's bytes
+        // or dies as a pop) and the moved-from slot (`last`, which goes
+        // dead but may be refilled by a later add). Slots stay marked
+        // until a sync materializes their unit.
+        if self.sync_cursor.is_some() {
+            self.mark_dirty(idx);
+            let last = self.n_vectors - 1;
+            if last != idx {
+                self.mark_dirty(last);
+            }
+        }
 
         // n_vectors > 0 (asserted above) implies a successful add, which
         // implies self.dim was committed at that point. Unwrap is safe.
@@ -2770,5 +3172,973 @@ mod x86_scalar_fallback_tests {
                 "bits={bits}: scalar fallback returned a different top-k than SIMD",
             );
         }
+    }
+}
+
+/// The crash contract, exhaustively: every batch of a sync's write plan
+/// torn at every byte (in order, reversed, and each op alone), plus a
+/// bit flipped in every byte of a committed file. See `io_v7`'s module
+/// doc for the protocol these tests pin.
+#[cfg(test)]
+mod v7_crash_tests {
+    use super::*;
+    use std::path::{Path, PathBuf};
+
+    const DIM: usize = 64;
+
+    fn rows(n: usize, seed: u64) -> Vec<f32> {
+        let mut v = vec![0.0f32; n * DIM];
+        let mut s = seed | 1;
+        for x in v.iter_mut() {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            *x = ((s >> 40) as f32 / (1u64 << 23) as f32) - 0.5;
+        }
+        for row in v.chunks_mut(DIM) {
+            let norm: f32 = row.iter().map(|x| x * x).sum::<f32>().sqrt();
+            for x in row.iter_mut() {
+                *x /= norm;
+            }
+        }
+        v
+    }
+
+    fn temp(name: &str) -> PathBuf {
+        let mut p = std::env::temp_dir();
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        p.push(format!("turbovec-v7crash-{nonce}-{name}"));
+        std::fs::create_dir(&p).unwrap();
+        p.push("index.tv");
+        p
+    }
+
+    fn apply(file: &mut Vec<u8>, off: u64, bytes: &[u8]) {
+        let end = off as usize + bytes.len();
+        if file.len() < end {
+            file.resize(end, 0);
+        }
+        file[off as usize..end].copy_from_slice(bytes);
+    }
+
+    fn state_of(scratch: &Path, bytes: &[u8]) -> Option<Vec<u8>> {
+        std::fs::write(scratch, bytes).unwrap();
+        TurboQuantIndex::load(scratch).ok().map(|i| i.to_bytes())
+    }
+
+
+
+    /// A sync with adds AND removals (3 barriers), torn at every byte
+    /// of every op: the loaded state is the previous commit until the
+    /// header op's final byte completes, then the new commit. Never an
+    /// error, never a third state.
+    #[test]
+    fn a_sync_torn_at_any_byte_recovers_the_previous_commit() {
+        let path = temp("torn");
+        let scratch = path.with_file_name("torn-scratch.tv");
+        let mut idx = TurboQuantIndex::new(DIM, 4).unwrap();
+        idx.calibrate(&rows(1024, 15)).unwrap();
+        idx.add(&rows(100, 16));
+        idx.sync(&path).unwrap();
+        let base = std::fs::read(&path).unwrap();
+        let state_a = TurboQuantIndex::load(&path).unwrap().to_bytes();
+
+        idx.add(&rows(37, 17));
+        idx.swap_remove(5);
+        idx.swap_remove(60);
+        idx.swap_remove(idx.len() - 1);
+        let plan = idx.plan_next_sync(0, None);
+        // Every incremental sync is ONE batch, ONE fsync: the header's
+        // delta descriptor makes a commit that persists before its data
+        // detectable, so no ordering barrier separates them.
+        assert_eq!(plan.batches.len(), 1, "single-fsync sync");
+
+        // The fully-applied plan is the live index, byte for byte.
+        let mut done = base.clone();
+        for b in &plan.batches {
+            for (off, bytes) in &b.ops {
+                apply(&mut done, *off, bytes);
+            }
+        }
+        let state_b = state_of(&scratch, &done).expect("full plan must load");
+        assert_eq!(state_b, idx.to_bytes(), "the standard oracle");
+
+        let header_batch = plan.batches.len() - 1;
+        for bi in 0..plan.batches.len() {
+            let ops = &plan.batches[bi].ops;
+            // Three intra-batch schedules: in order, reversed, and each
+            // op alone — a batch's ops may hit disk in any order.
+            for schedule in 0..3 {
+                for (oj, (off, bytes)) in ops.iter().enumerate() {
+                    for cut in 0..=bytes.len() {
+                        let mut torn = base.clone();
+                        for prev in &plan.batches[..bi] {
+                            for (o, b) in &prev.ops {
+                                apply(&mut torn, *o, b);
+                            }
+                        }
+                        match schedule {
+                            0 => {
+                                for (o, b) in &ops[..oj] {
+                                    apply(&mut torn, *o, b);
+                                }
+                            }
+                            1 => {
+                                for (o, b) in ops[oj + 1..].iter().rev() {
+                                    apply(&mut torn, *o, b);
+                                }
+                            }
+                            _ => {}
+                        }
+                        apply(&mut torn, *off, &bytes[..cut]);
+                        let got = state_of(&scratch, &torn).unwrap_or_else(|| {
+                            panic!("batch {bi} op {oj} sched {schedule} cut {cut}: unloadable")
+                        });
+                        let complete = bi == header_batch
+                            && cut == bytes.len()
+                            && (schedule == 0 && oj == ops.len() - 1
+                                || schedule == 1 && oj == 0
+                                || ops.len() == 1);
+                        let want = if complete { &state_b } else { &state_a };
+                        assert_eq!(
+                            &got, want,
+                            "batch {bi} op {oj} sched {schedule} cut {cut}: wrong state"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Commit removals as pending ops, then tear the NEXT sync — the
+    /// one that materializes them — at its batch boundaries, load the
+    /// recovered state, keep working, and sync forward. The redo ops in
+    /// the committed header must repair every partial materialization.
+    #[test]
+    fn a_recovery_load_syncs_forward_and_survives_a_second_tear() {
+        let path = temp("double");
+        let scratch = path.with_file_name("double-scratch.tv");
+        let mut idx = TurboQuantIndex::new(DIM, 4).unwrap();
+        idx.calibrate(&rows(1024, 25)).unwrap();
+        idx.add(&rows(96, 26));
+        idx.sync(&path).unwrap();
+
+        // Removals commit as pending ops in the header (one barrier).
+        idx.swap_remove(3);
+        idx.swap_remove(40);
+        assert_eq!(idx.plan_next_sync(0, None).batches.len(), 1);
+        idx.sync(&path).unwrap();
+        let base = std::fs::read(&path).unwrap();
+        let state_a = TurboQuantIndex::load(&path).unwrap().to_bytes();
+        assert_eq!(state_a, idx.to_bytes());
+
+        // The next sync materializes those ops and appends new units.
+        idx.add(&rows(40, 27));
+        let plan = idx.plan_next_sync(0, None);
+        assert_eq!(plan.batches.len(), 1, "single-fsync sync");
+        assert!(plan.carried.is_empty());
+
+        // Tear it after the data writes (everything except the header
+        // op, which the planner pushes last): the old header still
+        // carries the ops, and re-applying them over the materialized
+        // units is a converging no-op.
+        let mut crashed = base.clone();
+        let ops = &plan.batches[0].ops;
+        for (off, bytes) in &ops[..ops.len() - 1] {
+            apply(&mut crashed, *off, bytes);
+        }
+        std::fs::write(&path, &crashed).unwrap();
+        let mut rec = TurboQuantIndex::load(&path).unwrap();
+        assert_eq!(rec.to_bytes(), state_a, "recovery must be exact");
+
+        // Work on the recovered index and sync it for real; its pending
+        // set came from the loaded header.
+        rec.add(&rows(5, 28));
+        rec.swap_remove(10);
+        rec.sync(&path).unwrap();
+        let loaded = TurboQuantIndex::load(&path).unwrap();
+        assert_eq!(loaded.to_bytes(), rec.to_bytes());
+
+        // And tearing that recovery-continuation sync anywhere still
+        // yields exactly one of the two adjacent commits.
+        let plan2 = {
+            let mut again = TurboQuantIndex::load(scratch_write(&scratch, &crashed)).unwrap();
+            again.add(&rows(5, 28));
+            again.swap_remove(10);
+            again.plan_next_sync(0, None)
+        };
+        let state_b = {
+            let mut done = crashed.clone();
+            for b in &plan2.batches {
+                for (off, bytes) in &b.ops {
+                    apply(&mut done, *off, bytes);
+                }
+            }
+            state_of(&scratch, &done).expect("full plan2 must load")
+        };
+        for bi in 0..plan2.batches.len() {
+            let ops = &plan2.batches[bi].ops;
+            for (oj, (off, bytes)) in ops.iter().enumerate() {
+                for cut in [0, bytes.len() / 2, bytes.len()] {
+                    let mut torn = crashed.clone();
+                    for prev in &plan2.batches[..bi] {
+                        for (o, b) in &prev.ops {
+                            apply(&mut torn, *o, b);
+                        }
+                    }
+                    for (o, b) in &ops[..oj] {
+                        apply(&mut torn, *o, b);
+                    }
+                    apply(&mut torn, *off, &bytes[..cut]);
+                    let got = state_of(&scratch, &torn)
+                        .unwrap_or_else(|| panic!("batch {bi} op {oj} cut {cut}: unloadable"));
+                    assert!(
+                        got == state_a || got == state_b,
+                        "batch {bi} op {oj} cut {cut}: neither adjacent commit"
+                    );
+                }
+            }
+        }
+    }
+
+    fn scratch_write<'a>(p: &'a Path, bytes: &[u8]) -> &'a Path {
+        std::fs::write(p, bytes).unwrap();
+        p
+    }
+
+    /// Barrier economics, pinned: pure appends need 2 barriers, a
+    /// removal inside the tail needs only the header, and removals in
+    /// committed units need 3.
+    #[test]
+    fn barrier_counts_match_the_change() {
+        let path = temp("barriers");
+        let mut idx = TurboQuantIndex::new(DIM, 4).unwrap();
+        idx.calibrate(&rows(1024, 35)).unwrap();
+        idx.add(&rows(70, 36));
+        idx.sync(&path).unwrap();
+
+        idx.add(&rows(40, 37));
+        assert_eq!(
+            idx.plan_next_sync(0, None).batches.len(),
+            1,
+            "pure append: one fsync"
+        );
+        idx.sync(&path).unwrap();
+
+        idx.add(&rows(3, 38)); // tail now 3 rows past a block boundary
+        idx.swap_remove(idx.len() - 1); // pop inside the tail
+        assert_eq!(
+            idx.plan_next_sync(0, None).batches.len(),
+            1,
+            "tail-only change: header alone"
+        );
+        idx.sync(&path).unwrap();
+
+        idx.swap_remove(0);
+        assert_eq!(
+            idx.plan_next_sync(0, None).batches.len(),
+            1,
+            "committed-unit removal: one fsync — the op rides the header"
+        );
+        idx.sync(&path).unwrap();
+        // The op is pending now; the next sync (any content)
+        // materializes it inside its single batch, then clears it.
+        idx.add(&rows(1, 39));
+        let plan = idx.plan_next_sync(0, None);
+        assert_eq!(plan.batches.len(), 1, "materialization folds into the batch");
+        assert!(
+            plan.batches[0].ops.len() >= 2,
+            "the materialized unit write precedes the header op"
+        );
+        assert!(plan.carried.is_empty(), "no fresh dirt: nothing carried");
+        idx.sync(&path).unwrap();
+        let loaded = TurboQuantIndex::load(&path).unwrap();
+        assert_eq!(loaded.to_bytes(), idx.to_bytes());
+    }
+
+    /// A header whose claimed n does not fit the file must be rejected
+    /// as a candidate — refusing or falling back, never sizing an
+    /// allocation from it (a hostile file could otherwise abort the
+    /// process instead of returning Err).
+    #[test]
+    fn an_absurd_header_n_is_refused_not_allocated() {
+        let path = temp("hostilen");
+        let mut idx = TurboQuantIndex::new(DIM, 4).unwrap();
+        idx.calibrate(&rows(1024, 65)).unwrap();
+        idx.add(&rows(64, 66)); // whole blocks, empty tail: fixed prefix
+        idx.sync(&path).unwrap();
+        let mut bytes = std::fs::read(&path).unwrap();
+
+        let geo = io_v7::Geo {
+            kind: 0,
+            dim: DIM,
+            bit_width: 4,
+            n_calib: DIM,
+        };
+        // Gen 0 lives in slot 0. Rewrite n to an absurd value and
+        // re-seal the used prefix's CRC so only the bound can refuse.
+        let at = geo.hdr_at_for_test(0);
+        bytes[at + 8..at + 16].copy_from_slice(&(u64::MAX / 2).to_le_bytes());
+        let used = 16 + 4; // no tail rows (n % 32 == 0), no op groups
+        let c = io_v7::crc32(&bytes[at..at + used]);
+        bytes[at + used..at + used + 4].copy_from_slice(&c.to_le_bytes());
+        std::fs::write(&path, &bytes).unwrap();
+        assert!(
+            TurboQuantIndex::load(&path).is_err(),
+            "an absurd n must refuse, not allocate"
+        );
+    }
+
+    /// Bit-rot over every byte of the STRUCTURAL region (superblock and
+    /// both header slots) — the region that still carries guarantees
+    /// now that blocks have no checksums (block damage from outside the
+    /// writer is out of scope, as it was for v6): each flip either
+    /// refuses, loads the identical current state, or — only inside the
+    /// newest header slot — falls back to exactly the previous commit.
+    /// Flips inside the newest commit's delta-covered blocks must also
+    /// refuse or fall back — the digest owns those bytes.
+    #[test]
+    fn bit_rot_in_any_byte_is_never_served_silently() {
+        let path = temp("rot");
+        let scratch = path.with_file_name("rot-scratch.tv");
+        let mut idx = TurboQuantIndex::new(DIM, 4).unwrap();
+        idx.calibrate(&rows(1024, 45)).unwrap();
+        idx.add(&rows(70, 46));
+        idx.sync(&path).unwrap();
+        let prev = TurboQuantIndex::load(&path).unwrap().to_bytes();
+
+        idx.add(&rows(20, 47));
+        idx.swap_remove(5);
+        idx.sync(&path).unwrap();
+        let cur = TurboQuantIndex::load(&path).unwrap().to_bytes();
+        let file = std::fs::read(&path).unwrap();
+
+        let geo = io_v7::Geo {
+            kind: 0,
+            dim: DIM,
+            bit_width: 4,
+            n_calib: DIM,
+        };
+        // gen 1 lives in slot 1.
+        let newest_hdr = geo.hdr_at_for_test(1)..geo.hdr_at_for_test(1) + geo.hdr_len();
+
+        let structural_end = geo.unit_at_for_test(0).min(file.len());
+        for at in 0..structural_end {
+            let mut bytes = file.clone();
+            bytes[at] ^= 1 << (at % 8);
+            match state_of(&scratch, &bytes) {
+                None => {}
+                Some(got) if got == cur => {}
+                Some(got) if got == prev && newest_hdr.contains(&at) => {}
+                Some(_) => panic!("flip at byte {at} served a state it must not"),
+            }
+        }
+    }
+}
+
+/// Crash coverage for the two capture paths the main harness misses:
+/// removal capture on a RELOADED (blocked-only) index, where `seq_row`
+/// takes the lane-gather arm rather than the packed arm.
+#[cfg(test)]
+mod v7_crash_blocked_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    const DIM: usize = 64;
+
+    fn rows(n: usize, seed: u64) -> Vec<f32> {
+        let mut v = vec![0.0f32; n * DIM];
+        let mut s = seed | 1;
+        for x in v.iter_mut() {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            *x = ((s >> 40) as f32 / (1u64 << 23) as f32) - 0.5;
+        }
+        for row in v.chunks_mut(DIM) {
+            let norm: f32 = row.iter().map(|x| x * x).sum::<f32>().sqrt();
+            for x in row.iter_mut() {
+                *x /= norm;
+            }
+        }
+        v
+    }
+
+    fn temp(name: &str) -> PathBuf {
+        let mut p = std::env::temp_dir();
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        p.push(format!("turbovec-v7blk-{nonce}-{name}"));
+        std::fs::create_dir(&p).unwrap();
+        p.push("index.tv");
+        p
+    }
+
+    fn apply(file: &mut Vec<u8>, off: u64, bytes: &[u8]) {
+        let end = off as usize + bytes.len();
+        if file.len() < end {
+            file.resize(end, 0);
+        }
+        file[off as usize..end].copy_from_slice(bytes);
+    }
+
+    /// Removals on a blocked-only index (fresh from load) serialize
+    /// their redo ops through the lane-gather arm of `seq_row`. The
+    /// committed header's op bytes are consumed on every load, and the
+    /// materializing sync is torn after its data batch so recovery
+    /// must verify those bytes against the expected unit CRCs — a
+    /// wrong gather cannot survive this.
+    #[test]
+    fn blocked_only_capture_survives_a_torn_sync() {
+        let path = temp("blkcap");
+        let scratch = path.with_file_name("scratch.tv");
+        let mut idx = TurboQuantIndex::new(DIM, 4).unwrap();
+        idx.calibrate(&rows(1024, 55)).unwrap();
+        idx.add(&rows(100, 56));
+        idx.sync(&path).unwrap();
+
+        // Reload: blocked cache only, packed unset — the gather arm.
+        let mut idx = TurboQuantIndex::load(&path).unwrap();
+        assert!(!idx.packed_ready(), "reload must be blocked-only");
+        idx.swap_remove(1); // lane 1 of block 0: offset arithmetic visible
+        idx.swap_remove(37); // lane 5 of block 1: base + group stride visible
+        idx.sync(&path).unwrap();
+        // The header's op bytes came from the gather arm; loading
+        // consumes and verifies them.
+        let state_a = TurboQuantIndex::load(&path).unwrap().to_bytes();
+        assert_eq!(state_a, idx.to_bytes(), "gathered op bytes must be exact");
+
+        // Tear the materializing sync after its data batch.
+        let base = std::fs::read(&path).unwrap();
+        idx.add(&rows(1, 57));
+        let plan = idx.plan_next_sync(0, None);
+        assert_eq!(plan.batches.len(), 1, "single-fsync sync");
+        let mut torn = base.clone();
+        let ops = &plan.batches[0].ops;
+        for (off, bytes) in &ops[..ops.len() - 1] {
+            apply(&mut torn, *off, bytes);
+        }
+        std::fs::write(&scratch, &torn).unwrap();
+        let recovered = TurboQuantIndex::load(&scratch).unwrap();
+        assert_eq!(recovered.to_bytes(), state_a, "recovery must be exact");
+
+        // And the completed sync round-trips.
+        idx.sync(&path).unwrap();
+        assert_eq!(TurboQuantIndex::load(&path).unwrap().to_bytes(), idx.to_bytes());
+    }
+}
+
+/// The two crash states the review's executed reproductions exposed:
+/// a spliced commit header whose data never landed (the delta digest
+/// must reject it — a concatenation of self-consistent unit codewords
+/// used to hash to a content-free constant), and syncing forward after
+/// load fell back past such a commit (cursor_state must agree with the
+/// loader about which commit is newest, or every sync wedges Foreign).
+#[cfg(test)]
+mod v7_delta_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    const DIM: usize = 64; // small dim: single-chain CRC, the vacuous case
+
+    fn rows(n: usize, seed: u64) -> Vec<f32> {
+        let mut v = vec![0.0f32; n * DIM];
+        let mut s = seed | 1;
+        for x in v.iter_mut() {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            *x = ((s >> 40) as f32 / (1u64 << 23) as f32) - 0.5;
+        }
+        for row in v.chunks_mut(DIM) {
+            let norm: f32 = row.iter().map(|x| x * x).sum::<f32>().sqrt();
+            for x in row.iter_mut() {
+                *x /= norm;
+            }
+        }
+        v
+    }
+
+    fn temp(name: &str) -> PathBuf {
+        let mut p = std::env::temp_dir();
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        p.push(format!("turbovec-v7delta-{nonce}-{name}"));
+        std::fs::create_dir(&p).unwrap();
+        p.push("index.tv");
+        p
+    }
+
+    /// Splice ONLY the new commit header over the pre-sync file — the
+    /// exact "commit reached disk before its data" state — with a
+    /// materialized one-unit delta at a small dim. The digest must be
+    /// content-sensitive: the loader lands on the previous commit, and
+    /// a removed vector is never resurrected.
+    #[test]
+    fn a_spliced_header_without_its_data_is_not_adopted() {
+        let path = temp("splice");
+        let mut idx = TurboQuantIndex::new(DIM, 4).unwrap();
+        idx.calibrate(&rows(1024, 11)).unwrap();
+        idx.add(&rows(96, 12));
+        idx.sync(&path).unwrap();
+        // Ops ride the header...
+        idx.swap_remove(3);
+        idx.add(&rows(1, 13));
+        idx.sync(&path).unwrap();
+        let pre = std::fs::read(&path).unwrap();
+        let state_pre = TurboQuantIndex::load(&path).unwrap().to_bytes();
+        // ...and this sync materializes block 0: a one-unit delta.
+        // (The fresh dirt goes to block 1 — dirtying block 0 again
+        // would carry its ops instead of materializing them.)
+        idx.swap_remove(40);
+        idx.add(&rows(1, 14));
+        let plan = idx.plan_next_sync(0, None);
+        let (hdr_off, hdr_bytes) = plan.batches[0]
+            .ops
+            .last()
+            .expect("plan has a header op")
+            .clone();
+        assert!(
+            plan.batches[0].ops.len() > 1,
+            "the sync must materialize at least one unit for this test"
+        );
+        let mut spliced = pre.clone();
+        let end = hdr_off as usize + hdr_bytes.len();
+        if spliced.len() < end {
+            spliced.resize(end, 0);
+        }
+        spliced[hdr_off as usize..end].copy_from_slice(&hdr_bytes);
+        std::fs::write(&path, &spliced).unwrap();
+        let got = TurboQuantIndex::load(&path).unwrap();
+        assert_eq!(
+            got.to_bytes(),
+            state_pre,
+            "a header without its data must fall back, not resurrect stale blocks"
+        );
+    }
+
+    /// A crafted header whose op group names an out-of-range block must
+    /// refuse the load — never reach the op-application indexing.
+    #[test]
+    fn an_out_of_range_op_block_is_refused_not_indexed() {
+        let path = temp("hostileb");
+        let mut idx = TurboQuantIndex::new(DIM, 4).unwrap();
+        idx.calibrate(&rows(1024, 31)).unwrap();
+        idx.add(&rows(65, 32)); // 65 so the post-removal n is a whole block
+        idx.sync(&path).unwrap();
+        // Commit a real op so the header layout has a group to mutate.
+        idx.swap_remove(3);
+        idx.sync(&path).unwrap();
+        let mut bytes = std::fs::read(&path).unwrap();
+
+        let geo = io_v7::Geo {
+            kind: 0,
+            dim: DIM,
+            bit_width: 4,
+            n_calib: DIM,
+        };
+        // Gen 1 lives in slot 1. Its used prefix: gen8 | n8 | tail(0) |
+        // n_units4 | group { block4, crc4, n_ops1, op... }. Overwrite
+        // the group's block index with an absurd value and re-seal the
+        // header CRC so only the bound can refuse.
+        let at = geo.hdr_at_for_test(1);
+        let gb = at + 16 + 4;
+        bytes[gb..gb + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        let row = DIM / 2;
+        let op_size = 1 + row + 4;
+        let used = 16 + 4 + 5 + op_size + 4 + 12;
+        let c = io_v7::crc32(&bytes[at..at + used]);
+        bytes[at + used..at + used + 4].copy_from_slice(&c.to_le_bytes());
+        std::fs::write(&path, &bytes).unwrap();
+        // The corrupt gen-1 header must be rejected as a candidate; the
+        // file falls back to gen 0 or errs — it must never panic.
+        let _ = TurboQuantIndex::load(&path);
+    }
+
+    /// A negative scale smuggled into the commit tail must refuse the
+    /// load — the sign check is load's only guard for tail scales.
+    #[test]
+    fn a_negative_tail_scale_is_refused() {
+        let path = temp("negscale");
+        let mut idx = TurboQuantIndex::new(DIM, 4).unwrap();
+        idx.calibrate(&rows(1024, 41)).unwrap();
+        idx.add(&rows(65, 42)); // one tail row rides the header
+        idx.sync(&path).unwrap();
+        let mut bytes = std::fs::read(&path).unwrap();
+
+        let geo = io_v7::Geo {
+            kind: 0,
+            dim: DIM,
+            bit_width: 4,
+            n_calib: DIM,
+        };
+        let row_bytes = DIM / 2;
+        // Gen 0, slot 0: gen8 | n8 | tail row { codes, scale } | ops(0)
+        // | delta(empty) | crc. Negate the tail scale and re-seal.
+        let at = geo.hdr_at_for_test(0);
+        let sc = at + 16 + row_bytes;
+        let v = f32::from_le_bytes(bytes[sc..sc + 4].try_into().unwrap());
+        bytes[sc..sc + 4].copy_from_slice(&(-v.max(0.5)).to_le_bytes());
+        let used = 16 + (row_bytes + 4) + 4 + 16;
+        let c = io_v7::crc32(&bytes[at..at + used]);
+        bytes[at + used..at + used + 4].copy_from_slice(&c.to_le_bytes());
+        std::fs::write(&path, &bytes).unwrap();
+        assert!(
+            TurboQuantIndex::load(&path).is_err(),
+            "a negative tail scale must refuse the load"
+        );
+    }
+
+    /// A tampered calibration value (zero scale, resealed superblock
+    /// CRC) must refuse the load — search divides by these, and v6
+    /// refuses the identical payload.
+    #[test]
+    fn a_zero_tqplus_scale_is_refused() {
+        let path = temp("zeroscale");
+        let mut idx = TurboQuantIndex::new(DIM, 4).unwrap();
+        idx.calibrate(&rows(1024, 51)).unwrap();
+        idx.add(&rows(40, 52));
+        idx.sync(&path).unwrap();
+        let mut bytes = std::fs::read(&path).unwrap();
+
+        // Superblock: magic4 ver1 bit1 kind1 dim4 nonce8 | boundaries
+        // (nl-1)*4 | centroids nl*4 | n_calib4 | shift dim*4 | scale
+        // dim*4 | crc4. Zero scale[5] and reseal.
+        let nl = 16;
+        let scale5 = 23 + (nl - 1) * 4 + nl * 4 + 4 + DIM * 4 + 5 * 4;
+        bytes[scale5..scale5 + 4].copy_from_slice(&0.0f32.to_le_bytes());
+        let sb_end = 23 + (nl - 1) * 4 + nl * 4 + 4 + DIM * 8;
+        let c = io_v7::crc32(&bytes[..sb_end]);
+        bytes[sb_end..sb_end + 4].copy_from_slice(&c.to_le_bytes());
+        std::fs::write(&path, &bytes).unwrap();
+        let err = TurboQuantIndex::load(&path).unwrap_err();
+        assert!(err.to_string().contains("TQ+ scale"), "{err}");
+    }
+
+    /// calibrate() queues a compaction; if another writer has taken
+    /// over the path since, that compaction must refuse like any other
+    /// sync — never rename over the foreign file unchecked.
+    #[test]
+    fn a_queued_compaction_still_respects_the_foreign_file_guard() {
+        let path = temp("calibforeign");
+        let mut a = TurboQuantIndex::new(DIM, 4).unwrap();
+        a.calibrate(&rows(1024, 53)).unwrap();
+        a.add(&rows(40, 54));
+        a.sync(&path).unwrap();
+
+        let mut b = TurboQuantIndex::new(DIM, 4).unwrap();
+        b.calibrate(&rows(1024, 55)).unwrap();
+        b.add(&rows(20, 56));
+        b.sync(&path).unwrap(); // B takes over the path (new nonce)
+
+        a.calibrate(&rows(1024, 57)).unwrap(); // queues A's compaction
+        let err = a.sync(&path).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData, "{err}");
+        let loaded = TurboQuantIndex::load(&path).unwrap();
+        assert_eq!(loaded.to_bytes(), b.to_bytes(), "B's file must be untouched");
+    }
+
+    /// The corruption matrix: overwrite every early field and hundreds
+    /// of seeded random bytes across a committed file, RESEAL the
+    /// checksums so only semantic validation can object, and demand the
+    /// loader always ends politely — Ok or Err, never a panic. This is
+    /// the systematic form of the crafted-file attacks the reviews kept
+    /// finding one at a time.
+    #[test]
+    fn every_field_tamper_loads_politely() {
+        let path = temp("matrix");
+        let scratch = path.with_file_name("matrix-scratch.tv");
+        let mut idx = TurboQuantIndex::new(DIM, 4).unwrap();
+        idx.calibrate(&rows(1024, 61)).unwrap();
+        idx.add(&rows(70, 62));
+        idx.sync(&path).unwrap();
+        idx.swap_remove(3); // a pending op rides the header
+        idx.add(&rows(2, 63));
+        idx.sync(&path).unwrap();
+        let base = std::fs::read(&path).unwrap();
+        let geo = io_v7::Geo {
+            kind: 0,
+            dim: DIM,
+            bit_width: 4,
+            n_calib: DIM,
+        };
+
+        let try_load = |bytes: &[u8], what: &str| {
+            std::fs::write(&scratch, bytes).unwrap();
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = TurboQuantIndex::load(&scratch);
+            }));
+            assert!(r.is_ok(), "loader panicked on tamper: {what}");
+        };
+
+        // Hostile values in every byte of the structural regions: the
+        // whole superblock and both header slots.
+        let hostile: [u8; 4] = [0xFF, 0x00, 0x80, 0x01];
+        // The parser reads the superblock and each header slot's used
+        // prefix; the rest of the slots is reserved slack it never
+        // touches. Tamper every read byte with every hostile value, and
+        // stride-sample the slack (a prime stride so successive runs
+        // land on different offsets per slot).
+        let mut targets: Vec<usize> = Vec::new();
+        let sb_end = geo.hdr_at_for_test(0);
+        targets.extend(0..sb_end);
+        for slot in [0usize, 1] {
+            let at = geo.hdr_at_for_test(slot);
+            let used = io_v7::hdr_used_for_test(&base, &geo, slot) + 8;
+            let end = at + geo.hdr_len();
+            targets.extend(at..(at + used).min(end));
+            targets.extend(((at + used)..end).step_by(251));
+        }
+        let structural_end = geo.unit_at_for_test(0);
+        let _ = structural_end;
+        for &at in targets.iter().filter(|&&a| a < base.len()) {
+            for v in hostile {
+                if base[at] == v {
+                    continue;
+                }
+                let mut bytes = base.clone();
+                bytes[at] = v;
+                io_v7::reseal_for_test(&mut bytes, &geo);
+                try_load(&bytes, &format!("byte {at} <- {v:#04x}"));
+            }
+        }
+        // Seeded random multi-byte tampers across the entire file.
+        let mut s = 0x1234_5678_9ABC_DEF0u64;
+        for i in 0..400 {
+            let mut bytes = base.clone();
+            for _ in 0..1 + (i % 4) {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                let at = (s as usize) % bytes.len();
+                bytes[at] = (s >> 32) as u8;
+            }
+            io_v7::reseal_for_test(&mut bytes, &geo);
+            try_load(&bytes, &format!("random tamper {i}"));
+        }
+        // Truncations at every structural boundary and random lengths.
+        for cut in [0usize, 4, 11, 19, structural_end / 2, structural_end] {
+            try_load(&base[..cut.min(base.len())], &format!("truncate {cut}"));
+        }
+    }
+
+    /// A negative scale inside a BLOCK must refuse the load too — the
+    /// blocks carry no checksums, so the sign check is the only guard.
+    #[test]
+    fn a_negative_block_scale_is_refused() {
+        let path = temp("negblockscale");
+        let mut idx = TurboQuantIndex::new(DIM, 4).unwrap();
+        idx.calibrate(&rows(1024, 71)).unwrap();
+        idx.add(&rows(64, 72));
+        idx.sync(&path).unwrap();
+        let mut bytes = std::fs::read(&path).unwrap();
+        let geo = io_v7::Geo {
+            kind: 0,
+            dim: DIM,
+            bit_width: 4,
+            n_calib: DIM,
+        };
+        // Unit 0: codes (32 * row) then 32 scales. Negate scale of lane 7.
+        let row_bytes = DIM / 2;
+        let sc = geo.unit_at_for_test(0) + 32 * row_bytes + 7 * 4;
+        let v = f32::from_le_bytes(bytes[sc..sc + 4].try_into().unwrap());
+        bytes[sc..sc + 4].copy_from_slice(&(-v.max(0.5)).to_le_bytes());
+        // No reseal needed: blocks carry no checksum. Only the sign
+        // check can object.
+        std::fs::write(&path, &bytes).unwrap();
+        let err = TurboQuantIndex::load(&path).unwrap_err();
+        assert!(err.to_string().contains("scale"), "{err}");
+    }
+
+    /// More dirtied slots than one header can carry must stay
+    /// incremental — the dirty blocks are committed directly in the
+    /// same batch, never a full rewrite (which would swap the nonce).
+    #[test]
+    fn a_mass_removal_stays_incremental() {
+        let path = temp("massremove");
+        let mut idx = TurboQuantIndex::new(DIM, 4).unwrap();
+        idx.calibrate(&rows(1024, 73)).unwrap();
+        idx.add(&rows(200, 74));
+        idx.sync(&path).unwrap();
+        let nonce_before = std::fs::read(&path).unwrap()[11..19].to_vec();
+        // Dirty far more than MAX_OPS distinct committed slots.
+        for i in 0..80 {
+            idx.swap_remove(i);
+        }
+        idx.sync(&path).unwrap();
+        let nonce_after = std::fs::read(&path).unwrap()[11..19].to_vec();
+        assert_eq!(nonce_before, nonce_after, "sync degraded to a full rewrite");
+        let loaded = TurboQuantIndex::load(&path).unwrap();
+        assert_eq!(loaded.to_bytes(), idx.to_bytes());
+        // And the file keeps syncing incrementally afterwards.
+        idx.add(&rows(1, 75));
+        idx.sync(&path).unwrap();
+        let loaded = TurboQuantIndex::load(&path).unwrap();
+        assert_eq!(loaded.to_bytes(), idx.to_bytes());
+    }
+
+    /// Materializing a unit that the FALLBACK header's delta also names
+    /// (append + removal committed together, cleaned up one sync later),
+    /// torn before the new header lands, must still load the previous
+    /// commit exactly — safe because ops are absolute writes of the
+    /// unit's current bytes, so materialization rewrites byte-identical
+    /// content.
+    #[test]
+    fn a_torn_materialize_of_a_delta_named_unit_recovers() {
+        let path = temp("mat-delta");
+        let mut idx = TurboQuantIndex::new(DIM, 4).unwrap();
+        idx.calibrate(&rows(1024, 41)).unwrap();
+        idx.add(&rows(32, 42));
+        idx.sync(&path).unwrap();
+        // Sync 2: append unit 1 AND remove a slot inside it -> unit 1 is
+        // fresh (op carried) and named by header 2's delta as an append.
+        idx.add(&rows(64, 43));
+        idx.swap_remove(40);
+        idx.sync(&path).unwrap();
+        let committed = TurboQuantIndex::load(&path).unwrap().to_bytes();
+        // Sync 3: nothing new -> materializes unit 1 (op from header 2).
+        let plan = idx.plan_next_sync(0, None);
+        // Tear: apply every op EXCEPT the header write (last op).
+        let batch = &plan.batches[0];
+        let mut f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        use std::io::{Seek, SeekFrom, Write};
+        for (off, bytes) in &batch.ops[..batch.ops.len() - 1] {
+            f.seek(SeekFrom::Start(*off)).unwrap();
+            f.write_all(bytes).unwrap();
+        }
+        drop(f);
+        match TurboQuantIndex::load(&path) {
+            Ok(loaded) => assert_eq!(
+                loaded.to_bytes(),
+                committed,
+                "loaded state differs from the previous commit"
+            ),
+            Err(e) => panic!("file refused to load: {e}"),
+        }
+    }
+
+    /// Past [`io_v7::MAX_OPS`] scattered removals between syncs, the
+    /// sync must fall back to a full rewrite (fresh blocks may never be
+    /// overwritten in the sync that first commits their changes — no
+    /// fallback header would describe them) and round-trip exactly.
+    #[test]
+    fn an_op_overflow_falls_back_to_a_full_rewrite() {
+        let path = temp("ovf-full");
+        let mut idx = TurboQuantIndex::new(DIM, 4).unwrap();
+        idx.calibrate(&rows(1024, 51)).unwrap();
+        idx.add(&rows(2_112, 52));
+        idx.sync(&path).unwrap();
+        let nonce_before = std::fs::read(&path).unwrap()[11..19].to_vec();
+        // One more dirtied slot than one header holds (the cap counts
+        // slots; contiguous ones overflow it as well as scattered).
+        for v in (5..5 + io_v7::MAX_OPS + 1).rev() {
+            idx.swap_remove(v);
+        }
+        idx.sync(&path).unwrap();
+        let nonce_after = std::fs::read(&path).unwrap()[11..19].to_vec();
+        assert_ne!(nonce_before, nonce_after, "overflow must full-rewrite");
+        let loaded = TurboQuantIndex::load(&path).unwrap();
+        assert_eq!(loaded.to_bytes(), idx.to_bytes());
+        // And the rewritten file keeps syncing incrementally.
+        idx.add(&rows(1, 53));
+        idx.sync(&path).unwrap();
+        assert_eq!(TurboQuantIndex::load(&path).unwrap().to_bytes(), idx.to_bytes());
+    }
+
+    /// A failed sync must not wedge the binding: if the commit landed
+    /// but sync() reported an error, the cursor is dropped and the next
+    /// sync recovers by writing full — never "another writer advanced".
+    #[test]
+    // set_readonly(false) on the throwaway test file is deliberate: the
+    // cross-platform way to restore writability after the induced error.
+    #[allow(clippy::permissions_set_readonly_false)]
+    fn a_failed_sync_recovers_via_full_write() {
+        let path = temp("failedsync");
+        let mut idx = TurboQuantIndex::new(DIM, 4).unwrap();
+        idx.calibrate(&rows(1024, 91)).unwrap();
+        idx.add(&rows(64, 92));
+        idx.sync(&path).unwrap();
+        idx.add(&rows(32, 93));
+        // Make the incremental write itself fail: after any failed
+        // sync, nothing on disk can be trusted (a commit may or may
+        // not have landed), so the binding must drop.
+        let mut perm = std::fs::metadata(&path).unwrap().permissions();
+        perm.set_readonly(true);
+        std::fs::set_permissions(&path, perm.clone()).unwrap();
+        assert!(idx.sync(&path).is_err(), "read-only sync must fail");
+        perm.set_readonly(false);
+        std::fs::set_permissions(&path, perm).unwrap();
+        // The retry must succeed (full write path) and round-trip.
+        idx.sync(&path).unwrap();
+        let loaded = TurboQuantIndex::load(&path).unwrap();
+        assert_eq!(loaded.to_bytes(), idx.to_bytes());
+    }
+
+    /// After load falls back past a data-less commit, sync must keep
+    /// working: cursor_state has to reject that commit exactly as the
+    /// loader did, or the file wedges Foreign forever.
+    #[test]
+    fn sync_keeps_working_after_a_fallback_load() {
+        let path = temp("wedge");
+        let mut idx = TurboQuantIndex::new(DIM, 4).unwrap();
+        idx.calibrate(&rows(1024, 21)).unwrap();
+        idx.add(&rows(64, 22));
+        idx.sync(&path).unwrap();
+        let state_g0 = TurboQuantIndex::load(&path).unwrap().to_bytes();
+        idx.add(&rows(32, 23));
+        idx.sync(&path).unwrap();
+
+        // Zero the appended unit's bytes in place: header gen 1 landed,
+        // its data did not (lengths and both header slots untouched).
+        let geo = io_v7::Geo {
+            kind: 0,
+            dim: DIM,
+            bit_width: 4,
+            n_calib: DIM,
+        };
+        let mut bytes = std::fs::read(&path).unwrap();
+        let at = geo.unit_at(2); // blocks 0,1 belong to gen 0; block 2 was gen 1's append
+        for b in bytes[at..at + geo.unit_len()].iter_mut() {
+            *b = 0;
+        }
+        std::fs::write(&path, &bytes).unwrap();
+
+        // Load falls back to gen 0...
+        let mut rec = TurboQuantIndex::load(&path).unwrap();
+        assert_eq!(rec.to_bytes(), state_g0, "fallback must be exact");
+        // ...and the very next sync must succeed, not wedge Foreign.
+        rec.add(&rows(5, 24));
+        rec.sync(&path).unwrap();
+        let after = TurboQuantIndex::load(&path).unwrap();
+        assert_eq!(after.to_bytes(), rec.to_bytes());
+
+        // The truncation flavour of the same state.
+        let path2 = temp("wedge-trunc");
+        let mut idx = TurboQuantIndex::new(DIM, 4).unwrap();
+        idx.calibrate(&rows(1024, 25)).unwrap();
+        idx.add(&rows(64, 26));
+        idx.sync(&path2).unwrap();
+        let pre_len = std::fs::metadata(&path2).unwrap().len();
+        let state_g0 = TurboQuantIndex::load(&path2).unwrap().to_bytes();
+        idx.add(&rows(32, 27));
+        idx.sync(&path2).unwrap();
+        // Keep the header region (it precedes the units), drop the data.
+        let full = std::fs::read(&path2).unwrap();
+        std::fs::write(&path2, &full[..pre_len as usize]).unwrap();
+        let mut rec = TurboQuantIndex::load(&path2).unwrap();
+        assert_eq!(rec.to_bytes(), state_g0);
+        rec.swap_remove(0);
+        rec.sync(&path2).unwrap();
+        assert_eq!(
+            TurboQuantIndex::load(&path2).unwrap().to_bytes(),
+            rec.to_bytes()
+        );
     }
 }
