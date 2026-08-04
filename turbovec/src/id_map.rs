@@ -848,9 +848,45 @@ impl IdMapIndex {
         )
     }
 
-    /// Load a `.tvim` file previously written by [`Self::write`].
+    /// Load a `.tvim` file previously written by [`Self::write`], or a
+    /// v7 file previously written by [`Self::sync`].
     pub fn load(path: impl AsRef<Path>) -> std::io::Result<Self> {
+        if crate::io_v7::is_v7(path.as_ref()) {
+            return Self::load_v7(path.as_ref());
+        }
         Self::from_loaded(io::load_id_map(path)?)
+    }
+
+    /// Incrementally persist the index to `path`; see
+    /// [`TurboQuantIndex::sync`] for the container's contract. Ids ride
+    /// inside the same block units and header tail as the rows they
+    /// name, so a synced-then-loaded index resolves every id exactly as
+    /// the live one does.
+    pub fn sync(&mut self, path: impl AsRef<Path>) -> std::io::Result<()> {
+        self.inner.sync_v7_impl(path.as_ref(), 1, Some(&self.slot_to_id))
+    }
+
+    /// Shared tail of the v7 load: adopt the id table out of the block
+    /// units and validate it exactly as the v6 loader does.
+    fn load_v7(path: &Path) -> std::io::Result<Self> {
+        let mut l = crate::io_v7::load(path, 0, 1)?;
+        let slot_to_id = std::mem::take(&mut l.ids);
+        let inner = TurboQuantIndex::from_v7(l, path)?;
+        let mut sorted = slot_to_id.clone();
+        sorted.sort_unstable();
+        if sorted.windows(2).any(|w| w[0] == w[1]) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "duplicate ids in v7 file",
+            ));
+        }
+        Ok(Self {
+            inner,
+            slot_to_id,
+            id_to_slot: std::sync::OnceLock::new(),
+            sorted_ids: std::sync::Mutex::new(sorted),
+            deferred_added: std::sync::Mutex::new(Default::default()),
+        })
     }
 
     /// Serialize the index in the `.tvim` byte format to any
@@ -1275,6 +1311,233 @@ mod tests {
                 deferred, ADDS,
                 "the deferred set must grow by exactly the rows added (n={n})"
             );
+        }
+    }
+}
+
+/// The corruption matrix for the id-mapped container: same contract as
+/// the plain-index matrix — every structural byte tampered with hostile
+/// values, checksums resealed, plus seeded random tampers and
+/// truncations — and the loader must always end politely. The kind-1
+/// format carries ids inside units, in the tail, and in op payloads;
+/// those parsing paths get probed here.
+#[cfg(test)]
+mod v7_matrix_id_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    const DIM: usize = 64;
+
+    fn rows(n: usize, seed: u64) -> Vec<f32> {
+        let mut v = vec![0.0f32; n * DIM];
+        let mut s = seed | 1;
+        for x in v.iter_mut() {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            *x = ((s >> 40) as f32 / (1u64 << 23) as f32) - 0.5;
+        }
+        for row in v.chunks_mut(DIM) {
+            let norm: f32 = row.iter().map(|x| x * x).sum::<f32>().sqrt();
+            for x in row.iter_mut() {
+                *x /= norm;
+            }
+        }
+        v
+    }
+
+    fn temp(name: &str) -> PathBuf {
+        let mut p = std::env::temp_dir();
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        p.push(format!("turbovec-v7idmatrix-{nonce}-{name}"));
+        std::fs::create_dir(&p).unwrap();
+        p.push("index.tvim");
+        p
+    }
+
+    #[test]
+    fn every_field_tamper_loads_politely_for_id_maps() {
+        let path = temp("matrix");
+        let scratch = path.with_file_name("scratch.tvim");
+        let mut idx = IdMapIndex::new(DIM, 4).unwrap();
+        idx.calibrate(&rows(1024, 81)).unwrap();
+        let ids: Vec<u64> = (0..70u64).map(|i| i * 17 + 3).collect();
+        idx.add_with_ids(&rows(70, 82), &ids).unwrap();
+        idx.sync(&path).unwrap();
+        assert!(idx.remove(3)); // a pending op with an id payload
+        idx.add_with_ids(&rows(2, 83), &[9001, 9002]).unwrap();
+        idx.sync(&path).unwrap();
+        let base = std::fs::read(&path).unwrap();
+        let geo = crate::io_v7::Geo {
+            kind: 1,
+            dim: DIM,
+            bit_width: 4,
+            n_calib: DIM,
+        };
+
+        let try_load = |bytes: &[u8], what: &str| {
+            std::fs::write(&scratch, bytes).unwrap();
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = IdMapIndex::load(&scratch);
+            }));
+            assert!(r.is_ok(), "loader panicked on tamper: {what}");
+        };
+
+        let hostile: [u8; 4] = [0xFF, 0x00, 0x80, 0x01];
+        // The parser reads the superblock and each header slot's used
+        // prefix; the rest of the slots is reserved slack it never
+        // touches. Tamper every read byte with every hostile value, and
+        // stride-sample the slack (a prime stride so successive runs
+        // land on different offsets per slot).
+        let mut targets: Vec<usize> = Vec::new();
+        let sb_end = geo.hdr_at_for_test(0);
+        targets.extend(0..sb_end);
+        for slot in [0usize, 1] {
+            let at = geo.hdr_at_for_test(slot);
+            let used = crate::io_v7::hdr_used_for_test(&base, &geo, slot) + 8;
+            let end = at + geo.hdr_len();
+            targets.extend(at..(at + used).min(end));
+            targets.extend(((at + used)..end).step_by(251));
+        }
+        let structural_end = geo.unit_at_for_test(0).min(base.len());
+        let _ = structural_end;
+        for &at in targets.iter().filter(|&&a| a < base.len()) {
+            for v in hostile {
+                if base[at] == v {
+                    continue;
+                }
+                let mut bytes = base.clone();
+                bytes[at] = v;
+                crate::io_v7::reseal_for_test(&mut bytes, &geo);
+                try_load(&bytes, &format!("byte {at} <- {v:#04x}"));
+            }
+        }
+        let mut s = 0xDEAD_BEEF_1234_5678u64;
+        for i in 0..400 {
+            let mut bytes = base.clone();
+            for _ in 0..1 + (i % 4) {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                let at = (s as usize) % bytes.len();
+                bytes[at] = (s >> 32) as u8;
+            }
+            crate::io_v7::reseal_for_test(&mut bytes, &geo);
+            try_load(&bytes, &format!("random tamper {i}"));
+        }
+        for cut in [0usize, 4, 11, 19, structural_end / 2, structural_end] {
+            try_load(&base[..cut.min(base.len())], &format!("truncate {cut}"));
+        }
+    }
+}
+
+/// Crash coverage for the id-carrying (kind 1) undo path: ids ride the
+/// units and the undo blob, and a torn sync must restore them exactly.
+#[cfg(test)]
+mod v7_crash_id_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    const DIM: usize = 64;
+
+    fn rows(n: usize, seed: u64) -> Vec<f32> {
+        let mut v = vec![0.0f32; n * DIM];
+        let mut s = seed | 1;
+        for x in v.iter_mut() {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            *x = ((s >> 40) as f32 / (1u64 << 23) as f32) - 0.5;
+        }
+        for row in v.chunks_mut(DIM) {
+            let norm: f32 = row.iter().map(|x| x * x).sum::<f32>().sqrt();
+            for x in row.iter_mut() {
+                *x /= norm;
+            }
+        }
+        v
+    }
+
+    fn temp(name: &str) -> PathBuf {
+        let mut p = std::env::temp_dir();
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        p.push(format!("turbovec-v7idcrash-{nonce}-{name}"));
+        std::fs::create_dir(&p).unwrap();
+        p.push("index.tvim");
+        p
+    }
+
+    fn apply(file: &mut Vec<u8>, off: u64, bytes: &[u8]) {
+        let end = off as usize + bytes.len();
+        if file.len() < end {
+            file.resize(end, 0);
+        }
+        file[off as usize..end].copy_from_slice(bytes);
+    }
+
+    /// Tear an id-mapped removal sync at every batch boundary and mid-
+    /// op: the previous commit — ids included, byte for byte — until
+    /// the header's last byte lands, then the new one.
+    #[test]
+    fn an_id_mapped_sync_torn_anywhere_restores_ids_exactly() {
+        let path = temp("idtorn");
+        let scratch = path.with_file_name("scratch.tvim");
+        let mut idx = IdMapIndex::new(DIM, 4).unwrap();
+        idx.calibrate(&rows(1024, 70)).unwrap();
+        let ids: Vec<u64> = (0..100u64).map(|i| i * 31 + 5).collect();
+        idx.add_with_ids(&rows(100, 71), &ids).unwrap();
+        idx.sync(&path).unwrap();
+        let base = std::fs::read(&path).unwrap();
+        let state_a = IdMapIndex::load(&path).unwrap().to_bytes();
+
+        assert!(idx.remove(5)); // slot 0: hole in a committed unit
+        assert!(idx.remove(36 * 31 + 5)); // a mid-file slot
+        idx.add_with_ids(&rows(2, 72), &[9_000_001, 9_000_002]).unwrap();
+        let plan = idx.inner.plan_next_sync(1, Some(&idx.slot_to_id));
+        // Two removals dirty committed units (ops in the header) and the
+        // two added rows extend the tail — no new whole block, so the
+        // whole sync is the single header barrier.
+        assert_eq!(plan.batches.len(), 1);
+
+        // Fully applied = the live index (the standard oracle).
+        let mut done = base.clone();
+        for b in &plan.batches {
+            for (off, bytes) in &b.ops {
+                apply(&mut done, *off, bytes);
+            }
+        }
+        std::fs::write(&scratch, &done).unwrap();
+        assert_eq!(IdMapIndex::load(&scratch).unwrap().to_bytes(), idx.to_bytes());
+
+        // Torn at every batch prefix and mid-op: exactly the previous
+        // commit, ids and all.
+        for bi in 0..plan.batches.len() {
+            let ops = &plan.batches[bi].ops;
+            for (oj, (off, bytes)) in ops.iter().enumerate() {
+                for cut in [0, bytes.len() / 3, bytes.len() - 1] {
+                    let mut torn = base.clone();
+                    for prev in &plan.batches[..bi] {
+                        for (o, b) in &prev.ops {
+                            apply(&mut torn, *o, b);
+                        }
+                    }
+                    for (o, b) in &ops[..oj] {
+                        apply(&mut torn, *o, b);
+                    }
+                    apply(&mut torn, *off, &bytes[..cut]);
+                    std::fs::write(&scratch, &torn).unwrap();
+                    let got = IdMapIndex::load(&scratch)
+                        .unwrap_or_else(|e| panic!("batch {bi} op {oj} cut {cut}: {e}"))
+                        .to_bytes();
+                    assert_eq!(got, state_a, "batch {bi} op {oj} cut {cut}");
+                }
+            }
         }
     }
 }

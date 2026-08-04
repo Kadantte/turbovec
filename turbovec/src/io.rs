@@ -972,6 +972,10 @@ const TMP_NAME_MAX: usize = 255;
 /// [`create_tmp`] is what actually defeats a planted symlink; the
 /// randomness keeps collisions with a crash-leaked temp from a reused
 /// pid from turning into save failures.)
+pub(crate) fn file_nonce() -> u64 {
+    ((tmp_rand() as u64) << 32) | tmp_rand() as u64
+}
+
 fn tmp_rand() -> u32 {
     use std::hash::{BuildHasher, Hasher};
     let mut h = std::collections::hash_map::RandomState::new().build_hasher();
@@ -1022,7 +1026,7 @@ fn tmp_sibling(path: &Path, rand: u32) -> PathBuf {
 /// crash-leaked temp from a reused pid, since the name embeds pid, a
 /// process-wide counter, and a random component — retries with a fresh
 /// name a few times rather than failing the save.
-fn create_tmp(path: &Path) -> io::Result<(File, PathBuf)> {
+pub(crate) fn create_tmp(path: &Path) -> io::Result<(File, PathBuf)> {
     let mut last_err = None;
     for _ in 0..8 {
         let tmp = tmp_sibling(path, tmp_rand());
@@ -1069,7 +1073,7 @@ fn is_transient_rename_error(raw_os_error: Option<i32>) -> bool {
 /// rustup, and git take (#313), and the same set the Python writer uses
 /// (`turbovec-python/python/turbovec/_persist.py`). The two must stay in
 /// step: they implement one protocol against one on-disk format.
-fn rename_atomic(tmp: &Path, path: &Path) -> io::Result<()> {
+pub(crate) fn rename_atomic(tmp: &Path, path: &Path) -> io::Result<()> {
     #[cfg(windows)]
     {
         let mut delay_ms = 1u64;
@@ -1154,7 +1158,7 @@ fn claim_first_sweep(path: &Path) -> bool {
 /// takes seconds, so a live writer's in-flight temp is never touched.
 /// Every error is ignored: sweeping is opportunistic and must never
 /// fail a save.
-fn sweep_stale_tmps(path: &Path) {
+pub(crate) fn sweep_stale_tmps(path: &Path) {
     // A destination that is itself one of our temp names means someone
     // is staging through us — `_persist.atomic_save` writes the index to
     // a fresh `<dest>.tmp.…` name on every save, so all four Python
@@ -1248,7 +1252,7 @@ fn sync_parent_dir(path: &Path) -> io::Result<()> {
 /// a non-fatal diagnostic through [`crate::warning`], which an embedder
 /// can route into its own logging (or silence) instead of being handed
 /// an unconditional line on stderr.
-fn sync_parent_dir_after_commit(path: &Path) {
+pub(crate) fn sync_parent_dir_after_commit(path: &Path) {
     if let Err(e) = sync_parent_dir(path) {
         crate::warning::warn(&format!(
             "{} was written and committed, but syncing its parent directory \
@@ -1759,13 +1763,22 @@ fn read_tqplus_trailer<R: Read>(r: &mut R, dim: usize) -> io::Result<(Vec<f32>, 
     let tqplus_shift = read_f32_array(r, n_calib)?;
     let tqplus_scale = read_f32_array(r, n_calib)?;
 
-    // Value-level validation, mirroring the header checks: the encoder
-    // only ever emits finite shifts and strictly-positive scales
-    // (encode.rs initialises scale to 1.0 and overwrites it only with a
-    // positive span), so anything else is corruption or an attacker
-    // payload. Search divides by `tqplus_scale`, so a zero/negative/
-    // non-finite value — which a bare is_finite() check would not fully
-    // catch — silently turns every query's scores into NaN/Inf.
+    validate_calibration(&tqplus_shift, &tqplus_scale)?;
+
+    Ok((tqplus_shift, tqplus_scale))
+}
+
+/// Value-level calibration validation — THE rule, shared by every
+/// loader (v6 here, v7 in `io_v7`): the encoder only ever emits finite
+/// shifts and strictly-positive scales, so anything else is corruption
+/// or an attacker payload. Search divides by `tqplus_scale`, so a
+/// zero/negative/non-finite value — which a bare is_finite() check
+/// would not fully catch — silently turns every query's scores into
+/// NaN/Inf.
+pub(crate) fn validate_calibration(
+    tqplus_shift: &[f32],
+    tqplus_scale: &[f32],
+) -> io::Result<()> {
     if let Some((i, &v)) = tqplus_shift
         .iter()
         .enumerate()
@@ -1786,8 +1799,7 @@ fn read_tqplus_trailer<R: Read>(r: &mut R, dim: usize) -> io::Result<(Vec<f32>, 
             format!("invalid TQ+ scale at coord {i}: {v} (must be finite and > 0)"),
         ));
     }
-
-    Ok((tqplus_shift, tqplus_scale))
+    Ok(())
 }
 
 /// Header-field validation shared by every format version.

@@ -46,6 +46,41 @@ appears under each surface it touches.
 
 #### Added
 
+- **Incremental saves: `sync(path)` on both index types (#475, #476).**
+  A saved index is now updatable on disk for the cost of what changed,
+  not the cost of what it holds. The first sync of a fresh path writes
+  the whole file; every later sync to the same path writes only the
+  delta — appended 32-row blocks land past the committed region, a
+  removal rides the commit header as a redo op (an absolute write,
+  materialized into the block by a later sync), and a small alternating
+  commit header (holding the partial tail block) flips last. Every sync is one write batch and ONE fsync:
+  the header names the blocks its sync wrote and carries their bytes'
+  checksum, so a commit that persists before its data is detected at
+  load and the previous commit wins — the journal-checksum trick that
+  replaces write-ordering barriers. Net-zero churn leaves the file size
+  flat; only `calibrate`, a mass removal (>1024 distinct
+  slots pending), a failed sync (recovery re-establishes ground truth),
+  or syncing over a foreign file rewrites it whole.
+
+  The crash contract, pinned by an exhaustive in-crate harness: a crash
+  at any byte of any write of a sync recovers the previous commit
+  exactly — never garbage, never a blend. A torn commit header fails
+  its checksum and load falls back to the alternate header slot; damage
+  from outside the writer (bit rot, mangled copies) is out of scope,
+  exactly as it is for `write`. Every sync is durable — one fsync,
+  `write(durable=True)`'s strength on every platform — including the
+  temp-file protocol and parent-directory fsync on the full-write path.
+
+  `load` recognises synced files and lands in the same blocked-only
+  state a `.tv`/`.tvim` load reaches (no extra RAM; 0.38 ms vs 0.24 ms
+  for a 50k x 512d load, the delta being the one placement copy the
+  block-interleaved layout needs to make the codes contiguous). A loaded index keeps syncing forward
+  incrementally, ids agree byte-for-byte on `IdMapIndex`, and `write` /
+  `load` keep their meaning — migrating a `.tv` file is
+  `load(path)` + `sync(path)`. New: `sync` on `TurboQuantIndex` and
+  `IdMapIndex` — always durable; when it returns, the commit is on
+  stable storage.
+
 - **Self-describing `IdMapIndex` search results (#351).** New
   `IdSearchResults { scores, ids, nq, k }` — the id-space counterpart of
   `SearchResults`, with the same `scores_for_query` / `ids_for_query` row
@@ -1166,6 +1201,15 @@ appears under each surface it touches.
 ### turbovec — Python package
 
 #### Added
+
+- **`sync(path)` on `TurboQuantIndex` and `IdMapIndex`
+  (#475, #476).** Incremental persistence: the first sync writes the
+  whole file, later syncs to the same path write only what changed since
+  — kilobytes for a small batch, not the file. A crash at any byte
+  leaves the previous commit intact, and every sync is durable — when
+  it returns, the commit is on stable storage; `load` recognises synced
+  files and a loaded index keeps syncing forward. Re-calibrating makes the next sync rewrite the file
+  once. Runs GIL-released under the write lock.
 
 - **Interruptible long search/add (#216).** A large batch `search` / `add`
   / `add_with_ids` is now processed one row-slice at a time (default

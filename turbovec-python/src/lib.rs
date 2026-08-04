@@ -717,6 +717,35 @@ impl TurboQuantIndex {
             .map_err(|e| load_err(path, e))
     }
 
+    /// Incrementally persist the index to ``path``. The first sync of a
+    /// fresh path writes the whole file; every later sync to the same
+    /// path appends only what changed since the last one — added
+    /// vectors and applied removals — and commits, so saving after a
+    /// small batch costs kilobytes, not the file. A crash at any byte
+    /// leaves the previous commit intact. Every sync is durable: when it
+    /// returns, the commit is on stable storage — there is no fast
+    /// mode. Re-calibrating (or heavy churn)
+    /// makes the next sync compact the file by rewriting it whole.
+    ///
+    /// ``load`` recognises synced files, and a loaded index keeps
+    /// syncing forward incrementally. ``write`` keeps its meaning; a
+    /// sync after a ``write`` to the same path rebuilds the synced
+    /// format once, then appends again.
+    fn sync(&self, py: Python<'_>, path: &str) -> PyResult<()> {
+        // A sync mutates the cursor, so it takes the write lock; detach
+        // first for the same #289 reason as `write`, and queue core
+        // warnings (#360/#365) rather than running user Python under
+        // the lock.
+        let result = py.detach(|| {
+            let _defer = DeferCoreWarnings::new();
+            let mut guard = lock_write(&self.inner);
+            let index = &mut *guard;
+            with_pool(|| index.sync(path))
+        });
+        flush_core_warnings(py);
+        result?.map_err(|e| load_err(path, e))
+    }
+
     #[classmethod]
     fn load(cls: &Bound<PyType>, path: &str) -> PyResult<Self> {
         // The v6 load parallelizes the layout transform — run it in the
@@ -1272,8 +1301,38 @@ impl IdMapIndex {
             .map_err(|e| load_err(path, e))
     }
 
+    /// Incrementally persist the index to ``path``. The first sync of a
+    /// fresh path writes the whole file; every later sync to the same
+    /// path appends only what changed since the last one — added
+    /// vectors and applied removals — and commits, so saving after a
+    /// small batch costs kilobytes, not the file. A crash at any byte
+    /// leaves the previous commit intact. Every sync is durable: when it
+    /// returns, the commit is on stable storage — there is no fast
+    /// mode. Re-calibrating (or heavy churn)
+    /// makes the next sync compact the file by rewriting it whole.
+    ///
+    /// ``load`` recognises synced files, and a loaded index keeps
+    /// syncing forward incrementally. ``write`` keeps its meaning; a
+    /// sync after a ``write`` to the same path rebuilds the synced
+    /// format once, then appends again.
+    fn sync(&self, py: Python<'_>, path: &str) -> PyResult<()> {
+        // A sync mutates the cursor, so it takes the write lock; detach
+        // first for the same #289 reason as `write`, and queue core
+        // warnings (#360/#365) rather than running user Python under
+        // the lock.
+        let result = py.detach(|| {
+            let _defer = DeferCoreWarnings::new();
+            let mut guard = lock_write(&self.inner);
+            let index = &mut *guard;
+            with_pool(|| index.sync(path))
+        });
+        flush_core_warnings(py);
+        result?.map_err(|e| load_err(path, e))
+    }
+
     /// Load an ``IdMapIndex`` from a ``.tvim`` file previously written
-    /// by ``IdMapIndex.write``.
+    /// by ``IdMapIndex.write``, or a synced file written by
+    /// ``IdMapIndex.sync``.
     #[classmethod]
     fn load(cls: &Bound<PyType>, path: &str) -> PyResult<Self> {
         // The v6 load parallelizes the layout transform — run it in the
