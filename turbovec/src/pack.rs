@@ -29,6 +29,30 @@ macro_rules! pack_blocked_native {
     }};
 }
 
+/// One byte group of a lane move, evaluating to the byte that was moved.
+///
+/// A macro rather than a `cfg`-gated function, for the reason recorded on
+/// [`pack_blocked_native`]: a function body compiled out on x86 cannot be
+/// covered by any test the x86-only mutation gate runs, so mutating it
+/// produces an identical binary and is reported uncovered forever (#421).
+/// With no non-x86 function body there is nothing to mutate.
+macro_rules! move_one_native {
+    ($blocked:expr, $s_off:expr, $sl:expr, $d_off:expr, $dl:expr) => {{
+        #[cfg(target_arch = "x86_64")]
+        {
+            let code = deinterleave_x86_code_byte($blocked, $s_off, $sl);
+            write_x86_code_byte($blocked, $d_off, $dl, code);
+            code
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            let code = $blocked[$s_off + $sl];
+            $blocked[$d_off + $dl] = code;
+            code
+        }
+    }};
+}
+
 /// Repack bit-plane codes into SIMD-blocked layout.
 /// Returns (blocked_codes, n_blocks).
 ///
@@ -137,23 +161,52 @@ pub(crate) fn write_x86_code_byte(blocked: &mut [u8], group_off: usize, lane: us
 /// Copy vector `src_vec`'s code bytes into vector `dst_vec`'s lane across
 /// every byte-group of the native blocked layout — the O(dim) primitive
 /// that lets `swap_remove` maintain the cache without a block repack.
-pub(crate) fn move_lane(blocked: &mut [u8], n_byte_groups: usize, src_vec: usize, dst_vec: usize) {
+///
+/// With `capture`, the moved row's *sequential* code bytes are also written
+/// there. The move already computes exactly those bytes, one per byte
+/// group, and would otherwise drop each into the destination lane and
+/// forget it; handing them out costs a store per group and saves a later
+/// reader from walking the whole 32-lane block to recover them (at dim 768,
+/// a 12 KB strided read to collect 384 bytes). The bytes are the same
+/// either way, because `write_x86_code_byte` is the exact inverse of the
+/// de-interleave — what is captured is what a later read of `dst_vec`'s
+/// lane returns.
+///
+/// `capture`, when given, must be exactly `n_byte_groups` long. The caller
+/// sizes it so the loop below is a straight indexed store with no capacity
+/// check and no temporary, which matters at one call per byte group per
+/// removal: a `Vec::push` per byte, plus a `Vec` per removal and a copy out
+/// of it, cost more than the whole capture is worth.
+pub(crate) fn move_lane(
+    blocked: &mut [u8],
+    n_byte_groups: usize,
+    src_vec: usize,
+    dst_vec: usize,
+    capture: Option<&mut [u8]>,
+) {
     let (sb, sl) = (src_vec / BLOCK, src_vec % BLOCK);
     let (db, dl) = (dst_vec / BLOCK, dst_vec % BLOCK);
-    for g in 0..n_byte_groups {
-        let s_off = (sb * n_byte_groups + g) * BLOCK;
-        let d_off = (db * n_byte_groups + g) * BLOCK;
-        #[cfg(target_arch = "x86_64")]
-        {
-            let code = deinterleave_x86_code_byte(blocked, s_off, sl);
-            write_x86_code_byte(blocked, d_off, dl, code);
+    debug_assert!(capture.as_ref().is_none_or(|c| c.len() == n_byte_groups));
+    // Split the two loops rather than testing the option per byte: the
+    // plain move is the common path and must stay branch-free.
+    match capture {
+        None => {
+            for g in 0..n_byte_groups {
+                let s_off = (sb * n_byte_groups + g) * BLOCK;
+                let d_off = (db * n_byte_groups + g) * BLOCK;
+                move_one_native!(blocked, s_off, sl, d_off, dl);
+            }
         }
-        #[cfg(not(target_arch = "x86_64"))]
-        {
-            blocked[d_off + dl] = blocked[s_off + sl];
+        Some(out) => {
+            for (g, slot) in out.iter_mut().enumerate() {
+                let s_off = (sb * n_byte_groups + g) * BLOCK;
+                let d_off = (db * n_byte_groups + g) * BLOCK;
+                *slot = move_one_native!(blocked, s_off, sl, d_off, dl);
+            }
         }
     }
 }
+
 
 /// Append `n_new` vectors' packed bit-plane rows to the native blocked
 /// layout as direct lane writes, growing the buffer to the new geometry
