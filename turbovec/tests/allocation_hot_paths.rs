@@ -124,6 +124,16 @@ fn repack_allocation_count_does_not_scale_with_vector_count() {
     let small = cold_index(64);
     let large = cold_index(4096);
 
+    // Warm process-wide lazy state (layout OnceLocks, env reads) on a
+    // THROWAWAY index, then measure the FIRST prepare of each subject:
+    // prepare() is a cached no-op on a warm index now, so re-measuring
+    // the same index compares a no-op against a real repack and the
+    // counts diverge by the fixed buffer set rather than anything
+    // per-vector. First-call vs first-call keeps the pin honest: both
+    // pay the same fixed rotation/codebook/layout allocations, and only
+    // a per-vector regression can split them.
+    let _ = count_allocs(|| cold_index(8).prepare());
+
     let a = count_allocs(|| small.prepare());
     let b = count_allocs(|| large.prepare());
     println!("prepare allocations: 64 vectors = {a}, 4096 vectors = {b}");

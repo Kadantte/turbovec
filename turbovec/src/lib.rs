@@ -515,7 +515,8 @@ impl TurboQuantIndex {
             if self.n_vectors == 0 {
                 return Vec::new();
             }
-            let seq = pack::native_to_seq(&cache.data);
+            let (_, nbg, _) = pack::blocked_geometry(self.n_vectors, self.bit_width, dim);
+            let seq = pack::native_to_seq(&cache.data, self.bit_width, nbg);
             pack::seq_to_packed(&seq, self.n_vectors, self.bit_width, dim)
         })
     }
@@ -1541,16 +1542,10 @@ impl TurboQuantIndex {
         // gather; on x86 each byte de-interleaves from its nibble
         // planes (the primitive the scalar search fallback uses).
         let cache = self.blocked.get().expect("no code layout materialized");
-        let block_bytes = row_bytes * BLOCK;
-        let base = (idx / BLOCK) * block_bytes;
+        let b = idx / BLOCK;
         let lane = idx % BLOCK;
-        #[cfg(target_arch = "x86_64")]
-        return (0..row_bytes)
-            .map(|g| pack::deinterleave_x86_code_byte(&cache.data, base + g * BLOCK, lane))
-            .collect();
-        #[cfg(not(target_arch = "x86_64"))]
         (0..row_bytes)
-            .map(|g| pack::seq_lane_byte(&cache.data, base, g, lane))
+            .map(|g| pack::read_code(&cache.data, self.bit_width, row_bytes, b, g, lane))
             .collect()
     }
 
@@ -1579,7 +1574,11 @@ impl TurboQuantIndex {
         }
         let cache = self.blocked.get().expect("no code layout materialized");
         let block_bytes = row_bytes * BLOCK;
-        pack::native_to_seq(&cache.data[from / BLOCK * block_bytes..to / BLOCK * block_bytes])
+        pack::native_to_seq(
+            &cache.data[from / BLOCK * block_bytes..to / BLOCK * block_bytes],
+            self.bit_width,
+            row_bytes,
+        )
     }
 
     /// Persist this index's changes to `path` incrementally.
@@ -1775,7 +1774,8 @@ impl TurboQuantIndex {
         // The units already hold the seq-blocked layout; one platform
         // transform in place (identity off x86) and it IS the search
         // cache.
-        let native = pack::seq_into_native(l.seq_blocked);
+        let (_, nbg, _) = pack::blocked_geometry(l.n_vectors, l.bit_width, l.dim);
+        let native = pack::seq_into_native(l.seq_blocked, l.bit_width, nbg);
         let (tqplus_shift, tqplus_scale) =
             Self::normalize_calibration(l.tqplus_shift, l.tqplus_scale);
         let (boundaries, centroids) = codebook::codebook(l.bit_width, l.dim);
@@ -1865,14 +1865,14 @@ impl TurboQuantIndex {
         // arches the cache IS the sequential layout, so this skips the
         // whole-payload copy. Bytes are identical either way.
         if self.n_vectors > 0 && self.dim.is_some() {
-            if let Some(cache) = self.blocked.get() {
+            if let Some(native) = self.blocked_native_for_write() {
                 #[cfg(target_arch = "x86_64")]
                 return io::write_native_with_durability(
                     path,
                     self.bit_width,
                     self.dim.unwrap_or(0),
                     self.n_vectors,
-                    &cache.data,
+                    native,
                     &boundaries,
                     &centroids,
                     &self.scales,
@@ -1886,7 +1886,7 @@ impl TurboQuantIndex {
                     self.bit_width,
                     self.dim.unwrap_or(0),
                     self.n_vectors,
-                    &cache.data,
+                    native,
                     &boundaries,
                     &centroids,
                     &self.scales,
@@ -1914,8 +1914,29 @@ impl TurboQuantIndex {
     /// Borrow the warm native blocked cache for a fused write, if one
     /// exists. `None` for empty/lazy indexes or a cold cache (callers
     /// fall back to [`Self::codes_blocked_seq`]).
+    /// Whether this index's blocked cache is in the vector-major layout —
+    /// i.e. whether the native layout differs from the stored one. Callers
+    /// that would otherwise hand cache bytes straight to a writer must
+    /// consult this rather than inferring it from the target arch.
+    pub(crate) fn cache_is_vector_major(&self) -> bool {
+        self.dim.is_some_and(|d| {
+            crate::pack::vector_major_for(self.bit_width, d / (8 / self.bit_width))
+        })
+    }
+
     pub(crate) fn blocked_native_for_write(&self) -> Option<&[u8]> {
         if self.n_vectors == 0 || self.dim.is_none() {
+            return None;
+        }
+        // A vector-major cache is NOT the stored sequential layout, and
+        // the fused writers' chunk transform only inverts the classic
+        // perm0 interleave — handing them vm bytes persists garbage
+        // (silent index corruption on any dotprod ARM or VBMI x86 host;
+        // found by review after the warm-write path skipped the guard).
+        // Folded here so no call site can forget it: vm caches take the
+        // cold path through `codes_blocked_seq`, whose `native_to_seq`
+        // dispatches by actual layout.
+        if self.cache_is_vector_major() {
             return None;
         }
         self.blocked.get().map(|c| c.data.as_slice())
@@ -1934,7 +1955,8 @@ impl TurboQuantIndex {
             return Vec::new();
         }
         if let Some(cache) = self.blocked.get() {
-            return pack::native_to_seq(&cache.data);
+            let (_, nbg, _) = pack::blocked_geometry(self.n_vectors, self.bit_width, dim);
+            return pack::native_to_seq(&cache.data, self.bit_width, nbg);
         }
         pack::repack_seq(self.packed(), self.n_vectors, self.bit_width, dim)
     }
@@ -1974,14 +1996,18 @@ impl TurboQuantIndex {
     /// caller owns the sink.
     pub fn write_to_writer<W: std::io::Write>(&self, w: &mut W) -> std::io::Result<()> {
         let (boundaries, centroids) = self.codebook_for_write();
-        // Off x86 the warm cache already holds the sequential layout the
-        // format persists, so it is written straight from the cache; the
-        // `codes_blocked_seq()` fallback below would copy it first. On x86
-        // the native cache is perm0-nibble-interleaved and has to be
-        // de-interleaved into a materialized buffer — a deliberate,
-        // documented asymmetry (#409): streaming that transform chunk-wise
-        // is what the file writer does, and it needs a positioned sink,
-        // which a bare `Write` is not.
+        // When the warm cache already holds the sequential layout the format
+        // persists, write straight from it; the `codes_blocked_seq()`
+        // fallback below would copy it first. That is the common case off
+        // x86 — but only while the target has no native layout of its own,
+        // which stopped being true when aarch64 gained the vector-major
+        // layout, so the shortcut has to ask rather than assume. Assuming it
+        // put native bytes in the file, where a later load transformed them
+        // again. On x86 the native cache is perm0-interleaved (or
+        // vector-major) and has to be transformed into a materialized buffer
+        // — a deliberate, documented asymmetry (#409): streaming that
+        // transform chunk-wise is what the file writer does, and it needs a
+        // positioned sink, which a bare `Write` is not.
         #[cfg(not(target_arch = "x86_64"))]
         if let Some(native) = self.blocked_native_for_write() {
             return io::write_to(
@@ -2209,8 +2235,8 @@ impl TurboQuantIndex {
                 let centroids_lock = OnceLock::new();
                 if let Some(d) = dim_opt {
                     if n_vectors > 0 {
-                        let (n_blocks, _, _) = pack::blocked_geometry(n_vectors, bit_width, d);
-                        let data = pack::seq_into_native(seq);
+                        let (n_blocks, nbg, _) = pack::blocked_geometry(n_vectors, bit_width, d);
+                        let data = pack::seq_into_native(seq, bit_width, nbg);
                         let _ = blocked.set(BlockedCache { data, n_blocks });
                         // Seed the codebook from the file — the second
                         // half of skipping the first-search rebuild (the
@@ -3003,9 +3029,9 @@ impl TurboQuantIndex {
                     }
                     &mut capture_buf[off..off + n_byte_groups]
                 });
-                pack::move_lane(&mut cache.data, n_byte_groups, last, idx, dst);
+                pack::move_lane(&mut cache.data, self.bit_width, n_byte_groups, last, idx, dst);
             }
-            pack::zero_lane(&mut cache.data, n_byte_groups, last);
+            pack::zero_lane(&mut cache.data, self.bit_width, n_byte_groups, last);
             cache.data.truncate(new_n_blocks * block_bytes);
             cache.n_blocks = new_n_blocks;
         }
@@ -3344,6 +3370,33 @@ mod x86_scalar_fallback_tests {
             .collect()
     }
 
+    /// Brute-force float top-k over the raw vectors — the target both
+    /// scorers are approximating.
+    fn exact_topk(
+        data: &[f32],
+        queries: &[f32],
+        n: usize,
+        dim: usize,
+        nq: usize,
+        k: usize,
+    ) -> Vec<std::collections::BTreeSet<i64>> {
+        (0..nq)
+            .map(|q| {
+                let qr = &queries[q * dim..(q + 1) * dim];
+                let mut scored: Vec<(f32, i64)> = (0..n)
+                    .map(|i| {
+                        let row = &data[i * dim..(i + 1) * dim];
+                        (qr.iter().zip(row).map(|(a, b)| a * b).sum::<f32>(), i as i64)
+                    })
+                    .collect();
+                scored.sort_by(|a, b| {
+                    b.0.partial_cmp(&a.0).unwrap().then_with(|| a.1.cmp(&b.1))
+                });
+                scored[..k].iter().map(|p| p.1).collect()
+            })
+            .collect()
+    }
+
     #[test]
     fn scalar_fallback_matches_simd_topk() {
         let dim = 64;
@@ -3351,8 +3404,9 @@ mod x86_scalar_fallback_tests {
         let nq = 12;
         let k = 16;
         for &bits in &[2usize, 3, 4] {
+            let data = unit_vectors(n, dim, 11);
             let mut idx = TurboQuantIndex::new(dim, bits).unwrap();
-            idx.add(&unit_vectors(n, dim, 11));
+            idx.add(&data);
             let queries = unit_vectors(nq, dim, 22);
 
             FORCE_SCALAR_FALLBACK.store(false, Ordering::Relaxed);
@@ -3362,13 +3416,52 @@ mod x86_scalar_fallback_tests {
             FORCE_SCALAR_FALLBACK.store(false, Ordering::Relaxed);
 
             assert_eq!(simd.k, scalar.k, "bits={bits}: differing result width");
-            // Compare per-query top-k as sets (tie order between kernels may
-            // differ; membership must not).
-            assert_eq!(
-                topk_sets(&simd.indices, nq, simd.k),
-                topk_sets(&scalar.indices, nq, scalar.k),
-                "bits={bits}: scalar fallback returned a different top-k than SIMD",
-            );
+
+            let simd_sets = topk_sets(&simd.indices, nq, simd.k);
+            let scalar_sets = topk_sets(&scalar.indices, nq, scalar.k);
+
+            if bits == 4 && crate::pack::vector_major_for(bits, dim / (8 / bits)) {
+                // Here the SIMD path is the permute-dot kernel, which
+                // quantizes the query and the codebook separately to int8 and
+                // accumulates their products exactly in i32, where the scalar
+                // fallback sums LUT entries whose every (dimension, level)
+                // product was pre-rounded to 7 bits. The two approximate the
+                // same score by different routes, so demanding an identical
+                // top-k would pin the LUT's rounding error as the spec.
+                //
+                // What must hold is that the fallback is still a working
+                // scorer standing in for the kernel: it lands in the same
+                // neighbourhood, and it does not beat the kernel it replaces.
+                let exact = exact_topk(&data, &queries, n, dim, nq, k);
+                let hits = |sets: &[std::collections::BTreeSet<i64>]| -> usize {
+                    sets.iter().zip(exact.iter()).map(|(a, b)| a.intersection(b).count()).sum()
+                };
+                let (hs, hc) = (hits(&simd_sets), hits(&scalar_sets));
+                assert!(
+                    hs + 2 >= hc,
+                    "bits={bits}: scalar fallback ({hc}/{}) beat the SIMD kernel ({hs}/{}) \
+                     against exact scores — the kernel is the more accurate of the two",
+                    nq * k,
+                    nq * k,
+                );
+                let agree: usize = simd_sets
+                    .iter()
+                    .zip(scalar_sets.iter())
+                    .map(|(a, b)| a.intersection(b).count())
+                    .sum();
+                assert!(
+                    agree * 4 >= nq * k * 3,
+                    "bits={bits}: scalar fallback agreed with SIMD on only {agree}/{} slots",
+                    nq * k,
+                );
+            } else {
+                // Every other path scores through the same LUT, so tie order
+                // may differ between kernels but membership must not.
+                assert_eq!(
+                    simd_sets, scalar_sets,
+                    "bits={bits}: scalar fallback returned a different top-k than SIMD",
+                );
+            }
         }
     }
 }

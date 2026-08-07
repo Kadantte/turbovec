@@ -137,8 +137,10 @@ pub enum CodePayload {
     },
     /// Codes already in the *native* kernel layout for this platform —
     /// produced by the fast path loader, whose extraction pass fuses the
-    /// platform transform into the copy. Byte-identical to `BlockedSeq`
-    /// on non-x86 (the stored layout is native there).
+    /// platform transform into the copy. Which layout is native depends on
+    /// the host: vector-major where a dot-product kernel will read it, the
+    /// perm0 nibble interleave on classic x86, and byte-identical to
+    /// `BlockedSeq` elsewhere (the stored layout is native there).
     BlockedNative {
         /// The code bytes already in this platform's kernel layout.
         codes: Vec<u8>,
@@ -147,6 +149,17 @@ pub enum CodePayload {
         /// The codebook's `n_levels` reconstruction centroids.
         centroids: Vec<f32>,
     },
+}
+
+/// The native-layout bytes this host's fast-path loader produces for the
+/// given stored sequential-blocked codes — the same transform selection the
+/// loader itself uses, exposed so tests can state loader expectations
+/// without mirroring the per-host layout math and feature detection.
+#[doc(hidden)]
+pub fn native_layout_of_stored(bit_width: usize, dim: usize, seq: &[u8]) -> Vec<u8> {
+    let mut out = seq.to_vec();
+    crate::pack::apply_native_transform(&mut out, bit_width, dim / (8 / bit_width));
+    out
 }
 
 /// Core payload — what a fully-deserialized index needs.
@@ -2052,12 +2065,10 @@ fn try_load_v6_fast(
                 ),
             )
         })?;
-    // Native transform fused into the read at L2 granularity; identity
-    // on non-x86, where the stored layout is already native.
-    #[cfg(target_arch = "x86_64")]
-    let transform: Option<fn(&mut [u8])> = Some(crate::pack::interleave_chunk_x86);
-    #[cfg(not(target_arch = "x86_64"))]
-    let transform: Option<fn(&mut [u8])> = None;
+    // Native transform fused into the read at L2 granularity; `None` when
+    // the stored layout is already this target's native one.
+    let transform: Option<fn(&mut [u8])> =
+        crate::pack::native_transform(bit_width, dim / (8 / bit_width));
     // Tail (scales + TQ+ (+ id table for .tvim), ~a few MB) reads and
     // validates on a scoped thread while the main thread runs the big
     // parallel codes read — the tail pread + scales scan otherwise
@@ -2081,19 +2092,14 @@ fn try_load_v6_fast(
     // a borrow that outlives neither.
     type TailParts = (Vec<f32>, Vec<f32>, Vec<f32>, Vec<u8>, usize, Vec<u64>, Vec<u64>);
     let read_tail = || -> io::Result<TailParts> {
-        // Uninitialized, not zero-filled: every byte is overwritten by
-        // the read that follows, so `vec![0u8; tail_len]` was memsetting
-        // a few MB for nothing whenever the allocator handed back a
-        // dirty chunk rather than fresh (already-zero) pages.
-        let mut tail: Vec<u8> = Vec::with_capacity(tail_len);
-        // SAFETY: `read_exact_at` fills the whole span or returns `Err`,
-        // and on `Err` we leave before `set_len`, so the uninitialized
-        // capacity is never observable as initialized.
-        unsafe {
-            let span = std::slice::from_raw_parts_mut(tail.as_mut_ptr(), tail_len);
-            read_exact_at(f, span, codes_end)?;
-            tail.set_len(tail_len);
-        }
+        // Zero-filled: forming a `&mut [u8]` over uninitialized capacity
+        // and handing it to the safe Read family is documented UB, no
+        // matter that today's impls only write (review finding; twice).
+        // The memset this reintroduces is bounded by the tail (scales +
+        // calibration + id table), not the codes payload — small next to
+        // the read it fronts.
+        let mut tail: Vec<u8> = vec![0u8; tail_len];
+        read_exact_at(f, &mut tail, codes_end)?;
         let mut tr: &[u8] = &tail[..];
         let scales = read_scales_validated(&mut tr, n_vectors)?;
         let (tqplus_shift, tqplus_scale) = read_tqplus_trailer(&mut tr, dim)?;

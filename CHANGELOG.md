@@ -13,7 +13,90 @@ appears under each surface it touches.
 
 ### turbovec — Rust crate
 
+#### Fixed
+
+- **Masked search no longer drops allowed vectors on AVX-512 VNNI/VBMI
+  hardware.** The nq=1 block-interleave (H54) steps the permute-dot
+  block loop eight blocks at a time, but the mask block-skip still
+  tested only the first block of each group — a group whose head block
+  was fully masked skipped all eight, losing allowed vectors in the
+  other seven and padding short results with heap-prefill slot ids.
+  The skip now clears the whole interleaved group.
+- **Saving a warm index on vector-major hardware no longer corrupts the
+  file.** The fused write path borrowed the blocked cache assuming the
+  stored sequential layout; on dotprod ARM and AVX-512-VBMI x86 the
+  cache is vector-major, so saves persisted kernel-layout bytes that
+  reloaded as garbage. The layout guard now lives inside the borrow
+  helper itself, and vector-major caches take the repacking path.
+- **Single-threaded batch search no longer drops queries 8 and 9 on
+  2/3-bit vector-major indexes.** The thread-aware batch width widened
+  to a 10-query batch wherever that saved a pass, but only the
+  permute-dot (4-bit) kernel carries 10 query lanes; the VNNI kernel
+  that scores 2/3-bit vector-major indexes is 8-wide, so it scored
+  lanes 0..8 and returned the last two queries of every batch empty.
+  The wide width is now selected only when the permute-dot kernel is
+  the one taking the batch, and the VNNI kernel asserts its 8-lane
+  bound.
+- **Batch search no longer panics (or drops queries) on x86 CPUs
+  without the wide kernels.** The 8-query batch introduced for the
+  AVX-512 permute-dot kernels reached the classic 4-slot AVX2/BW
+  kernels whole; those arms now consume it in padded 4-query chunks.
+- The NEON tiling A/B env hooks (TV_NEON_MULT/TV_NEON_CAP) are gone —
+  the swept constants are compiled in — and the v6 fast loader no
+  longer forms a mutable slice over uninitialized memory.
+
 #### Changed
+
+- **x86 with AVX-512 VBMI and VNNI scores batch searches with a dot-product
+  kernel.** Codes are permuted at load into a layout where each aligned
+  4-byte group holds one vector's codes for four consecutive byte-groups,
+  so `vpdpbusd` reduces them into that vector's own accumulator lane and
+  `vpermb` selects the right sub-table per byte position. **1.233x** on
+  the batch search cell (200k×768 4-bit, nq=100, k=10), holding across
+  50k–500k vectors, 384–1536 dimensions and 2-bit codes. No format
+  change: this replaces the existing load-time permutation rather than
+  adding one, and existing index files are unaffected. CPUs without both
+  features, and geometries whose byte-group count is not a multiple of 4,
+  keep the previous kernel.
+
+  **Scores change in the last few bits.** Accumulation is now exact in
+  u32 where the previous kernel rounded through f32 every 256 byte-groups,
+  so this path is strictly more accurate — but it is not bit-identical to
+  earlier releases, and vectors separated by less than ~5e-05 in score may
+  swap order. Recall is unchanged (measured identical at k=10, with the
+  same returned ids), and results remain fully deterministic: the same
+  query on the same index always returns the same answer. Set
+  `TURBOVEC_NO_VNNI=1` to force the previous kernel.
+
+- **Batch search schedules its block-axis tiles at a finer grain.** Three
+  scheduler changes, results bit-identical by construction (the
+  cross-range merge is a strict total order; verified across
+  nq ∈ {1,4,25,100,257} × k ∈ {1,10,100} plus masked and tied-score
+  shapes on both architectures): the tile target per worker rises 4 → 32
+  so the final rayon wave amortizes stragglers (nq=100, 200k×768 4-bit:
+  x1.105 ARM / x1.030 x86); tiles are emitted block-range-major so
+  same-range tiles share cache residency (x1.019 ARM); and the NEON
+  dispatch carries its own, 2× finer pair of tile constants where the
+  AVX-512 dispatch keeps the coarser one — the two peak in different
+  places (x1.017 ARM, x86 untouched by construction). Shapes where the
+  block or k caps already bound the range count are unchanged; between
+  nq≈21 and 64 the range count can rise to the block cap.
+
+- **The x86 batch kernel widens its query batch when that saves a pass.**
+  A batch width of 10 buys fewer passes over the code array
+  single-threaded but pays more live state per tile multi-threaded, so
+  one constant cannot be right for both: the width is now chosen per
+  search — 10 when running single-threaded, the batch is bound for the
+  10-lane permute-dot kernel, *and* the wider batch actually removes a
+  pass at this query count, 8 otherwise (+8.4% at
+  nq=100 single-threaded, +0.60% on the 8-cell mean, and no change
+  multi-threaded or at query counts where both widths need the same
+  passes). The batch epilogue also reduces each block's accumulators
+  at 512 bits instead of 256 (+1.41% on the 8-cell mean); its floats
+  combine in a different order, so scores can move in the last bits,
+  within the tolerance the dot-product kernel already documents above.
+  Both changes soak-tested against a control build from the same tree
+  with identical returned ids and recall.
 
 - **`write` and `load` are faster on both architectures.** No format
   change, no API change, and the durability protocol is untouched — a
