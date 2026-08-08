@@ -234,7 +234,7 @@ def write_insert_panel(arch, hw_label, thread_key, thread_label, filename):
     px = margin["left"]
     py = margin["top"]
 
-    y_max = nice_ceil(max(max(g["bulk"], g["warm"], g["faiss"]) for g in groups) * 1.22)
+    y_max = nice_ceil(max(max(g["bulk"], g["faiss"]) for g in groups) * 1.22)
 
     parts = [grid_lines(px, py, pw, ph, 0, y_max, lambda v: f"{v / 1e3:.0f}K")]
     parts.append(f'<text x="{px}" y="{py - 14}" class="panel">{xe(thread_label)}</text>')
@@ -258,9 +258,8 @@ def write_insert_panel(arch, hw_label, thread_key, thread_label, filename):
 
     for i, g in enumerate(groups):
         cx = px + band * i + band / 2
-        parts.append(draw(cx - 1.5 * bar_w - gap, g["bulk"], C["tq"], accent=True))
-        parts.append(draw(cx - 0.5 * bar_w, g["warm"], C["tq_4"]))
-        parts.append(draw(cx + 0.5 * bar_w + gap, g["faiss"], C["faiss"]))
+        parts.append(draw(cx - bar_w - gap / 2, g["bulk"], C["tq"], accent=True))
+        parts.append(draw(cx + gap / 2, g["faiss"], C["faiss"]))
         label_y = py + ph + 22
         primary, _, secondary = g["label"].partition("|")
         parts.append(f'<text x="{cx:.1f}" y="{label_y}" text-anchor="middle" class="label">{xe(primary)}</text>')
@@ -272,9 +271,11 @@ def write_insert_panel(arch, hw_label, thread_key, thread_label, filename):
 
     legend_y = height - 26
     lx = margin["left"]
+    # Warm append is not shown separately: with explicit calibration the
+    # steady-state encode path IS the bulk path — the two measure within
+    # noise of each other (within 2% ST, 4% MT, both directions).
     items = [
         ("TQ bulk", C["tq"], True),
-        ("TQ warm append", C["tq_4"], False),
         ("FAISS bulk", C["faiss"], False),
     ]
     offset = 0
@@ -290,7 +291,7 @@ def write_insert_panel(arch, hw_label, thread_key, thread_label, filename):
   {style_block()}
   <rect width="100%" height="100%" fill="#ffffff" />
   <text x="{margin["left"]}" y="32" class="title">Insertion Throughput — {xe(hw_label)} — {xe(thread_label)}</text>
-  <text x="{margin["left"]}" y="52" class="subtitle">Bulk: 100K vectors into an empty index (init + calibration fit included). Warm: 10K append, calibration frozen. Median of 5 runs.</text>
+  <text x="{margin["left"]}" y="52" class="subtitle">Bulk add() of 100K vectors into an empty index (one-time rotation/codebook init included). Median of 5 runs.</text>
   {body}
 </svg>
 """
