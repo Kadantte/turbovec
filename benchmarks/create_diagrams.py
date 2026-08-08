@@ -3,8 +3,8 @@
 Reads JSON files from ./results/ and writes:
   ../docs/arm_speed_st.svg, ../docs/arm_speed_mt.svg
   ../docs/x86_speed_st.svg, ../docs/x86_speed_mt.svg
-  ../docs/arm_insert_st.svg, ../docs/arm_insert_mt.svg, ../docs/arm_remove_st.svg
-  ../docs/x86_insert_st.svg, ../docs/x86_insert_mt.svg, ../docs/x86_remove_st.svg
+  ../docs/arm_insert_online_st.svg, ../docs/x86_insert_online_st.svg
+  ../docs/arm_remove_online_st.svg, ../docs/x86_remove_online_st.svg
   ../docs/arm_persist_st.svg, ../docs/arm_persist_mt.svg
   ../docs/x86_persist_st.svg, ../docs/x86_persist_mt.svg
   ../docs/recall_d1536.svg, ../docs/recall_d3072.svg, ../docs/recall_glove.svg
@@ -209,89 +209,50 @@ def write_speed_panel(arch, hw_label, thread_key, thread_label, tick_fmt, value_
     print(f"wrote {out}")
 
 
-def fmt_k(v):
-    return f"{v / 1e3:.1f}K" if v < 20_000 else f"{v / 1e3:.0f}K"
-
-
-def write_insert_panel(arch, hw_label, thread_key, thread_label, filename):
-    groups = []
+def write_online_insert_panel(arch, hw_label, filename):
+    # Two panels: per-vector add() latency at n=1 and n=100, TurboQuant vs
+    # FAISS on the trained, populated index. Single-threaded cells: single
+    # add is serial, so the ST figures are the per-call cost any caller pays.
+    single, batch = [], []
     for dim in (1536, 3072):
         for bw in (2, 4):
-            entry = load_json(f"speed_insert_d{dim}_{bw}bit_{arch}_{thread_key}.json")
-            groups.append(
-                {
-                    "label": f"d={dim}|{bw}-bit",
-                    "bulk": entry["tq_bulk_insert_vecs_per_sec"],
-                    "warm": entry["tq_warm_insert_vecs_per_sec"],
-                    "faiss": entry["faiss_bulk_insert_vecs_per_sec"],
-                }
-            )
+            e = load_json(f"speed_insert_d{dim}_{bw}bit_{arch}_st.json")
+            lbl = f"d={dim}|{bw}-bit"
+            single.append({"label": lbl, "tq": e["tq_single_add_us"], "faiss": e["faiss_single_add_us"]})
+            batch.append({"label": lbl, "tq": e["tq_batch100_add_us"] / 100, "faiss": e["faiss_batch100_add_us"] / 100})
 
-    width, height = 900, 460
-    margin = {"top": 82, "right": 32, "bottom": 108, "left": 84}
-    pw = width - margin["left"] - margin["right"]
+    width, height = 1100, 470
+    margin = {"top": 92, "right": 24, "bottom": 100, "left": 84}
     ph = height - margin["top"] - margin["bottom"]
-    px = margin["left"]
     py = margin["top"]
+    inner = width - margin["left"] - margin["right"]
+    panel_gap = 64
+    panel_w = (inner - panel_gap) / 2
 
-    y_max = nice_ceil(max(max(g["bulk"], g["faiss"]) for g in groups) * 1.22)
+    def us_val(v):
+        return f"{v:.0f}" if v >= 20 else f"{v:.1f}"
 
-    parts = [grid_lines(px, py, pw, ph, 0, y_max, lambda v: f"{v / 1e3:.0f}K")]
-    parts.append(f'<text x="{px}" y="{py - 14}" class="panel">{xe(thread_label)}</text>')
-
-    n = len(groups)
-    band = pw / n
-    bar_w = min(44, band * 0.22)
-    gap = 8
-
-    def draw(xbar, val, color, accent=False):
-        h = (val / y_max) * ph
-        y = py + ph - h
-        stroke = f' stroke="{C["tq_stroke"]}" stroke-width="1.5"' if accent else ""
-        value_cls = "value-accent" if accent else "value"
-        return "\n".join(
-            [
-                f'<rect x="{xbar:.1f}" y="{y:.1f}" width="{bar_w}" height="{h:.1f}" rx="6" fill="{color}"{stroke} />',
-                f'<text x="{xbar + bar_w/2:.1f}" y="{y - 6:.1f}" text-anchor="middle" class="{value_cls}">{xe(fmt_k(val))}</text>',
-            ]
+    parts = []
+    for i, (title, groups) in enumerate([("Single add (n=1)", single), ("Batched add (n=100), per vector", batch)]):
+        px = margin["left"] + i * (panel_w + panel_gap)
+        y_max = nice_ceil(max(max(g["tq"], g["faiss"]) for g in groups) * 1.22)
+        parts.append(
+            paired_panel(px, py, panel_w, ph, title, groups,
+                         tick_fmt=lambda v: f"{v:.0f}", value_fmt=us_val, y_max=y_max)
         )
 
-    for i, g in enumerate(groups):
-        cx = px + band * i + band / 2
-        parts.append(draw(cx - bar_w - gap / 2, g["bulk"], C["tq"], accent=True))
-        parts.append(draw(cx + gap / 2, g["faiss"], C["faiss"]))
-        label_y = py + ph + 22
-        primary, _, secondary = g["label"].partition("|")
-        parts.append(f'<text x="{cx:.1f}" y="{label_y}" text-anchor="middle" class="label">{xe(primary)}</text>')
-        parts.append(f'<text x="{cx:.1f}" y="{label_y + 15}" text-anchor="middle" class="secondary">{xe(secondary)}</text>')
-
     parts.append(
-        f'<text x="26" y="{py + ph/2}" transform="rotate(-90, 26, {py + ph/2})" class="axis">vectors / sec</text>'
+        f'<text x="26" y="{py + ph/2}" transform="rotate(-90, 26, {py + ph/2})" class="axis">\u00b5s / vector</text>'
     )
-
-    legend_y = height - 26
-    lx = margin["left"]
-    # Warm append is not shown separately: with explicit calibration the
-    # steady-state encode path IS the bulk path — the two measure within
-    # noise of each other (within 2% ST, 4% MT, both directions).
-    items = [
-        ("TQ bulk", C["tq"], True),
-        ("FAISS bulk", C["faiss"], False),
-    ]
-    offset = 0
-    for lbl, col, accent in items:
-        stroke = f' stroke="{C["tq_stroke"]}" stroke-width="1.5"' if accent else ""
-        parts.append(f'<rect x="{lx + offset}" y="{legend_y - 10}" width="14" height="14" rx="3" fill="{col}"{stroke} />')
-        parts.append(f'<text x="{lx + offset + 22}" y="{legend_y + 1}" class="legend">{xe(lbl)}</text>')
-        offset += 40 + 8 * len(lbl)
+    parts.append(legend_tq_faiss(margin["left"], height - 26))
 
     body = "\n".join(parts)
     svg = f"""<?xml version="1.0" encoding="UTF-8"?>
-<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}" role="img" aria-label="Insertion Throughput — {xe(hw_label)} — {xe(thread_label)}">
+<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}" role="img" aria-label="Online Insert Latency \u2014 {xe(hw_label)}">
   {style_block()}
   <rect width="100%" height="100%" fill="#ffffff" />
-  <text x="{margin["left"]}" y="32" class="title">Insertion Throughput — {xe(hw_label)} — {xe(thread_label)}</text>
-  <text x="{margin["left"]}" y="52" class="subtitle">Bulk add() of 100K vectors into an empty index (one-time rotation/codebook init included). Median of 5 runs.</text>
+  <text x="{margin["left"]}" y="32" class="title">Online Insert Latency \u2014 {xe(hw_label)}</text>
+  <text x="{margin["left"]}" y="52" class="subtitle">Per-vector add() latency on a warm 100K-vector index, single-threaded, median of 5 runs. FAISS adds into the trained, populated IndexPQFastScan.</text>
   {body}
 </svg>
 """
@@ -301,56 +262,103 @@ def write_insert_panel(arch, hw_label, thread_key, thread_label, filename):
     print(f"wrote {out}")
 
 
-def write_remove_panel(arch, hw_label, thread_key, thread_label, filename):
-    groups = []
+def log_paired_panel(px, py, pw, ph, panel_title, groups, y_lo, y_hi, value_fmt):
+    # Log10 y-axis variant of paired_panel for quantities spanning orders
+    # of magnitude. Gridlines at decades; bars rise from y_lo.
+    import math as _m
+    lo, hi = _m.log10(y_lo), _m.log10(y_hi)
+
+    def ypx(v):
+        return py + ph - (_m.log10(v) - lo) / (hi - lo) * ph
+
+    parts = [f'<text x="{px}" y="{py - 14}" class="panel">{xe(panel_title)}</text>']
+    d = int(round(lo))
+    while d <= hi + 1e-9:
+        v = 10 ** d
+        y = ypx(v)
+        lbl = f"{v:g}" if v < 1000 else f"{v/1000:g}k"
+        parts.append(f'<line x1="{px}" y1="{y:.1f}" x2="{px + pw}" y2="{y:.1f}" stroke="{C["grid"]}" stroke-width="1" />')
+        parts.append(f'<text x="{px - 10}" y="{y + 4:.1f}" text-anchor="end" class="tick">{lbl}</text>')
+        d += 1
+    parts.append(f'<line x1="{px}" y1="{py + ph:.1f}" x2="{px + pw}" y2="{py + ph:.1f}" stroke="{C["baseline"]}" stroke-width="1.5" />')
+
+    n = len(groups)
+    band = pw / n
+    bar_w = min(44, band * 0.32)
+    gap = 6
+    for i, g in enumerate(groups):
+        cx = px + band * i + band / 2
+        for xbar, key, accent in ((cx - bar_w - gap / 2, "tq", True), (cx + gap / 2, "faiss", False)):
+            v = g[key]
+            y = ypx(v)
+            h = py + ph - y
+            stroke = f' stroke="{C["tq_stroke"]}" stroke-width="1.5"' if accent else ""
+            fill = C["tq"] if accent else C["faiss"]
+            cls = "value-accent" if accent else "value"
+            parts.append(f'<rect x="{xbar:.1f}" y="{y:.1f}" width="{bar_w}" height="{h:.1f}" rx="6" fill="{fill}"{stroke} />')
+            parts.append(f'<text x="{xbar + bar_w/2:.1f}" y="{y - 6:.1f}" text-anchor="middle" class="{cls}">{xe(value_fmt(v))}</text>')
+        label_y = py + ph + 22
+        primary, _, secondary = g["label"].partition("|")
+        parts.append(f'<text x="{cx:.1f}" y="{label_y}" text-anchor="middle" class="label">{xe(primary)}</text>')
+        if secondary:
+            parts.append(f'<text x="{cx:.1f}" y="{label_y + 15}" text-anchor="middle" class="secondary">{xe(secondary)}</text>')
+    return "\n".join(parts)
+
+
+def write_online_remove_panel(arch, hw_label, filename):
+    # Two panels: per-op remove-by-id latency at n=1 (steady per-op rate)
+    # and n=100 (first 100 removes on a fresh index, per op), TurboQuant
+    # IdMapIndex.remove vs FAISS IndexIDMap(IndexPQFastScan).remove_ids.
+    # The y-axis is log10: TurboQuant's swap-and-pop sits near a
+    # microsecond while FAISS's per-call compaction sits at milliseconds.
+    import math as _m
+    single, first100 = [], []
     for dim in (1536, 3072):
         for bw in (2, 4):
-            entry = load_json(f"speed_remove_d{dim}_{bw}bit_{arch}_{thread_key}.json")
-            groups.append(
-                {
-                    "label": f"d={dim}|{bw}-bit",
-                    "tq": entry["tq_idmap_remove_us_per_op"],
-                    "faiss": entry["tq_swap_remove_us_per_op"],
-                }
-            )
+            e = load_json(f"speed_remove_d{dim}_{bw}bit_{arch}_st.json")
+            lbl = f"d={dim}|{bw}-bit"
+            single.append({"label": lbl, "tq": e["tq_remove_1_us"], "faiss": e["faiss_remove_1_us"]})
+            first100.append({"label": lbl, "tq": e["tq_remove_100_us"] / 100, "faiss": e["faiss_remove_100_us"] / 100})
 
-    width, height = 900, 460
-    margin = {"top": 82, "right": 32, "bottom": 108, "left": 84}
-    pw = width - margin["left"] - margin["right"]
+    width, height = 1100, 470
+    margin = {"top": 92, "right": 24, "bottom": 100, "left": 84}
     ph = height - margin["top"] - margin["bottom"]
-    px = margin["left"]
     py = margin["top"]
+    inner = width - margin["left"] - margin["right"]
+    panel_gap = 64
+    panel_w = (inner - panel_gap) / 2
 
-    # nice_ceil floors at 1, far above these sub-microsecond bars — scale
-    # into its working range and back.
-    y_max = nice_ceil(max(max(g["tq"], g["faiss"]) for g in groups) * 1.22 * 100) / 100
+    def us_val(v):
+        if v >= 1000:
+            return f"{v/1000:.1f}ms"
+        return f"{v:.0f}" if v >= 20 else f"{v:.2f}"
 
-    parts = [
-        paired_panel(
-            px, py, pw, ph, thread_label, groups,
-            tick_fmt=lambda v: f"{v:.1f}",
-            value_fmt=lambda v: f"{v:.2f}",
-            y_max=y_max,
-        ),
-        f'<text x="26" y="{py + ph/2}" transform="rotate(-90, 26, {py + ph/2})" class="axis">µs / op</text>',
-    ]
+    all_vals = [g[k] for gs in (single, first100) for g in gs for k in ("tq", "faiss")]
+    y_lo = 0.1
+    y_hi = 10 ** _m.ceil(_m.log10(max(all_vals) * 1.2))
 
+    parts = []
+    for i, (title, groups) in enumerate([("Single remove (n=1)", single), ("First 100 removes, per op (n=100)", first100)]):
+        px = margin["left"] + i * (panel_w + panel_gap)
+        parts.append(log_paired_panel(px, py, panel_w, ph, title, groups, y_lo, y_hi, us_val))
+
+    parts.append(
+        f'<text x="26" y="{py + ph/2}" transform="rotate(-90, 26, {py + ph/2})" class="axis">\u00b5s / op (log scale)</text>'
+    )
     legend_y = height - 26
     lx = margin["left"]
-    parts.append(
-        f'<rect x="{lx}" y="{legend_y - 10}" width="14" height="14" rx="3" fill="{C["tq"]}" stroke="{C["tq_stroke"]}" stroke-width="1.5" />'
-    )
+    parts.append(f'<rect x="{lx}" y="{legend_y - 10}" width="14" height="14" rx="3" fill="{C["tq"]}" stroke="{C["tq_stroke"]}" stroke-width="1.5" />')
     parts.append(f'<text x="{lx + 22}" y="{legend_y + 1}" class="legend" style="fill: {C["tq_text"]};">IdMapIndex.remove</text>')
     parts.append(f'<rect x="{lx + 190}" y="{legend_y - 10}" width="14" height="14" rx="3" fill="{C["faiss"]}" />')
-    parts.append(f'<text x="{lx + 212}" y="{legend_y + 1}" class="legend">TurboQuantIndex.swap_remove</text>')
+    parts.append(f'<text x="{lx + 212}" y="{legend_y + 1}" class="legend">FAISS IndexIDMap(FastScan).remove_ids</text>')
 
     body = "\n".join(parts)
     svg = f"""<?xml version="1.0" encoding="UTF-8"?>
-<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}" role="img" aria-label="Removal Latency — {xe(hw_label)} — {xe(thread_label)}">
+<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}" role="img" aria-label="Online Remove Latency \u2014 {xe(hw_label)}">
   {style_block()}
   <rect width="100%" height="100%" fill="#ffffff" />
-  <text x="{margin["left"]}" y="32" class="title">Removal Latency — {xe(hw_label)} — {xe(thread_label)}</text>
-  <text x="{margin["left"]}" y="52" class="subtitle">100K vectors, 50K removals in seeded random order, median of 5 runs. Both paths are O(1) swap-and-pop; the gap is the id-map bookkeeping.</text>
+  <text x="{margin["left"]}" y="32" class="title">Online Remove Latency \u2014 {xe(hw_label)}</text>
+  <text x="{margin["left"]}" y="52" class="subtitle">Per-op remove-by-id latency on a fresh 100K-vector index, single-threaded, median of 5 runs, log-scale axis. FAISS remove_ids compacts the stored codes on every call, so its per-op cost scales with index size.</text>
   {body}
 </svg>
 """
@@ -666,19 +674,15 @@ if __name__ == "__main__":
     write_speed_panel("x86", "x86 (Intel Sapphire Rapids, 8 vCPUs)", "mt", "Multi-threaded",
                       tick_fmt=lambda v: f"{v:.2f}", value_fmt=lambda v: f"{v:.3f}",
                       filename="x86_speed_mt.svg")
-    # Insert/remove figures, per architecture.
-    write_insert_panel("arm", "ARM (GCP c4a-standard-8, Google Axion, 8 vCPUs)", "st", "Single-threaded",
-                       filename="arm_insert_st.svg")
-    write_insert_panel("arm", "ARM (GCP c4a-standard-8, Google Axion, 8 vCPUs)", "mt", "Multi-threaded",
-                       filename="arm_insert_mt.svg")
-    write_remove_panel("arm", "ARM (GCP c4a-standard-8, Google Axion, 8 vCPUs)", "st", "Single-threaded",
-                       filename="arm_remove_st.svg")
-    write_insert_panel("x86", "x86 (Intel Sapphire Rapids, 8 vCPUs)", "st", "Single-threaded",
-                       filename="x86_insert_st.svg")
-    write_insert_panel("x86", "x86 (Intel Sapphire Rapids, 8 vCPUs)", "mt", "Multi-threaded",
-                       filename="x86_insert_mt.svg")
-    write_remove_panel("x86", "x86 (Intel Sapphire Rapids, 8 vCPUs)", "st", "Single-threaded",
-                       filename="x86_remove_st.svg")
+    # Insert/remove online-latency figures, per architecture.
+    write_online_insert_panel("arm", "ARM (GCP c4a-standard-8, Google Axion, 8 vCPUs)",
+                              filename="arm_insert_online_st.svg")
+    write_online_insert_panel("x86", "x86 (Intel Sapphire Rapids, 8 vCPUs)",
+                              filename="x86_insert_online_st.svg")
+    write_online_remove_panel("arm", "ARM (GCP c4a-standard-8, Google Axion, 8 vCPUs)",
+                              filename="arm_remove_online_st.svg")
+    write_online_remove_panel("x86", "x86 (Intel Sapphire Rapids, 8 vCPUs)",
+                              filename="x86_remove_online_st.svg")
     # Save/load (persist) figures, per architecture.
     write_persist_panel("arm", "ARM (GCP c4a-standard-8, Google Axion, 8 vCPUs)", "st", "Single-threaded",
                         filename="arm_persist_st.svg")
