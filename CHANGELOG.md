@@ -15,6 +15,59 @@ appears under each surface it touches.
 
 #### Fixed
 
+- **aarch64: crossing the single-query block-parallel gate no longer makes
+  the same query slower (#493).** At `n_blocks >= 1024` (n ≥ 32768) an
+  unmasked `nq=1` search switches to the block-parallel scan, which ran
+  the full 32-lane top-k loop for every block — while the sub-gate kernel
+  it replaces has a whole-block SIMD-max prune that skips that loop once
+  the heap is warm. The result was a discontinuity exactly at the gate:
+  measured at dim=128, 4-bit, k=10, one thread, 77.9 µs at 1023 blocks
+  against 105.9 µs at 1024 — 36% slower for 0.1% more data. The prune is
+  now mirrored into the parallel scan: 105.9 → 84.9 µs at the gate, 141.7
+  → 120.2 µs at 1500 blocks, 183.9 → 166.8 µs at 2048, and the
+  discontinuity is gone (85.7 µs at 1023 blocks against 84.9 at 1024).
+  Multi-threaded is neutral to ~5% better. Results are unchanged — a block
+  whose maximum is at or below the heap minimum holds no lane that could
+  enter the heap.
+- **A v6 `load()` no longer commits memory proportional to the file's
+  apparent length (#487).** Two allocations were sized from the file
+  rather than from what its header declares. The tail (scales, TQ+
+  trailer, `.tvim` id table) took the whole remainder past the codes
+  section, so a genuine 2450-byte index padded into a 4 GiB sparse file
+  loaded correctly but peaked at 8.2 GB; the tail is now sized from
+  declared content and still capped by the real remainder, so a truncated
+  file fails exactly where it did. Separately, `load` / `load_id_map` read
+  the entire file *before* comparing four bytes to the magic, so pointing
+  them at a 4 GiB non-turbovec file cost 4 GB of RSS to produce "wrong
+  magic" — the magic is now checked from a 4 KB prefix, which reproduces
+  every rejection message (v1's missing magic, a v7 container, the
+  versions 1–4 rebuild error) without the read. `write()` always emits
+  exact-length files, so this only ever bit on files turbovec did not
+  write — but a sparse file makes a large apparent length nearly free to
+  fabricate. Trailing bytes are still accepted, matching `from_bytes` and
+  `load_from_reader`.
+- **The first small add after a load, a bulk add or a search no longer
+  permanently doubles the codes buffer (#501).** `Vec::reserve` grows
+  amortized — on `len == capacity` it takes `max(len + additional,
+  capacity * 2)` — so appending a single row to a tight buffer allocated a
+  second full copy and kept it as capacity slack for the index's lifetime,
+  since every later small add then fit inside it. A load, a `from_bytes`,
+  a one-shot bulk add and a `search`/`prepare` all leave exactly that
+  tight state, which made "load a large index, add a small delta" — the
+  workflow v7 `sync()` exists for — the worst case: a 2.4 GB index grew by
+  2.4 GB on its first incremental add. (The issue also measured a second
+  copy from the packed rows; since #475 an add drops those at its commit
+  point, so that one is now a peak-heap cost during the add rather than
+  retained capacity — still worth removing, and covered by a peak-heap
+  test.) All four growth sites (codes, scales, and the blocked
+  cache on both the lazy-append and eager-patch paths) now reserve close
+  to what they need when the append is at most an eighth of current
+  length, keeping an eighth as headroom so a run of small adds stays
+  amortized — the reserve is skipped entirely when the spare capacity
+  already covers the append, which is what makes that headroom usable
+  instead of merely requested. Larger appends keep amortized doubling unchanged, which is
+  what repeated same-size batch adds rely on for O(1) growth; add
+  throughput is unchanged single- and multi-threaded.
 - **The stale-temp sweep works for long destination filenames.** A save
   writes to a `<dest>.tmp.…` sibling, and `tmp_sibling` truncates the
   destination's basename when the whole name would exceed NAME_MAX — but
@@ -1824,6 +1877,31 @@ appears under each surface it touches.
 
 #### Fixed
 
+- **Agno: `async_insert`, `upsert` and `async_upsert` now fail before
+  embedding when `create()` was not called (#473).** Sync `insert()`
+  already refused at that boundary, but the other three embedded the
+  batch first and only discovered the uninitialized store when they
+  delegated into it — so a caller who forgot `create()` still paid for
+  the embedding work (a paid API call, GPU time) on a write that could
+  never succeed. All four now check the same boundary first, with the
+  same error. Empty batches are unchanged and remain a no-op.
+- **A deletion no longer stalls for seconds while searches are running
+  (#484).** `swap_remove` and `IdMapIndex.remove` route through a
+  GIL-aware write lock that, when contended, waited for the lock
+  *detached*, immediately dropped it, and retried *attached*. That threw
+  away `RwLock`'s queueing fairness: `search` holds the read lock for its
+  whole detached duration, so the retry had to win an unsynchronised race
+  against every searcher, and one background searcher was enough to
+  starve a delete. Measured at n=400k, dim=128: eight removals took 3.35 s
+  with a single searcher (worst 3352 ms) and 17.63 s with four (p50 2228
+  ms) — against 66 ns uncontended — and an earlier 8-searcher probe never
+  returned at all. The helper now takes a closure and performs the removal
+  *inside* one detached blocking acquire, inheriting the queueing the
+  other write paths (`add`, `prepare`, `__len__`, `remove`'s slow path)
+  have always used. The same probes now take 0.22 s (worst 37 ms) and
+  0.76 s (p50 101 ms); `IdMapIndex.remove` under four searchers goes from
+  22.93 s (worst 10 280 ms) to 0.29 s (worst 55 ms). The uncontended
+  `try_write` fast path is unchanged and still costs 0.34 us/op.
 - **Copying or saving a warming-up index that has been drained to zero
   no longer commits the copy to identity calibration forever (#418).**
   Deleting every document from a store that never reached 1000 vectors

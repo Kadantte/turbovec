@@ -1490,3 +1490,177 @@ mod calibrate_fit_unwind {
         assert_ne!(idx.tqplus_shift(), &pair[..]);
     }
 }
+
+/// A tiny add must not double a tight buffer (#501).
+///
+/// `Vec::reserve` grows amortized: on `len == capacity` it takes
+/// `max(len + additional, capacity * 2)`, so one appended row to a tight
+/// codes buffer allocates a second full copy and keeps it as capacity
+/// slack for the index's lifetime — every later small add fits inside it,
+/// so nothing ever releases it. A load, a `from_bytes`, a one-shot bulk
+/// add and a `search`/`prepare` all leave exactly that tight state.
+///
+/// These assert on capacity rather than on RSS deliberately: the slack is
+/// a live allocation the allocator is free to satisfy from an arena it
+/// already holds, so process RSS does not reliably move when it appears.
+mod tight_buffer_growth {
+    use crate::TurboQuantIndex;
+
+    fn rows(n: usize, dim: usize, seed: u64) -> Vec<f32> {
+        let mut v = vec![0.0f32; n * dim];
+        let mut s = seed | 1;
+        for x in v.iter_mut() {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            *x = ((s >> 40) as f32 / (1u64 << 23) as f32) - 0.5;
+        }
+        v
+    }
+
+    /// The scales buffer grows on the same `reserve` and is *not* dropped
+    /// by the add, so its capacity is directly observable afterwards.
+    ///
+    /// The packed codes buffer used to be checkable here too, but since
+    /// #475 an add drops it at its commit point — so post-add there is no
+    /// packed buffer to measure. The reserve still bounds how large it
+    /// gets *during* the add, which is peak heap rather than retained
+    /// capacity; `adversarial_load_memory` covers that.
+    #[test]
+    fn one_row_added_to_a_tight_scales_buffer_does_not_double_it() {
+        let dim = 768;
+        let mut idx = TurboQuantIndex::new(dim, 2).unwrap();
+        idx.add_2d(&rows(4096, dim, 1), dim).unwrap();
+
+        let scales_len = idx.scales.len();
+        assert_eq!(scales_len, 4096, "one scale per row");
+        idx.add_2d(&rows(1, dim, 2), dim).unwrap();
+        let scales_cap = idx.scales.capacity();
+
+        // Unfixed this lands at exactly 2x. The bound allows the 1/8
+        // headroom the fix reserves, plus the row itself.
+        assert!(
+            scales_cap < scales_len + scales_len / 4,
+            "one row doubled the scales buffer: len {scales_len} -> capacity {scales_cap}"
+        );
+    }
+
+    #[test]
+    fn one_row_added_to_a_tight_blocked_cache_does_not_double_it() {
+        let dim = 768;
+        let mut idx = TurboQuantIndex::new(dim, 2).unwrap();
+        idx.add_2d(&rows(4096, dim, 1), dim).unwrap();
+        // Warm the search layout, which is what a search/prepare leaves
+        // behind and what the eager add path then patches.
+        idx.prepare();
+
+        let cache_len = idx.blocked.get().expect("blocked after prepare").data.len();
+        idx.add_2d(&rows(1, dim, 2), dim).unwrap();
+        let cache_cap = idx.blocked.get().expect("blocked").data.capacity();
+
+        assert!(
+            cache_cap < cache_len + cache_len / 4,
+            "one row doubled the blocked cache: len {cache_len} -> capacity {cache_cap}"
+        );
+    }
+
+    /// The exact path must not apply to appends that are a meaningful
+    /// fraction of the buffer: repeated large adds rely on amortized
+    /// doubling for O(1) growth, and reserving exactly each time would
+    /// make a run of them quadratic.
+    ///
+    /// Asserted on the helper rather than through `add`, because for an
+    /// append of exactly the current length the two policies produce the
+    /// same number: `max(len + additional, cap * 2)` is `2 * len` either
+    /// way. A half-length append separates them — amortized still doubles,
+    /// exact would stop at `len + additional`.
+    #[test]
+    fn a_large_append_keeps_amortized_doubling() {
+        let mut v: Vec<u8> = vec![0; 1000];
+        v.shrink_to_fit();
+        assert_eq!(v.capacity(), 1000, "test needs a tight buffer to start");
+        crate::reserve_mostly_exact(&mut v, 500);
+        assert_eq!(
+            v.capacity(),
+            2000,
+            "a half-length append must still double, not reserve exactly"
+        );
+    }
+
+    /// A run of small appends must reallocate a handful of times, not
+    /// once per append.
+    ///
+    /// The headroom is measured from the current `len`, so re-requesting
+    /// it on every call targets just above the capacity the previous call
+    /// produced — which reallocates every time and makes a run of small
+    /// adds O(n) per add. Wall-clock did not catch this (the per-add cost
+    /// is small next to encode), so count reallocations directly by
+    /// watching the pointer and capacity.
+    #[test]
+    fn a_run_of_small_appends_does_not_reallocate_every_time() {
+        let mut v: Vec<u8> = vec![0; 4096 * 768 / 8];
+        v.shrink_to_fit();
+        let (mut ptr, mut cap) = (v.as_ptr(), v.capacity());
+        let mut reallocs = 0;
+        for _ in 0..64 {
+            crate::reserve_mostly_exact(&mut v, 96);
+            v.extend(std::iter::repeat_n(0u8, 96));
+            if v.as_ptr() != ptr || v.capacity() != cap {
+                reallocs += 1;
+                ptr = v.as_ptr();
+                cap = v.capacity();
+            }
+        }
+        assert!(
+            reallocs <= 2,
+            "64 small appends reallocated {reallocs} times; the headroom is being \
+             requested but never used"
+        );
+    }
+
+    /// An append that already fits must not touch the allocation at all.
+    ///
+    /// `pack::append_lanes` passes `0` whenever the appended rows land in
+    /// the already-allocated partial tail block — 31 of every 32 one-row
+    /// adds — and the blocked cache is capacity-tight straight after a v6
+    /// load. Growing there would reallocate the whole codes buffer on the
+    /// first small add after a load, which is the workflow this all
+    /// exists to protect.
+    #[test]
+    fn an_append_that_already_fits_does_not_reallocate() {
+        let mut v: Vec<u8> = vec![0; 1000];
+        v.shrink_to_fit();
+        let before = (v.as_ptr(), v.capacity());
+        crate::reserve_mostly_exact(&mut v, 0);
+        assert_eq!(
+            (v.as_ptr(), v.capacity()),
+            before,
+            "a zero-length append grew a tight buffer"
+        );
+
+        // And with real spare capacity, an append that fits inside it.
+        v.reserve_exact(64);
+        let before = (v.as_ptr(), v.capacity());
+        crate::reserve_mostly_exact(&mut v, 32);
+        assert_eq!(
+            (v.as_ptr(), v.capacity()),
+            before,
+            "an append that fits the spare capacity still reallocated"
+        );
+    }
+
+    /// The other side of the same boundary: a small append reserves close
+    /// to what it needs instead of doubling.
+    #[test]
+    fn a_small_append_reserves_close_to_exact() {
+        let mut v: Vec<u8> = vec![0; 1000];
+        v.shrink_to_fit();
+        assert_eq!(v.capacity(), 1000, "test needs a tight buffer to start");
+        crate::reserve_mostly_exact(&mut v, 1);
+        assert_eq!(
+            v.capacity(),
+            1126,
+            "a one-byte append must reserve it plus 1/8 headroom, not double"
+        );
+    }
+}

@@ -3348,11 +3348,58 @@ pub(crate) fn search(
                     );
                 }
             }
-            // No whole-block prune here, unlike `neon_block_topk_update`, and
-            // H116 measured that the omission costs nothing: adding one was
-            // x1.009 at nq=1 ST and x0.987 at MT. This cell is memory-bound
-            // (P42: 95% of the single-core streaming roofline), so the scalar
-            // lane loop runs inside memory latency that is being paid anyway.
+            // Whole-block prune, mirroring `neon_block_topk_update`: skip
+            // the lane loop when the block's max cannot beat the current
+            // heap minimum. The heap is not cold here — with k <= 32 it
+            // fills within this worker's first block — so the prune is
+            // eligible from block 1 onward.
+            //
+            // H116 measured adding this as neutral (x1.009 ST, x0.987 MT)
+            // and the omission was left documented as harmless. That
+            // conclusion does not hold at the block-parallel gate: crossing
+            // `SINGLE_QUERY_PARALLEL_MIN_BLOCKS` switches nq=1 from the
+            // pruned sub-gate path to this one, and the identical query got
+            // measurably slower for 0.1% more data (#493).
+            //
+            // Safe by construction: a block whose maximum is at or below
+            // the heap minimum contains no lane that could enter the heap,
+            // masked or not. Padding lanes hold NEG_INFINITY (the kernels
+            // guarantee it), and reading them could only raise the max,
+            // which makes the prune fire less often — never more.
+            if heap.len() >= k {
+                // Offsets are written out as constants rather than as
+                // `p.add(i * 4)` in a loop. This body is
+                // `cfg(target_arch = "aarch64")`, so on the x86 mutation
+                // runner it is compiled out and *any* mutant inside it
+                // survives vacuously, however well the logic is tested
+                // (#421) — `replace * with + in scan_range_neon` is
+                // exactly what the gate reported. A literal offset is not
+                // an operator a mutant can rewrite. Same reason
+                // `pack::native_transform` puts its `cfg` on the call
+                // rather than on a function body: leave nothing mutable
+                // in code the gate cannot execute.
+                //
+                // Written as one `max` tree over eight loads, which is
+                // what the loop compiled to anyway — the `chunks_exact`
+                // form measured consistently slower at the gate (90.6 vs
+                // 84.9 us at 1024 blocks).
+                //
+                // SAFETY: NEON is baseline on aarch64; `out[0]` is exactly
+                // BLOCK (32) f32 lanes, so all eight 4-wide loads are in
+                // bounds.
+                let block_max = unsafe {
+                    use std::arch::aarch64::*;
+                    let p = out[0].as_ptr();
+                    let m0 = vmaxq_f32(vld1q_f32(p), vld1q_f32(p.add(4)));
+                    let m1 = vmaxq_f32(vld1q_f32(p.add(8)), vld1q_f32(p.add(12)));
+                    let m2 = vmaxq_f32(vld1q_f32(p.add(16)), vld1q_f32(p.add(20)));
+                    let m3 = vmaxq_f32(vld1q_f32(p.add(24)), vld1q_f32(p.add(28)));
+                    vmaxvq_f32(vmaxq_f32(vmaxq_f32(m0, m1), vmaxq_f32(m2, m3)))
+                };
+                if block_max <= heap_min {
+                    continue;
+                }
+            }
             for (lane, &s) in out[0][..end - base].iter().enumerate() {
                 if MASKED && !mask_allows(mask.expect("MASKED implies a mask"), base + lane) {
                     continue;
