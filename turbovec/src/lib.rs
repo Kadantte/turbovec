@@ -446,6 +446,50 @@ fn retain_scratch(scratch: &mut Vec<f32>, prev: usize, want: usize) -> usize {
     want
 }
 
+/// Reserve for an append without doubling a tight buffer for a tiny one.
+///
+/// `Vec::reserve` grows amortized: on a buffer with `len == capacity` it
+/// takes `max(len + additional, capacity * 2)`, so appending one row to a
+/// tight 2.4 GB codes buffer allocates 4.8 GB and keeps the difference as
+/// capacity slack forever — every later small add fits inside it, so it
+/// is never released (#501). A load, a `from_bytes`, a one-shot bulk add
+/// and a `search`/`prepare` all leave exactly that tight state, which
+/// makes "load a large index, add a small delta" — the workflow v7
+/// `sync()` exists for — the worst case.
+///
+/// Doubling is still right when the append is a meaningful fraction of
+/// the buffer: repeated same-size adds depend on it for amortized O(1)
+/// growth, and #333's scratch-retention behaviour assumes it. So the
+/// exact path applies only to appends of at most an eighth of current
+/// length, and even then leaves an eighth of headroom, which keeps a run
+/// of small adds amortized (a 1.125x growth factor) while bounding the
+/// dead slack to something proportional to the append pattern rather than
+/// to the whole index.
+pub(crate) fn reserve_mostly_exact<T>(v: &mut Vec<T>, additional: usize) {
+    let len = v.len();
+    // Nothing to do when the spare capacity already covers the append —
+    // and this guard is what makes the headroom below *usable* rather
+    // than merely requested. `reserve_exact` targets `len + additional +
+    // headroom`, and `headroom` is measured from the current `len`, so a
+    // call on every append re-targets just above the capacity the last
+    // one produced and reallocates every single time: 64 one-row appends
+    // to a tight 4096x768 buffer went from 1 reallocation to 64, moving
+    // 202.9 MB instead of 3.1 MB. That is O(n) per add — the opposite of
+    // this function's purpose. It also made `additional == 0` grow the
+    // buffer for an append needing no bytes, which is the common case in
+    // `pack::append_lanes` (a row lands in the already-allocated partial
+    // tail block 31 times out of 32).
+    if v.capacity() - len >= additional {
+        return;
+    }
+    let headroom = len / 8;
+    if additional <= headroom {
+        v.reserve_exact(additional + headroom);
+    } else {
+        v.reserve(additional);
+    }
+}
+
 /// Top-`k` results for a batch of queries, as returned by
 /// [`TurboQuantIndex::search`] / [`TurboQuantIndex::search_with_mask`].
 ///
@@ -1015,6 +1059,9 @@ impl TurboQuantIndex {
             };
             let cache = self.blocked.get_mut().expect("blocked present");
             cache.data.truncate(first_block * block_bytes);
+            // `extend_from_slice` reserves amortized, doubling the cache
+            // for a one-block patch on a tight buffer (#501).
+            reserve_mostly_exact(&mut cache.data, patch.len());
             cache.data.extend_from_slice(&patch);
             cache.n_blocks = new_n_blocks;
         }
