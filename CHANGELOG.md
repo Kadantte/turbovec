@@ -15,6 +15,16 @@ appears under each surface it touches.
 
 #### Fixed
 
+- **The stale-temp sweep works for long destination filenames.** A save
+  writes to a `<dest>.tmp.…` sibling, and `tmp_sibling` truncates the
+  destination's basename when the whole name would exceed NAME_MAX — but
+  the sweep that reclaims temps leaked by a killed writer matched on the
+  *untruncated* basename, so past about 234 bytes it never matched
+  anything. A crash-looping writer's temps accumulated with nothing to
+  reclaim them, which is the failure the sweep exists to prevent. The
+  sweep now recognises the truncated form, identified precisely (a stem
+  that prefixes the destination's basename, on a name that lands exactly
+  on NAME_MAX) so it cannot reach an unrelated destination's temps.
 - **A finite-but-unusable calibration no longer loads clean and NaNs every
   score.** `tqplus_scale` was checked for `finite && > 0`, so a value like
   `1e-40` was accepted by `from_parts` and by every `.tv`/`.tvim` loader —
