@@ -41,7 +41,20 @@ from turbovec import IdMapIndex
 store = TurboQuantVectorStore(embeddings, index=IdMapIndex(1536, 4))
 ```
 
-`bit_width` is `2` or `4` and is fixed once the index is created.
+`bit_width` is one of `{2, 3, 4}` and is fixed once the index is created.
+
+## Similarity modes
+
+The `similarity` keyword (on the constructor and `from_texts`/`afrom_texts`) selects how scores are computed. It is fixed for the lifetime of the store:
+
+- **`"cosine"` (default).** Document vectors are L2-normalized before they reach the quantized index and query vectors are normalized before search, so scores are true cosine similarity in `[-1, 1]` and ranking matches `InMemoryVectorStore` regardless of embedding magnitude. Zero vectors are kept as-is and score `0` against everything (matching the reference's behavior).
+- **`"dot_product"`.** Vectors are stored and queried raw: scores are raw inner products and ranking is magnitude-aware. The `(sim + 1) / 2` relevance mapping still applies for continuity, but it is **not** clamped to `[0, 1]` in this mode — an unbounded inner product has no calibrated relevance, so clamping would silently collapse every score `>= 1.0` onto exactly `1.0` and defeat `score_threshold` retrieval. Requesting a relevance-score fn in this mode emits a `UserWarning`, and out-of-range values reach LangChain's own out-of-range warning. `score_threshold` retrieval is only meaningful in this mode if your embeddings are unit-normalized upstream.
+
+```python
+store = TurboQuantVectorStore(embeddings, similarity="dot_product")
+```
+
+The `similarity` keyword is a turbovec extension: `InMemoryVectorStore` computes cosine unconditionally, so code written against the reference behaves identically under the default.
 
 ## Adding with explicit ids
 
@@ -62,6 +75,8 @@ store.add_documents([
 
 If an id is already present, `add_texts` **upserts** — the existing entry is removed and the new one added with the same id. This matches the typical user expectation that re-indexing a document with the same id should replace it, not duplicate it.
 
+Ids must be `str`. A `None` entry in an explicit ids list is replaced with a generated UUID; any other non-`str` id (including `bool`/`int`) raises `TypeError` — naming the offending id, its type, and its position — before anything is stored. This is stricter than `InMemoryVectorStore`, which accepts non-str ids and then corrupts them through JSON persistence (an `int` `2` coexisting with the `str` `"2"` collapses to one document across `dump`/`load`).
+
 Async equivalents (`aadd_texts`, `aadd_documents`) use the embedding model's `aembed_documents` so they benefit from concurrent embedding generation when the model supports it.
 
 ## Search
@@ -80,11 +95,13 @@ qvec /= np.linalg.norm(qvec)
 docs = store.similarity_search_by_vector(qvec.tolist(), k=5)
 ```
 
-Scores are raw inner products. Because vectors are L2-normalized on insert, inner product equals cosine similarity — higher is better, range `[-1, 1]`.
+Under the default `similarity="cosine"` mode, scores are cosine similarity — higher is better, range `[-1, 1]` — for embeddings of any magnitude (see [Similarity modes](#similarity-modes)).
 
-`similarity_search_with_relevance_scores` and `as_retriever(search_type="similarity_score_threshold")` work: the raw cosine is mapped to `[0, 1]` via `(sim + 1) / 2` (clamped to absorb the tiny overshoot caused by quantization noise).
+`similarity_search_with_relevance_scores` and `as_retriever(search_type="similarity_score_threshold")` work: the cosine is mapped to `[0, 1]` via `(sim + 1) / 2` (clamped to absorb the tiny overshoot caused by quantization noise). The clamp is cosine-only — see [Similarity modes](#similarity-modes) for `dot_product`.
 
-Async equivalents (`asimilarity_search`, `asimilarity_search_with_score`, `asimilarity_search_by_vector`, `aget_by_ids`) are all implemented.
+`similarity_search_with_score_by_vector` returns `(document, score)` pairs for a precomputed query vector.
+
+Async equivalents (`asimilarity_search`, `asimilarity_search_with_score`, `asimilarity_search_by_vector`, `asimilarity_search_with_score_by_vector`, `aget_by_ids`) are all implemented.
 
 ## Filters
 
@@ -102,7 +119,9 @@ docs = store.similarity_search(
 )
 ```
 
-The callable form matches the `Callable[[Document], bool]` convention used by `InMemoryVectorStore`, so predicates ported from there work unchanged.
+The callable form matches the `Callable[[Document], bool]` convention used by `InMemoryVectorStore`, so predicates ported from there work unchanged. The dict form is a turbovec convenience on top of it — `InMemoryVectorStore` itself takes callables only.
+
+A dict entry requires the key to be **present**: `filter={"source": None}` matches documents that store `source=None`, not documents with no `source` key at all. To match on absence, use the callable form (`lambda doc: "source" not in doc.metadata`).
 
 Filters are resolved to an id allowlist **before** scoring; the kernel only ever inserts allowed documents into the per-query heap. You get up to `k` results from the filtered set, never fewer than `k` because the filter happened to exclude the top-scoring candidates.
 
@@ -135,9 +154,42 @@ Writes two files under the given folder path:
 - `index.tvim` — the `IdMapIndex` payload (see [api.md](../api.md#tvim--idmapindex)).
 - `docstore.json` — JSON-encoded document text, metadata, and id maps.
 
+The similarity mode is recorded in `docstore.json` and restored by `load`. A store folder written before the mode field existed holds raw, unnormalized vectors, so it loads in `"dot_product"` mode — exactly the scoring it was written under — with no migration needed.
+
 Document metadata must be JSON-serializable — the same constraint `InMemoryVectorStore.dump` imposes. If the `docstore.json` side-car is out of sync with its `index.tvim` (a partial copy, a stale backup, tampering), `load` raises a `ValueError` immediately rather than failing later with a `KeyError` at query time.
 
 `dump` is atomic with respect to the destination: both files are written to sibling temp files and moved into place, so a failed dump (e.g. non-JSON-serializable metadata) leaves a store previously saved at the same path intact.
+
+The store also supports `pickle` (e.g. for `multiprocessing` workers, provided the embedder is picklable) and `copy.copy` / `copy.deepcopy` — both copies return a fully independent store (there is no shallow copy that shares the underlying index).
+
+## Async
+
+Every read and write method has an `a*` counterpart: `aadd_texts`, `aadd_documents`, `asimilarity_search*`, `aget_by_ids`, `adelete`, `afrom_texts`.
+
+They run the index work on a worker thread (`asyncio.to_thread`), so the event loop stays responsive while a large add or search is in flight — the same contract as `VectorStore`'s own default async implementations, which offload via `run_in_executor`. The embedding step still awaits the embedder's own `aembed_*` coroutine.
+
+Cancellation is only partial, and the distinction matters:
+
+- `asyncio.wait_for`, `task.cancel()`, or a client disconnect returns control to the awaiting caller promptly — that part now works, where previously the coroutine ran to completion and the timeout never fired.
+- It does **not** decide what happened to the write. If the worker thread had already started, it runs the call to completion — work inside the Rust core is not interruptible at all — and the write commits in full. If the executor was saturated, the call is cancelled before it ever starts and nothing is written. **A cancelled write is "outcome unknown": it may have fully committed, or may never have begun.** Neither "it happened" nor "it did not happen" is safe to assume; make retries idempotent by passing explicit `ids`, or read back to find out.
+- What *is* guaranteed: the outcome is all-or-nothing. The store is never left in a torn state.
+- Timing out does not make the work go away: the loop's shutdown (`asyncio.run` on the way out, or `loop.shutdown_default_executor()`) waits for the worker thread, so a process that exits right after a short timeout can still block for the rest of the in-flight call.
+
+## Thread safety
+
+The store is safe for concurrent multi-threaded use:
+
+- **Reads run concurrently and scale.** `similarity_search*` and `get_by_ids` take no lock; the underlying index releases the GIL during scoring, so independent searches from multiple threads overlap and scale.
+- **Writes serialize.** `add_texts` / `add_documents`, `delete`, and `dump` (and their async counterparts) serialize on a per-store lock.
+- **A read overlapping a write sees pre- or post-write state** — never a torn one. Under heavy concurrent churn a search may transiently return fewer than `k` results (hits deleted mid-search are skipped).
+
+What the contract does *not* cover:
+
+- **No cross-call atomicity.** A caller-side check-then-act sequence (`get_by_ids` then `delete`, a count then a search) can interleave with other writers. Batch writes are not atomic with respect to readers: a search overlapping an upsert can briefly see a document id under both its old and new entry.
+- **`dump` serializes with writes** (so it always snapshots a consistent store); reads may proceed during a dump.
+- **The embedder is invoked outside the store's lock** and must be thread-safe itself.
+- **Two stores writing to the same path is safe.** Concurrent `dump` calls to one destination from several threads each publish atomically and the last writer wins; a caller never sees a torn file, and never an error caused only by the other writer. Which writer wins is not defined.
+- **Multi-process access is not supported.**
 
 ## Known limitations
 

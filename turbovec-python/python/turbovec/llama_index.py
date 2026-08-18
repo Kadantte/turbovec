@@ -1,19 +1,39 @@
 """LlamaIndex VectorStore backed by turbovec's quantized index.
 
 Install with: ``pip install turbovec[llama-index]``.
+
+Async methods run the index work on a worker thread
+(``asyncio.to_thread``) so the event loop stays responsive while a large
+add or query is in flight (issue #342) — ``BasePydanticVectorStore``'s
+defaults call straight into the sync body, which blocked the loop for the
+operation's full duration. Cancelling the awaiting task returns control
+to the caller immediately, but it does **not** decide the write's fate: a
+worker that already started runs to completion (work inside the Rust core
+is not interruptible), while a call still queued behind a saturated
+executor is cancelled before it ever runs. A cancelled write is therefore
+"outcome unknown" — it may have fully committed, or may never have begun.
+The one guarantee is that it is all-or-nothing: the store is never torn.
 """
 
 from __future__ import annotations
 
+import asyncio
+import copy as _copy
 import json
 import os
+import threading
 from pathlib import Path
 from typing import Any, List, Optional, Sequence
 
 import numpy as np
 
 from ._dedup import DuplicatePolicy, resolve_duplicates
-from ._persist import check_persisted_handles, check_sidecar_keysets
+from ._persist import (
+    check_persisted_handles,
+    check_schema_version,
+    check_sidecar_keysets,
+)
+from ._similarity import COSINE, DOT_PRODUCT, l2_normalize_rows, validate_similarity
 from ._turbovec import IdMapIndex
 from ._persist import atomic_save  # isort:skip
 
@@ -60,12 +80,16 @@ _DEFAULT_PERSIST_FNAME = "vector_store.json"
 _DEFAULT_VECTOR_STORE = "default"
 # Bump when the nodes.json shape changes; loader accepts the current
 # version plus any older versions whose missing fields we know how to
-# reconstruct (currently v1, written before full-node round-trip was
-# added — v1 entries are reconstructed as bare TextNodes with only
-# text + metadata + SOURCE relationship, matching the original
-# lossy behaviour rather than failing to load).
-_NODES_SCHEMA_VERSION = 2
-_NODES_SCHEMA_COMPAT = (1, 2)
+# reconstruct:
+#   - v1 was written before full-node round-trip was added — v1 entries
+#     are reconstructed as bare TextNodes with only text + metadata +
+#     SOURCE relationship, matching the original lossy behaviour rather
+#     than failing to load.
+#   - v1 and v2 predate the `similarity` field — those stores hold raw,
+#     unnormalized vectors, so they load in "dot_product" mode, which is
+#     exactly the scoring they were written under.
+_NODES_SCHEMA_VERSION = 3
+_NODES_SCHEMA_COMPAT = (1, 2, 3)
 
 # Enum members added after llama-index-core 0.11.0. Resolved with getattr
 # so that comparing against them never raises AttributeError on older
@@ -76,15 +100,123 @@ _TEXT_MATCH_INSENSITIVE = getattr(FilterOperator, "TEXT_MATCH_INSENSITIVE", None
 _CONDITION_NOT = getattr(FilterCondition, "NOT", None)
 
 
+def _payload_for(node: BaseNode) -> dict:
+    """The stored record for one node.
+
+    ``metadata`` holds the **JSON-coerced** view, not ``node.metadata``.
+    Filtering reads this field and ``_reconstruct_node`` rebuilds the
+    returned node from ``node_dict``, which is itself
+    ``model_dump(mode="json")`` — so keeping a raw copy here meant the
+    store filtered on values it would never hand back. A tuple filtered
+    as ``(1, 2)`` and returned as ``[1, 2]``; a datetime filtered as a
+    datetime and returned as an ISO string; and because ``persist()``
+    re-coerces through JSON, the same filter changed answers across a
+    save/reload cycle (#497).
+
+    ``SimpleVectorStore`` stores the coerced dict from
+    ``node_to_metadata_dict`` and filters on that same dict, so it is
+    self-consistent and persist-invariant. This matches it.
+    """
+    node_dict = node_to_metadata_dict(node, remove_text=False, flat_metadata=False)
+    # The coerced metadata lives inside the serialized node content; fall
+    # back to the raw mapping if a future llama-index shape omits it,
+    # since a filter on stale-but-present values beats crashing an add.
+    # The returned node is rebuilt from `node_dict` by
+    # `_reconstruct_node`, so the filter view has to come from the same
+    # place or stored and returned diverge — which is the whole point of
+    # #497. That means `_node_content`, not the node's own dump: at the
+    # declared floor the two disagree, and preferring the dump would
+    # reintroduce the divergence in the other direction.
+    coerced = None
+    content = node_dict.get("_node_content")
+    if isinstance(content, str):
+        try:
+            coerced = json.loads(content).get("metadata")
+        except (ValueError, AttributeError):
+            coerced = None
+    if not isinstance(coerced, dict):
+        coerced = dict(node.metadata)
+    return {
+        "metadata": coerced,
+        "ref_doc_id": node.ref_doc_id,
+        "node_dict": node_dict,
+    }
+
+
+def _validate_namespace(namespace: str) -> str:
+    """Reject a ``namespace`` that would escape the caller-chosen
+    ``persist_dir`` when composed into a filename.
+
+    ``from_persist_dir`` builds ``{persist_dir}/{namespace}__vector_store.json``.
+    A ``namespace`` containing a path separator or ``..`` resolves outside
+    ``persist_dir`` (path traversal), an empty/``.`` namespace names the
+    directory itself rather than a store file, and a ``:`` forms a
+    Windows drive-relative name (``C:foo``) that escapes ``persist_dir``
+    without any separator. We reject these loudly rather than silently
+    basenaming them — silent rewriting could load a *different* store
+    than the caller named. Any other namespace is accepted verbatim
+    (alphanumerics, dash, underscore, dots, and other non-separator
+    characters); dotted namespaces such as ``v1.2`` map to distinct
+    file pairs and coexist in one ``persist_dir``.
+
+    This is a deliberate divergence from ``SimpleVectorStore``, which does
+    not sanitize its namespace, in the safer direction.
+    """
+    if namespace == "" or namespace == ".":
+        raise ValueError(
+            f"namespace must be a non-empty name, got {namespace!r}"
+        )
+    if "/" in namespace or "\\" in namespace or os.sep in namespace or ".." in namespace:
+        raise ValueError(
+            "namespace must not contain path separators ('/' or '\\\\') or "
+            f"'..'; got {namespace!r}. It names a store within persist_dir, "
+            "not a path."
+        )
+    if ":" in namespace:
+        raise ValueError(
+            "namespace must not contain ':' (a Windows drive-relative name "
+            f"like 'C:foo' escapes persist_dir); got {namespace!r}. It "
+            "names a store within persist_dir, not a path."
+        )
+    return namespace
+
+
 def _split_persist_base(persist_path: str | Path) -> Path:
-    """Strip the framework-provided extension off `persist_path` so the
-    binary index and JSON side-car can sit next to each other under a
-    shared base. We then append our own extensions in persist / load."""
+    """Derive the on-disk base from ``persist_path``: the binary index is
+    written to ``{base}.tvim`` and the node side-car to
+    ``{base}.nodes.json`` (extensions *appended* — see ``_with_ext``).
+
+    Only a trailing ``.json`` — the conventional extension the framework
+    hands us via ``{namespace}__vector_store.json`` — is stripped; every
+    other character of the name is kept verbatim, including dots from a
+    dotted namespace. ``v1.2__vector_store.json`` and
+    ``v1.3__vector_store.json`` therefore map to distinct file pairs.
+    (The previous ``with_suffix``-based implementation re-split the stem
+    at its last dot when appending extensions, so dotted namespaces
+    sharing a prefix silently overwrote each other — issue #200.)"""
     p = Path(persist_path)
-    # Use the path without its suffix so both .tvim and .nodes.json share
-    # a base. If the input has no suffix (e.g. a bare folder-like name),
-    # use it as-is.
-    return p.with_suffix("") if p.suffix else p
+    if p.name.endswith(".json") and p.name != ".json":
+        return p.with_name(p.name[: -len(".json")])
+    return p
+
+
+def _with_ext(base: Path, ext: str) -> Path:
+    """Append ``ext`` to ``base``'s filename verbatim. Never
+    ``with_suffix`` — that would strip everything after the last dot of
+    a dotted stem (issue #200)."""
+    return base.with_name(base.name + ext)
+
+
+def _legacy_split_persist_base(persist_path: str | Path) -> tuple[Path, Path]:
+    """Reproduce the pre-#200 (mangled) index/side-car paths for
+    ``persist_path``: the old code stripped the last extension, then
+    ``with_suffix`` stripped from the last remaining dot again when
+    appending ``.tvim`` / ``.nodes.json`` — so namespace ``v1.2``
+    produced ``v1.tvim`` / ``v1.nodes.json``. Used only as a load-time
+    fallback for stores persisted by earlier releases."""
+    p = Path(persist_path)
+    base = p.with_suffix("") if p.suffix else p
+    return base.with_suffix(_INDEX_EXT), base.with_suffix(_STORE_EXT)
 
 
 class TurboQuantVectorStore(BasePydanticVectorStore):
@@ -94,6 +226,31 @@ class TurboQuantVectorStore(BasePydanticVectorStore):
     holds node text and metadata keyed by ``node_id``. Supports ``delete``
     (by ``ref_doc_id``, removing every node with that ref) and
     ``delete_nodes`` (by ``node_id``) — both O(1) per node.
+
+    **Similarity modes.** ``similarity="cosine"`` (default) L2-normalizes
+    node embeddings at add time and query embeddings at query time, so
+    the ``similarities`` in each :class:`VectorStoreQueryResult` are
+    cosine similarity in ``[-1, 1]`` and ranking matches the
+    ``SimpleVectorStore`` reference for embeddings of any magnitude.
+    ``similarity="dot_product"`` stores and queries raw vectors: the
+    similarities are raw inner products and ranking is magnitude-aware.
+    The mode is fixed at construction and recorded by :meth:`persist`;
+    :meth:`from_persist_path` restores it (stores persisted before the
+    mode existed load as ``"dot_product"`` — the raw-vector scoring they
+    were written under). This parameter is a turbovec extension — the
+    reference ``SimpleVectorStore`` computes cosine unconditionally.
+
+    **Thread safety.** The store is safe for concurrent multi-threaded
+    use. Reads (``query``, ``get_nodes``) run concurrently and scale
+    across threads; writes (``add``, ``delete``, ``delete_nodes``,
+    ``clear``, ``persist``) serialize on a per-store lock — the ``a*`` /
+    ``async_*`` variants delegate to the same locked bodies. A read that
+    overlaps a write sees either the pre- or post-write state — never a
+    torn one — and under heavy concurrent churn a query may transiently
+    return fewer than ``similarity_top_k`` results. There is no
+    cross-call atomicity: a caller-side check-then-act sequence (e.g.
+    ``get_nodes`` then ``delete_nodes``) can still interleave with other
+    writers. Multi-process access is not supported.
     """
 
     stores_text: bool = True
@@ -105,8 +262,17 @@ class TurboQuantVectorStore(BasePydanticVectorStore):
     _node_id_to_u64: dict[str, int] = PrivateAttr()
     _u64_to_node_id: dict[int, str] = PrivateAttr()
     _next_u64: int = PrivateAttr()
+    _write_lock: Any = PrivateAttr()
+    _similarity: str = PrivateAttr()
 
-    def __init__(self, index: IdMapIndex | None = None, *, bit_width: int = 4, **kwargs: Any) -> None:
+    def __init__(
+        self,
+        index: IdMapIndex | None = None,
+        *,
+        bit_width: int = 4,
+        similarity: str = "cosine",
+        **kwargs: Any,
+    ) -> None:
         """Construct the vector store.
 
         :param index: Optional pre-built :class:`IdMapIndex`. When omitted,
@@ -116,15 +282,27 @@ class TurboQuantVectorStore(BasePydanticVectorStore):
             ``StorageContext.from_defaults(vector_store=TurboQuantVectorStore())``).
         :param bit_width: Quantization width used when constructing the
             lazy index. Ignored if ``index`` is supplied.
+        :param similarity: ``"cosine"`` (default) or ``"dot_product"``.
+            See the class docstring. Fixed for the lifetime of the store.
         """
         super().__init__(**kwargs)
         # IdMapIndex itself supports lazy construction now — no per-store
         # lazy wrapping needed.
         self._index = index if index is not None else IdMapIndex(bit_width=bit_width)
+        self._similarity = validate_similarity(similarity)
         self._nodes = {}
         self._node_id_to_u64 = {}
         self._u64_to_node_id = {}
         self._next_u64 = 0
+        # Serializes every mutation (add / delete / clear / persist).
+        # Readers do NOT take this lock — query stays lock-free so
+        # concurrent reads keep scaling across threads (#186); reader
+        # safety comes from mutation ordering plus tolerant handle
+        # resolution instead. The lock also makes `_next_u64 += 1` atomic
+        # w.r.t. other writers: pydantic's PrivateAttr machinery makes the
+        # bare increment tearable, which issued duplicate handles (and
+        # silently rejected whole batches) under concurrent add (#161).
+        self._write_lock = threading.RLock()
 
     def _issue_handle(self) -> int:
         self._next_u64 += 1
@@ -135,14 +313,24 @@ class TurboQuantVectorStore(BasePydanticVectorStore):
         return "TurboQuantVectorStore"
 
     @classmethod
-    def from_params(cls, dim: int | None = None, bit_width: int = 4) -> "TurboQuantVectorStore":
+    def from_params(
+        cls,
+        dim: int | None = None,
+        bit_width: int = 4,
+        similarity: str = "cosine",
+    ) -> "TurboQuantVectorStore":
         """Build a store with a known ``dim`` (eager) or lazy when ``dim``
         is omitted."""
-        return cls(index=IdMapIndex(dim, bit_width))
+        return cls(index=IdMapIndex(dim, bit_width), similarity=similarity)
 
     @property
     def client(self) -> IdMapIndex:
         return self._index
+
+    @property
+    def similarity(self) -> str:
+        """The store's similarity mode: ``"cosine"`` or ``"dot_product"``."""
+        return self._similarity
 
     def add(self, nodes: list[BaseNode], **_: Any) -> list[str]:
         # Materialize once up front: the input is iterated multiple times
@@ -183,66 +371,109 @@ class TurboQuantVectorStore(BasePydanticVectorStore):
                 "nodes have empty embeddings (dim 0); check the embed "
                 "model that produced them"
             )
-        # IdMapIndex.add_with_ids handles eager (dim must match) and lazy
-        # (locks dim on first add) — pre-check the eager case so we
-        # surface a clean ValueError rather than a Rust panic.
-        existing_dim = self._index.dim
-        if existing_dim is not None and vectors.shape[1] != existing_dim:
-            raise ValueError(
-                f"node embedding dim {vectors.shape[1]} does not match index dim {existing_dim}"
-            )
-        if not vectors.flags["C_CONTIGUOUS"]:
-            vectors = np.ascontiguousarray(vectors)
+        # Build every side-car payload BEFORE mutating any state, so a
+        # payload failure (e.g. non-serializable metadata) leaves the
+        # store untouched. `metadata` and `ref_doc_id` are kept at top
+        # level for fast filter / doc-id lookup (queries hit these on
+        # every hit; parsing _node_content per hit would be wasteful).
+        # `node_dict` is the framework's canonical metadata representation
+        # (`_node_content` + `_node_type` + original metadata keys),
+        # which `metadata_dict_to_node` reconstructs into a full
+        # BaseNode — preserving relationships (PREVIOUS / NEXT /
+        # PARENT / CHILD), excluded_*_metadata_keys, template fields,
+        # start/end_char_idx and mimetype on retrieval. The narrow
+        # `{text, metadata, ref_doc_id}` schema we used to keep lost
+        # all of those silently.
+        payloads = [_payload_for(node) for node in nodes]
 
-        handles = np.array([self._issue_handle() for _ in nodes], dtype=np.uint64)
-        # Add first; if validation above or encoding here (e.g. non-finite
-        # values) rejects the batch, it raises before any existing data is
-        # touched. Only after the add succeeds do we remove the old entries
-        # for colliding node_ids, so a failed upsert never destroys existing
-        # data (issue #89). Handles are freshly issued, so the old and new
-        # vectors coexist until the delete.
-        self._index.add_with_ids(vectors, handles)
+        # Cosine mode: L2-normalize outside the lock (pure computation)
+        # so the engine's raw inner product is true cosine similarity.
+        # Zero rows pass through unchanged.
+        if self._similarity == COSINE:
+            vectors = l2_normalize_rows(vectors)
 
-        # Upsert-like: if a node_id is already present in the STORE, remove
-        # the old entry so the new embedding wins.
-        duplicates = [n.node_id for n in nodes if n.node_id in self._node_id_to_u64]
-        for node_id in duplicates:
-            self._remove_node_by_id(node_id)
+        with self._write_lock:
+            # IdMapIndex.add_with_ids handles eager (dim must match) and lazy
+            # (locks dim on first add) — pre-check the eager case so we
+            # surface a clean ValueError rather than a Rust panic.
+            existing_dim = self._index.dim
+            if existing_dim is not None and vectors.shape[1] != existing_dim:
+                raise ValueError(
+                    f"node embedding dim {vectors.shape[1]} does not match index dim {existing_dim}"
+                )
+            if not vectors.flags["C_CONTIGUOUS"]:
+                vectors = np.ascontiguousarray(vectors)
 
-        ids: list[str] = []
-        for node, handle in zip(nodes, handles):
-            h = int(handle)
-            nid = node.node_id
-            self._node_id_to_u64[nid] = h
-            self._u64_to_node_id[h] = nid
-            # `metadata` and `ref_doc_id` are kept at top level for fast
-            # filter / doc-id lookup (queries hit these on every hit;
-            # parsing _node_content per hit would be wasteful). `node_dict`
-            # is the framework's canonical metadata representation
-            # (`_node_content` + `_node_type` + original metadata keys),
-            # which `metadata_dict_to_node` reconstructs into a full
-            # BaseNode — preserving relationships (PREVIOUS / NEXT /
-            # PARENT / CHILD), excluded_*_metadata_keys, template fields,
-            # start/end_char_idx and mimetype on retrieval. The narrow
-            # `{text, metadata, ref_doc_id}` schema we used to keep lost
-            # all of those silently.
-            self._nodes[nid] = {
-                "metadata": dict(node.metadata),
-                "ref_doc_id": node.ref_doc_id,
-                "node_dict": node_to_metadata_dict(
-                    node, remove_text=False, flat_metadata=False
-                ),
-            }
-            ids.append(nid)
+            handles = np.array([self._issue_handle() for _ in nodes], dtype=np.uint64)
+
+            # Capture the previous state of any upserted node_id BEFORE the
+            # maps are overwritten, so a failed index add can restore it and
+            # the old vectors can be dropped once the add succeeds.
+            old = [
+                (nid, self._node_id_to_u64[nid], self._nodes[nid])
+                for nid in node_ids
+                if nid in self._node_id_to_u64
+            ]
+
+            # Maps BEFORE the index add: a concurrent query can only learn
+            # a handle from the index, so an entry that is resolvable but
+            # not yet searchable is invisible to readers (safe) — the
+            # reverse ordering let readers surface handles that did not
+            # resolve yet (issue #161).
+            ids: list[str] = []
+            for node, payload, handle in zip(nodes, payloads, handles):
+                h = int(handle)
+                nid = node.node_id
+                self._node_id_to_u64[nid] = h
+                self._u64_to_node_id[h] = nid
+                self._nodes[nid] = payload
+                ids.append(nid)
+            try:
+                self._index.add_with_ids(vectors, handles)
+            except BaseException:
+                # Unwind the pre-inserted map entries (and restore the
+                # previous state of any upserted node_id) so a failed add
+                # never destroys existing data — preserving the issue-#89
+                # guarantee under the maps-first ordering.
+                for node, handle in zip(nodes, handles):
+                    h = int(handle)
+                    nid = node.node_id
+                    self._u64_to_node_id.pop(h, None)
+                    if self._node_id_to_u64.get(nid) == h:
+                        self._node_id_to_u64.pop(nid, None)
+                        self._nodes.pop(nid, None)
+                for nid, old_h, old_data in old:
+                    self._node_id_to_u64[nid] = old_h
+                    self._u64_to_node_id[old_h] = nid
+                    self._nodes[nid] = old_data
+                raise
+
+            # Upsert-like: drop the replaced vectors, index first so each
+            # old handle stops being searchable before it stops resolving.
+            # The forward maps already hold the new entries, so only the
+            # old handle and its reverse-map entry remain to clean up.
+            for _nid, old_h, _old_data in old:
+                self._index.remove(old_h)
+                self._u64_to_node_id.pop(old_h, None)
         return ids
 
     def delete(self, ref_doc_id: str, **_: Any) -> None:
-        """Delete every node whose ``ref_doc_id`` matches."""
-        matching = [
-            nid for nid, data in self._nodes.items() if data.get("ref_doc_id") == ref_doc_id
-        ]
-        for nid in matching:
-            self._remove_node_by_id(nid)
+        """Delete every node whose ``ref_doc_id`` matches.
+
+        A node with no SOURCE relationship is filed under the literal
+        string ``"None"``, matching the reference (``SimpleVectorStore``
+        stores ``node.ref_doc_id or "None"``). So ``delete(None)`` is a
+        no-op rather than a wipe of every parentless node (issue #302);
+        ``delete("None")`` is the way to target them.
+        """
+        with self._write_lock:
+            matching = [
+                nid
+                for nid, data in self._nodes.items()
+                if (data.get("ref_doc_id") or "None") == ref_doc_id
+            ]
+            for nid in matching:
+                self._remove_node_by_id(nid)
 
     def delete_nodes(
         self,
@@ -252,22 +483,41 @@ class TurboQuantVectorStore(BasePydanticVectorStore):
     ) -> None:
         """Delete every node matching ``node_ids`` and/or ``filters``. Both
         constraints intersect when supplied. Missing node_ids are ignored.
-        Matches the signature and semantics of ``SimpleVectorStore.delete_nodes``.
+        ``node_ids`` is the explicit selection here: an empty list selects
+        nothing (a no-op), unlike ``query``'s ``node_ids=[]``, which
+        follows the retriever calling convention and restricts nothing.
+        Takes ``SimpleVectorStore.delete_nodes``'s signature, and its
+        semantics for the selections both accept. Two divergences are
+        deliberate:
+
+        * Both arguments ``None`` is a no-op here. ``SimpleVectorStore``
+          deletes *every* node in that case, because
+          ``build_metadata_filter_fn(None)`` returns an always-true
+          predicate that it applies to all ids. The base
+          ``BasePydanticVectorStore.delete_nodes`` contract does not
+          specify delete-all, and a dedicated ``clear()`` already exists
+          for it, so the no-op is the safer reading rather than an
+          accidental-mass-wipe footgun. Use ``clear()`` to empty the store.
+        * A ``filters`` value containing a nested ``MetadataFilters``
+          group is evaluated here, where the reference raises
+          ``ValueError`` — see ``_filters_match``, which documents that
+          superset.
         """
         if not node_ids and filters is None:
             return
-        candidates = list(self._nodes.items())
-        if node_ids is not None:
-            node_id_set = set(node_ids)
-            candidates = [(nid, data) for nid, data in candidates if nid in node_id_set]
-        if filters is not None:
-            candidates = [
-                (nid, data)
-                for nid, data in candidates
-                if self._filters_match(data["metadata"], filters)
-            ]
-        for nid, _data in candidates:
-            self._remove_node_by_id(nid)
+        with self._write_lock:
+            candidates = list(self._nodes.items())
+            if node_ids is not None:
+                node_id_set = set(node_ids)
+                candidates = [(nid, data) for nid, data in candidates if nid in node_id_set]
+            if filters is not None:
+                candidates = [
+                    (nid, data)
+                    for nid, data in candidates
+                    if self._filters_match(data["metadata"], filters)
+                ]
+            for nid, _data in candidates:
+                self._remove_node_by_id(nid)
 
     def clear(self) -> None:
         """Drop every node from the store and reset to a fresh lazy index.
@@ -275,12 +525,13 @@ class TurboQuantVectorStore(BasePydanticVectorStore):
         The new index keeps the same ``bit_width`` so subsequent adds
         commit a new ``dim`` lazily.
         """
-        bw = self._index.bit_width
-        self._index = IdMapIndex(bit_width=bw)
-        self._nodes = {}
-        self._node_id_to_u64 = {}
-        self._u64_to_node_id = {}
-        self._next_u64 = 0
+        with self._write_lock:
+            bw = self._index.bit_width
+            self._index = IdMapIndex(bit_width=bw)
+            self._nodes = {}
+            self._node_id_to_u64 = {}
+            self._u64_to_node_id = {}
+            self._next_u64 = 0
 
     def get(self, text_id: str) -> List[float]:
         """LlamaIndex's protocol expects this to return the full-precision
@@ -302,7 +553,10 @@ class TurboQuantVectorStore(BasePydanticVectorStore):
     ) -> List[BaseNode]:
         """Return the nodes matching ``node_ids`` and/or ``filters``. Both
         constraints intersect when supplied; missing node_ids are
-        silently skipped.
+        silently skipped. ``node_ids`` is the explicit selection here: an
+        empty list selects nothing and returns ``[]``, unlike ``query``'s
+        ``node_ids=[]``, which follows the retriever calling convention
+        and restricts nothing.
 
         Unlike ``SimpleVectorStore`` (which raises NotImplementedError
         here because it doesn't store nodes), turbovec keeps node text
@@ -314,10 +568,17 @@ class TurboQuantVectorStore(BasePydanticVectorStore):
         otherwise in storage order.
         """
         if node_ids is not None:
-            candidates = [
-                (nid, self._nodes[nid]) for nid in node_ids if nid in self._nodes
-            ]
+            # Single .get instead of check-then-read: a concurrent delete
+            # between `in` and `[]` would raise KeyError; a missing id is
+            # skipped either way.
+            candidates = []
+            for nid in node_ids:
+                data = self._nodes.get(nid)
+                if data is not None:
+                    candidates.append((nid, data))
         else:
+            # list() snapshot: a concurrent writer must not invalidate the
+            # iteration mid-scan (single C-level op, no torn view).
             candidates = list(self._nodes.items())
         if filters is not None:
             candidates = [
@@ -350,12 +611,17 @@ class TurboQuantVectorStore(BasePydanticVectorStore):
         return node
 
     def _remove_node_by_id(self, node_id: str) -> bool:
-        handle = self._node_id_to_u64.pop(node_id, None)
+        # Callers hold the writer lock. Index first: the handle stops
+        # being searchable before it stops resolving, so a concurrent
+        # query can never surface a handle whose side-car entries are
+        # already gone.
+        handle = self._node_id_to_u64.get(node_id)
         if handle is None:
             return False
+        self._index.remove(handle)
+        self._node_id_to_u64.pop(node_id, None)
         self._u64_to_node_id.pop(handle, None)
         self._nodes.pop(node_id, None)
-        self._index.remove(handle)
         return True
 
     def _resolve_allowed_handles(
@@ -365,16 +631,35 @@ class TurboQuantVectorStore(BasePydanticVectorStore):
         doc_ids: list[str] | None,
     ) -> list[int]:
         """Resolve ``query.filters``, ``query.node_ids`` and ``query.doc_ids``
-        to the list of internal u64 handles that satisfy the filter. Empty
-        list means no node matches.
+        to the list of internal u64 handles that satisfy the constraints.
+        An empty *return* means no node satisfies them.
 
-        Semantics (matching the SimpleVectorStore reference where applicable):
-          - ``node_ids``: filter by node_id (set membership).
-          - ``doc_ids``: filter by ``ref_doc_id`` only (source document id).
+        Semantics:
+          - ``node_ids``: filter by node_id (set membership). An **empty
+            list restricts nothing** — it is treated the same as ``None``.
+            This matches the framework's own calling convention:
+            ``VectorStoreIndex.as_retriever`` passes
+            ``node_ids=list(index_struct.nodes_dict.values())``
+            (llama_index/core/indices/vector_store/base.py), and for a
+            ``stores_text=True`` store like this one ``nodes_dict`` stays
+            empty (only Image/Index nodes are tracked there) — so every
+            retriever query arrives with ``node_ids=[]`` meaning
+            *unrestricted*. Treating ``[]`` as match-nothing would make
+            every ``VectorStoreIndex`` retrieval return zero results
+            (maintainer ruling on issue #130).
+          - ``doc_ids``: filter by ``ref_doc_id`` only (source document
+            id). Same convention: an empty list restricts nothing — as in
+            the ``SimpleVectorStore`` reference.
           - ``filters``: apply metadata filters.
-        All three intersect when more than one is supplied.
+        All supplied non-empty constraints intersect.
+
+        Contrast ``get_nodes`` / ``delete_nodes``: those are direct
+        node-selection APIs where ``node_ids`` *is* the selection, so an
+        explicit empty list there selects nothing.
         """
-        candidates = self._nodes.items()
+        # list() snapshot: this runs on the (lock-free) query path, so a
+        # concurrent writer must not invalidate the iteration mid-scan.
+        candidates = list(self._nodes.items())
 
         if node_ids:
             node_id_set = set(node_ids)
@@ -388,14 +673,16 @@ class TurboQuantVectorStore(BasePydanticVectorStore):
                 if data.get("ref_doc_id") in doc_id_set
             ]
 
-        if filters is None:
-            return [self._node_id_to_u64[nid] for nid, _ in candidates]
-
-        return [
-            self._node_id_to_u64[nid]
-            for nid, data in candidates
-            if self._filters_match(data["metadata"], filters)
-        ]
+        out: list[int] = []
+        for nid, data in candidates:
+            if filters is not None and not self._filters_match(data["metadata"], filters):
+                continue
+            # Tolerant resolution: the node can vanish between the snapshot
+            # above and here (concurrent delete) — skip rather than raise.
+            handle = self._node_id_to_u64.get(nid)
+            if handle is not None:
+                out.append(handle)
+        return out
 
     @classmethod
     def _filters_match(
@@ -405,6 +692,11 @@ class TurboQuantVectorStore(BasePydanticVectorStore):
         results: list[bool] = []
         for f in filters.filters:
             if isinstance(f, MetadataFilters):
+                # Deliberate superset of the reference: SimpleVectorStore's
+                # build_metadata_filter_fn raises ValueError on nested
+                # MetadataFilters groups; turbovec recurses and evaluates
+                # them. Per-operator semantics still match the reference
+                # (see _single_filter_match).
                 results.append(cls._filters_match(metadata, f))
             else:
                 results.append(cls._single_filter_match(metadata, f))
@@ -434,10 +726,11 @@ class TurboQuantVectorStore(BasePydanticVectorStore):
         if op == FilterOperator.IS_EMPTY:
             return value is None or value == "" or value == []
 
-        # Missing key: the reference (`build_metadata_filter_fn`,
-        # `utils.py`) treats an absent value as a MATCH for the negative
-        # operators NE / NIN ("not equal to X" is trivially true when the
-        # key isn't there) and a non-match for every other operator.
+        # Missing key: no value to compare, so every operator declines —
+        # EXCEPT the negative ones. "this node's colour is not red" is
+        # vacuously true of a node with no colour, which is what
+        # llama-index-core >= 0.14 does. (Older 0.12.x excluded on NE/NIN;
+        # we track the current reference, since that is what users get.)
         if value is None:
             return op in (FilterOperator.NE, FilterOperator.NIN)
 
@@ -460,11 +753,12 @@ class TurboQuantVectorStore(BasePydanticVectorStore):
         if op == FilterOperator.CONTAINS:
             return target in value
         if op == FilterOperator.TEXT_MATCH:
-            # Reference (`utils.py:138-144`): case-SENSITIVE substring,
-            # both sides must be strings. Previous turbovec impl
-            # lowercased both sides — a silent semantic divergence that
-            # caused our results to disagree with SimpleVectorStore on
-            # mixed-case keys.
+            # Case-SENSITIVE substring. `FilterOperator` defines
+            # TEXT_MATCH and TEXT_MATCH_INSENSITIVE as distinct operators,
+            # so folding case here would collapse that distinction and
+            # leave no way to ask for a case-sensitive match. The type
+            # guard is ours: the reference raises AttributeError on a
+            # non-string (issue #302).
             if isinstance(target, str) and isinstance(value, str):
                 return target in value
             raise TypeError(
@@ -514,12 +808,19 @@ class TurboQuantVectorStore(BasePydanticVectorStore):
         qvec = np.asarray(query.query_embedding, dtype=np.float32)
         if qvec.ndim == 1:
             qvec = qvec[None, :]
+        # Cosine mode: normalize the query so the raw inner product
+        # against unit node vectors is true cosine similarity.
+        if self._similarity == COSINE:
+            qvec = l2_normalize_rows(qvec)
         if not qvec.flags["C_CONTIGUOUS"]:
             qvec = np.ascontiguousarray(qvec)
 
         if len(self._index) == 0:
             return VectorStoreQueryResult(nodes=[], similarities=[], ids=[])
 
+        # Truthiness is deliberate: node_ids=[] / doc_ids=[] mean "no
+        # restriction", per the retriever calling convention — see the
+        # _resolve_allowed_handles docstring (issue #130 ruling).
         has_filters = (
             query.filters is not None
             or bool(query.node_ids)
@@ -529,22 +830,74 @@ class TurboQuantVectorStore(BasePydanticVectorStore):
             k = min(query.similarity_top_k, len(self._index))
             scores, handles = self._index.search(qvec, k)
         else:
-            allowed_handles = self._resolve_allowed_handles(
-                query.filters, query.node_ids, query.doc_ids
-            )
-            if not allowed_handles:
-                return VectorStoreQueryResult(nodes=[], similarities=[], ids=[])
-            allowlist = np.asarray(allowed_handles, dtype=np.uint64)
-            scores, handles = self._index.search(
-                qvec, query.similarity_top_k, allowlist=allowlist
-            )
+            for _attempt in range(8):
+                allowed_handles = self._resolve_allowed_handles(
+                    query.filters, query.node_ids, query.doc_ids
+                )
+                if not allowed_handles:
+                    return VectorStoreQueryResult(nodes=[], similarities=[], ids=[])
+                allowlist = np.asarray(allowed_handles, dtype=np.uint64)
+                try:
+                    scores, handles = self._index.search(
+                        qvec, query.similarity_top_k, allowlist=allowlist
+                    )
+                    break
+                except KeyError:
+                    # The allowlist went stale: a delete landed between
+                    # resolving it and the kernel's membership check.
+                    # Rebuild the allowlist and retry.
+                    continue
+            else:
+                # Sustained churn kept invalidating the allowlist. Fall
+                # back to an unfiltered search plus a tolerant Python-side
+                # post-filter, which cannot raise (a query overlapping
+                # heavy churn may return fewer than similarity_top_k hits).
+                k = query.similarity_top_k
+                fetch_k = min(max(k * 4, 32), len(self._index) or 1)
+                scores, handles = self._index.search(qvec, fetch_k)
+                node_id_set = set(query.node_ids) if query.node_ids else None
+                doc_id_set = set(query.doc_ids) if query.doc_ids else None
+                result_nodes: list[TextNode] = []
+                similarities: list[float] = []
+                ids: list[str] = []
+                for score, handle in zip(scores[0], handles[0]):
+                    nid = self._u64_to_node_id.get(int(handle))
+                    if nid is None:
+                        continue
+                    data = self._nodes.get(nid)
+                    if data is None:
+                        continue
+                    if node_id_set is not None and nid not in node_id_set:
+                        continue
+                    if doc_id_set is not None and data.get("ref_doc_id") not in doc_id_set:
+                        continue
+                    if query.filters is not None and not self._filters_match(
+                        data["metadata"], query.filters
+                    ):
+                        continue
+                    result_nodes.append(self._reconstruct_node(nid, data))
+                    similarities.append(float(score))
+                    ids.append(nid)
+                    if len(ids) >= k:
+                        break
+                return VectorStoreQueryResult(
+                    nodes=result_nodes, similarities=similarities, ids=ids
+                )
 
-        result_nodes: list[TextNode] = []
-        similarities: list[float] = []
-        ids: list[str] = []
+        result_nodes = []
+        similarities = []
+        ids = []
         for score, handle in zip(scores[0], handles[0]):
-            nid = self._u64_to_node_id[int(handle)]
-            data = self._nodes[nid]
+            # Tolerant translation: a handle surfaced by the index can stop
+            # resolving if a delete completes between the kernel search and
+            # this loop (the reader-straddle). Skip it — the node is gone
+            # either way — rather than raising KeyError mid-query.
+            nid = self._u64_to_node_id.get(int(handle))
+            if nid is None:
+                continue
+            data = self._nodes.get(nid)
+            if data is None:
+                continue
             result_nodes.append(self._reconstruct_node(nid, data))
             similarities.append(float(score))
             ids.append(nid)
@@ -554,17 +907,25 @@ class TurboQuantVectorStore(BasePydanticVectorStore):
     # ---- Async overrides --------------------------------------------------
     #
     # The base class provides default async impls that delegate to sync via
-    # `return self.<sync>(...)`. We override them explicitly so the signature
-    # is visible on the class and an autodoc tool / IDE doesn't make
-    # callers chase the abstract base class for the documentation.
+    # `return self.<sync>(...)` — inline on the loop thread, which blocks
+    # it for the operation's whole duration (issue #342). We override
+    # them to run the sync body on a worker
+    # thread instead. One `to_thread` call per method, never one per
+    # chunk: the sync bodies take the write lock, and a suspension point
+    # inside one would break the atomicity the sync path guarantees.
+    #
+    # `asyncio.to_thread` propagates the caller's context vars, and the
+    # index releases the GIL for the heavy work, so the loop really does
+    # keep running. Cancellation frees the *caller*, not the worker — see
+    # the module docstring.
 
     async def async_add(
         self, nodes: Sequence[BaseNode], **kwargs: Any
     ) -> List[str]:
-        return self.add(list(nodes), **kwargs)
+        return await asyncio.to_thread(self.add, list(nodes), **kwargs)
 
     async def adelete(self, ref_doc_id: str, **kwargs: Any) -> None:
-        self.delete(ref_doc_id, **kwargs)
+        await asyncio.to_thread(self.delete, ref_doc_id, **kwargs)
 
     async def adelete_nodes(
         self,
@@ -572,22 +933,26 @@ class TurboQuantVectorStore(BasePydanticVectorStore):
         filters: Optional[MetadataFilters] = None,
         **kwargs: Any,
     ) -> None:
-        self.delete_nodes(node_ids=node_ids, filters=filters, **kwargs)
+        await asyncio.to_thread(
+            self.delete_nodes, node_ids=node_ids, filters=filters, **kwargs
+        )
 
     async def aclear(self) -> None:
-        self.clear()
+        await asyncio.to_thread(self.clear)
 
     async def aquery(
         self, query: VectorStoreQuery, **kwargs: Any
     ) -> VectorStoreQueryResult:
-        return self.query(query, **kwargs)
+        return await asyncio.to_thread(self.query, query, **kwargs)
 
     async def aget_nodes(
         self,
         node_ids: Optional[List[str]] = None,
         filters: Optional[MetadataFilters] = None,
     ) -> List[BaseNode]:
-        return self.get_nodes(node_ids=node_ids, filters=filters)
+        return await asyncio.to_thread(
+            self.get_nodes, node_ids=node_ids, filters=filters
+        )
 
     # ---- Config serialization ---------------------------------------------
 
@@ -600,6 +965,7 @@ class TurboQuantVectorStore(BasePydanticVectorStore):
         return {
             "bit_width": self._index.bit_width,
             "dim": self._index.dim,  # may be None (lazy uncommitted)
+            "similarity": self._similarity,
         }
 
     @classmethod
@@ -608,13 +974,20 @@ class TurboQuantVectorStore(BasePydanticVectorStore):
         ``to_dict``. To restore data, use ``from_persist_path``."""
         dim = data.get("dim")
         bit_width = data.get("bit_width", 4)
-        return cls(index=IdMapIndex(dim, bit_width))
+        # Config dicts written before similarity modes existed get the
+        # constructor default — from_dict builds an *empty* store, so
+        # there is no pre-existing data whose scoring could change.
+        similarity = data.get("similarity", COSINE)
+        return cls(index=IdMapIndex(dim, bit_width), similarity=similarity)
 
     def persist(self, persist_path: str, fs: Any = None) -> None:
         """Persist the store. ``persist_path`` is treated as a path *stem*:
         the binary index goes to ``{stem}.tvim`` and the node side-car to
-        ``{stem}.nodes.json``. Any extension on ``persist_path`` (e.g.
-        ``.json`` from a StorageContext default) is replaced.
+        ``{stem}.nodes.json``. A trailing ``.json`` extension (the
+        StorageContext default) is stripped from ``persist_path`` first;
+        dots anywhere else in the name (e.g. a dotted namespace like
+        ``v1.2``) are preserved verbatim, so dotted namespaces sharing a
+        prefix persist to distinct file pairs (issue #200).
 
         This matches the layout assumed by ``StorageContext.persist`` —
         which calls us with ``persist_path = {persist_dir}/{namespace}__vector_store.json`` —
@@ -630,23 +1003,30 @@ class TurboQuantVectorStore(BasePydanticVectorStore):
             )
         base = _split_persist_base(persist_path)
         base.parent.mkdir(parents=True, exist_ok=True)
-        payload = {
-            "schema_version": _NODES_SCHEMA_VERSION,
-            "nodes": self._nodes,
-            # JSON object keys must be strings; round-trip int keys via
-            # an explicit list of [node_id, handle] pairs to preserve
-            # type fidelity.
-            "node_id_to_u64": list(self._node_id_to_u64.items()),
-            "next_u64": self._next_u64,
-        }
-        # Atomic: serializes in memory first, then temp-file + replace,
-        # so a failed persist can't destroy a previous store at this path.
-        atomic_save(
-            self._index,
-            base.with_suffix(_INDEX_EXT),
-            payload,
-            base.with_suffix(_STORE_EXT),
-        )
+        # Serializes with writers: snapshotting the maps and the index
+        # concurrently with a write would persist a torn store to disk.
+        # Reads may proceed while a persist runs.
+        with self._write_lock:
+            payload = {
+                "schema_version": _NODES_SCHEMA_VERSION,
+                "nodes": self._nodes,
+                # JSON object keys must be strings; round-trip int keys via
+                # an explicit list of [node_id, handle] pairs to preserve
+                # type fidelity.
+                "node_id_to_u64": list(self._node_id_to_u64.items()),
+                "next_u64": self._next_u64,
+                # Recorded so `from_persist_path` restores the mode the
+                # vectors were written under (v3+).
+                "similarity": self._similarity,
+            }
+            # Atomic: serializes in memory first, then temp-file + replace,
+            # so a failed persist can't destroy a previous store at this path.
+            atomic_save(
+                self._index,
+                _with_ext(base, _INDEX_EXT),
+                payload,
+                _with_ext(base, _STORE_EXT),
+            )
 
     @classmethod
     def from_persist_path(
@@ -655,8 +1035,17 @@ class TurboQuantVectorStore(BasePydanticVectorStore):
         fs: Any = None,
     ) -> "TurboQuantVectorStore":
         """Load a previously-persisted store. ``persist_path`` is the same
-        path that was passed to :meth:`persist` (extension is ignored;
-        ``{stem}.tvim`` and ``{stem}.nodes.json`` are read).
+        path that was passed to :meth:`persist` (a trailing ``.json`` is
+        ignored; ``{stem}.tvim`` and ``{stem}.nodes.json`` are read).
+
+        Legacy fallback: releases before the #200 fix mangled dotted
+        stems (namespace ``v1.2`` persisted as ``v1.tvim`` /
+        ``v1.nodes.json``). If the correct filename is absent but the
+        old mangled one exists, that pair is loaded instead — safe
+        because the mangling made colliding namespaces overwrite each
+        other, so at most one store can exist under a given mangled
+        prefix. A subsequent :meth:`persist` writes the correct
+        (unmangled) filenames.
 
         Safe to call on any path — the side-car is plain JSON, never
         pickle, so there's no deserialization-of-code risk.
@@ -666,16 +1055,26 @@ class TurboQuantVectorStore(BasePydanticVectorStore):
                 "fsspec filesystems are not supported yet; pass a local path."
             )
         base = _split_persist_base(persist_path)
-        index = IdMapIndex.load(str(base.with_suffix(_INDEX_EXT)))
-        with open(base.with_suffix(_STORE_EXT)) as f:
+        index_path = _with_ext(base, _INDEX_EXT)
+        store_path = _with_ext(base, _STORE_EXT)
+        if not index_path.exists():
+            legacy_index, legacy_store = _legacy_split_persist_base(persist_path)
+            if legacy_index != index_path and legacy_index.exists():
+                index_path, store_path = legacy_index, legacy_store
+        index = IdMapIndex.load(str(index_path))
+        with open(store_path) as f:
             state = json.load(f)
         version = state.get("schema_version", 0)
-        if version not in _NODES_SCHEMA_COMPAT:
-            raise ValueError(
-                f"{_STORE_EXT.lstrip('.')} has schema version {version}; "
-                f"this turbovec accepts versions {list(_NODES_SCHEMA_COMPAT)}"
-            )
-        store = cls(index=index)
+        check_schema_version(
+            version,
+            _NODES_SCHEMA_COMPAT,
+            prefix=f"{_STORE_EXT.lstrip('.')} has schema version",
+        )
+        # v1/v2 side-cars predate the mode field: their vectors are raw,
+        # so dot_product is the mode they actually contain — loading them
+        # that way keeps scoring byte-identical to the store that wrote
+        # them. v3+ side-cars restore the recorded mode.
+        store = cls(index=index, similarity=state.get("similarity", DOT_PRODUCT))
         # v1 entries lack `node_dict` and reconstruct as narrow TextNodes;
         # v2 entries carry it and reconstruct with full BaseNode fidelity.
         # `_reconstruct_node` dispatches on shape, so we just load the
@@ -703,7 +1102,12 @@ class TurboQuantVectorStore(BasePydanticVectorStore):
             mapping_name="node_id_to_u64",
             sidecar_name="nodes",
         )
-        check_persisted_handles(index, store._u64_to_node_id.keys(), what="node")
+        check_persisted_handles(
+            index,
+            store._u64_to_node_id.keys(),
+            what="node",
+            next_u64=store._next_u64,
+        )
         return store
 
     @classmethod
@@ -720,10 +1124,87 @@ class TurboQuantVectorStore(BasePydanticVectorStore):
         :meth:`from_persist_path`. The ``.json`` suffix is conventional —
         our actual on-disk files use ``.tvim`` and ``.nodes.json``
         extensions derived from the same stem.
+
+        ``namespace`` names a store *within* ``persist_dir``; it must not
+        contain path separators, ``..``, or ``:`` and must be non-empty. A
+        traversal (or Windows drive-relative) namespace raises
+        ``ValueError`` rather than reading outside ``persist_dir``.
+        Dotted namespaces (``v1.2``) are fine and coexist; a store
+        persisted by a pre-#200 release under a dotted namespace is found
+        via the legacy-filename fallback in :meth:`from_persist_path`.
         """
+        _validate_namespace(namespace)
         persist_fname = f"{namespace}{_NAMESPACE_SEP}{_DEFAULT_PERSIST_FNAME}"
         persist_path = os.path.join(persist_dir, persist_fname)
         return cls.from_persist_path(persist_path, fs=fs)
+
+    # ---- Copy & pickle ----------------------------------------------------
+    #
+    # Without these overrides, pickling silently returned an EMPTY store:
+    # the Rust index lives in a pydantic ``PrivateAttr``, and the
+    # inherited ``BaseComponent.__getstate__`` drops any private
+    # attribute that fails ``pickle.dumps`` — so ``_index`` (and the
+    # lock) vanished with only a log warning, and the store deserialized
+    # valid-looking but with zero nodes (issue #148). The state instead
+    # round-trips the index through the core's in-memory ``.tvim`` byte
+    # format (``IdMapIndex.to_bytes`` / ``from_bytes``); the per-store
+    # lock is excluded — locks cannot cross pickling — and recreated on
+    # restore.
+    #
+    # The calibration state round-trips exactly through the copy: an
+    # uncalibrated index copies as uncalibrated, a calibrated one keeps
+    # its fitted pair. A copy is byte-for-byte what ``write`` would have
+    # produced.
+
+    def __getstate__(self) -> dict[str, Any]:
+        # Snapshot under the writer lock so the index bytes and the
+        # side-car maps come from one consistent store state (the same
+        # guarantee persist() gives the on-disk pair). The maps are
+        # shallow-copied so a write landing after this returns cannot
+        # desync the captured pair.
+        with self._write_lock:
+            return {
+                # Pydantic model fields (stores_text & co.), restored
+                # through __init__ so the pydantic machinery on the bare
+                # unpickled instance is fully initialized.
+                "fields": {k: getattr(self, k) for k in type(self).model_fields},
+                "bit_width": self._index.bit_width,
+                # Private attrs are NOT covered by `model_fields` — each
+                # must be carried explicitly or __setstate__'s __init__
+                # call silently resets it to its default (a dot_product
+                # store would unpickle as cosine, with diverging scores).
+                "similarity": self._similarity,
+                "index_bytes": self._index.to_bytes(),
+                "nodes": dict(self._nodes),
+                "node_id_to_u64": dict(self._node_id_to_u64),
+                "next_u64": self._next_u64,
+            }
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        self.__init__(  # type: ignore[misc]
+            index=IdMapIndex.from_bytes(state["index_bytes"]),
+            bit_width=state["bit_width"],
+            similarity=state["similarity"],
+            **state["fields"],
+        )
+        self._nodes = dict(state["nodes"])
+        self._node_id_to_u64 = dict(state["node_id_to_u64"])
+        self._u64_to_node_id = {h: nid for nid, h in self._node_id_to_u64.items()}
+        self._next_u64 = state["next_u64"]
+
+    def __deepcopy__(self, memo: dict) -> "TurboQuantVectorStore":
+        new = self.__class__.__new__(self.__class__)
+        new.__setstate__(_copy.deepcopy(self.__getstate__(), memo))
+        return new
+
+    def __copy__(self) -> "TurboQuantVectorStore":
+        # Deliberately identical to __deepcopy__ (overriding pydantic's
+        # field-sharing shallow copy): there is no meaningful shallow
+        # copy of a store. Sharing the mutable Rust index between two
+        # store objects means every mutation of one silently mutates the
+        # other (issue #149), so ``copy.copy`` returns an independent
+        # copy instead of an alias.
+        return self.__deepcopy__({})
 
 
 __all__ = ["TurboQuantVectorStore"]

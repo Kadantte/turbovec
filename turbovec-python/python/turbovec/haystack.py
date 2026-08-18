@@ -16,15 +16,19 @@ callers that rely on ``Document.embedding`` after retrieval will see
 from __future__ import annotations
 
 import asyncio
+import copy as _copy
 import json
 import math
+import threading
 from concurrent.futures import ThreadPoolExecutor
+from numbers import Real
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Literal, Optional, Tuple
 
 import numpy as np
 
-from ._persist import atomic_save, check_persisted_handles
+from ._persist import atomic_save, check_persisted_handles, check_schema_version
+from ._similarity import l2_normalize_rows, validate_similarity
 from ._turbovec import IdMapIndex
 
 try:
@@ -48,6 +52,36 @@ class TurboQuantDocumentStore:
     embeddings are dropped after quantization — callers requesting
     ``return_embedding=True`` on retrieval will see ``None`` on the
     returned documents' ``embedding`` field regardless of the flag.
+
+    **Similarity modes.** ``embedding_similarity_function="cosine"``
+    (default) L2-normalizes document embeddings at write time and query
+    embeddings at retrieval time, so raw scores are cosine similarity in
+    ``[-1, 1]``, ranking matches ``InMemoryDocumentStore``'s cosine
+    branch for embeddings of any magnitude, and ``scale_score=True``
+    maps them into ``[0, 1]`` preserving order.
+    ``embedding_similarity_function="dot_product"`` stores and queries
+    raw vectors — scores are raw inner products, ranking is
+    magnitude-aware, and ``scale_score=True`` applies the reference's
+    sigmoid mapping. The mode is fixed at construction and recorded by
+    :meth:`save_to_disk`; :meth:`load_from_disk` restores it. Stores
+    persisted before the mode governed storage (side-car schema v1/v2)
+    hold raw vectors, so they load with normalization off — keeping
+    scoring byte-identical to the store that wrote them — while
+    retaining their recorded ``embedding_similarity_function`` for the
+    ``scale_score`` formula.
+
+    **Thread safety.** The store is safe for concurrent multi-threaded
+    use. Reads (``embedding_retrieval``, ``filter_documents``, counts and
+    metadata helpers) run concurrently and scale across threads; writes
+    (``write_documents``, ``delete_*``, ``update_by_filter``,
+    ``save_to_disk``) serialize on a per-store lock — the ``*_async``
+    variants delegate to the same locked bodies. A read that overlaps a
+    write sees either the pre- or post-write state — never a torn one —
+    and under heavy concurrent churn a retrieval may transiently return
+    fewer than ``top_k`` documents. There is no cross-call atomicity:
+    a caller-side check-then-act sequence (e.g. ``count_documents``
+    then ``filter_documents``) can still interleave with other writers.
+    Multi-process access is not supported.
 
     Example::
 
@@ -76,11 +110,13 @@ class TurboQuantDocumentStore:
             quantized index is created lazily by ``IdMapIndex`` itself on
             the first ``write_documents`` call — matches the no-``dim``
             ergonomics of ``InMemoryDocumentStore``.
-        :param bit_width: Quantization width per coordinate (2 or 4).
+        :param bit_width: Quantization width per coordinate (2, 3, or 4).
         :param embedding_similarity_function: ``"cosine"`` (default) or
-            ``"dot_product"``. Used to choose the ``scale_score`` formula
-            during retrieval. Defaults to ``"cosine"`` because turbovec
-            stores unit-normalized vectors.
+            ``"dot_product"`` — the store's similarity mode (see the
+            class docstring). Selects both how vectors are stored
+            (normalized vs raw) and the ``scale_score`` formula during
+            retrieval. Fixed for the lifetime of the store; any other
+            value raises :class:`ValueError`.
         :param async_executor: Optional executor for the ``*_async``
             methods. If omitted, a single-threaded executor is created
             and cleaned up on instance destruction.
@@ -91,8 +127,16 @@ class TurboQuantDocumentStore:
             API parity with ``InMemoryDocumentStore``.
         """
         self._bit_width = bit_width
-        self.embedding_similarity_function = embedding_similarity_function
+        self.embedding_similarity_function = validate_similarity(
+            embedding_similarity_function, param="embedding_similarity_function"
+        )
         self.return_embedding = return_embedding
+        # Whether the vectors in the index are L2-normalized. True for a
+        # fresh cosine-mode store; False for dot_product mode — and False
+        # for stores reloaded from a pre-mode (schema v1/v2) side-car,
+        # whose vectors were written raw whatever their recorded
+        # similarity function says (load_from_disk overrides this flag).
+        self._vectors_normalized = embedding_similarity_function == "cosine"
         # IdMapIndex itself supports lazy construction — pass dim through
         # and let it handle eager vs lazy. No per-store lazy wrapping.
         self._index = IdMapIndex(dim, bit_width)
@@ -104,6 +148,13 @@ class TurboQuantDocumentStore:
         # handle is `_next_u64 + 1`, then we bump. Plain int so pickle
         # can round-trip it directly.
         self._next_u64: int = 0
+        # Serializes every mutation (write / delete / update / save).
+        # Readers do NOT take this lock — retrieval stays lock-free so
+        # concurrent reads keep scaling across threads (#186); reader
+        # safety comes from mutation ordering plus tolerant handle
+        # resolution instead. RLock: write_documents nests into
+        # _commit_batch / _remove_one.
+        self._write_lock = threading.RLock()
 
         # Executor lifecycle mirrors InMemoryDocumentStore: own one when
         # the caller didn't pass one in, and shut it down in __del__.
@@ -137,7 +188,12 @@ class TurboQuantDocumentStore:
         Documents are reconstructed on every access; the
         ``embedding`` field is always ``None``.
         """
-        return {data["id"]: self._reconstruct(data) for data in self._u64_to_doc.values()}
+        # list() snapshot: a concurrent writer must not invalidate the
+        # iteration mid-scan (single C-level op, no torn view).
+        return {
+            data["id"]: self._reconstruct(data)
+            for data in list(self._u64_to_doc.values())
+        }
 
     # ---- DocumentStore protocol ---------------------------------------
 
@@ -147,15 +203,17 @@ class TurboQuantDocumentStore:
     def filter_documents(
         self, filters: Optional[Dict[str, Any]] = None
     ) -> List[Document]:
+        # list() snapshots: reads iterate the doc table lock-free, so a
+        # concurrent writer must not invalidate the iteration mid-scan.
         if filters:
             self._validate_filters(filters)
             docs = [
                 self._reconstruct(data)
-                for data in self._u64_to_doc.values()
+                for data in list(self._u64_to_doc.values())
                 if document_matches_filter(filters=filters, document=self._reconstruct(data))
             ]
         else:
-            docs = [self._reconstruct(data) for data in self._u64_to_doc.values()]
+            docs = [self._reconstruct(data) for data in list(self._u64_to_doc.values())]
         # `return_embedding` is informational here — we never have the
         # full-precision embedding to begin with. Kept for parity.
         return docs
@@ -177,13 +235,50 @@ class TurboQuantDocumentStore:
         if policy == DuplicatePolicy.NONE:
             policy = DuplicatePolicy.FAIL
 
-        # First pass: validate and resolve duplicates according to policy.
-        # Duplicates are resolved against the batch-so-far as well as the
-        # existing store: InMemoryDocumentStore writes into its dict as it
-        # iterates, so a repeated id *within a single call* is resolved the
-        # same way a cross-call repeat would be. Without tracking the batch,
-        # every duplicate row still gets its own vector while _str_to_u64
-        # keeps only the last handle, orphaning the earlier vectors.
+        with self._write_lock:
+            return self._write_documents_locked(documents, policy)
+
+    def _write_documents_locked(
+        self, documents: List[Document], policy: DuplicatePolicy
+    ) -> int:
+        if policy == DuplicatePolicy.FAIL:
+            # Reference parity (issue #167): InMemoryDocumentStore commits
+            # each document as it iterates and raises on the *first*
+            # duplicate, so every non-duplicate document preceding it
+            # stays persisted — a partial write. Mirror that observable
+            # state exactly: validate and commit per document, raising on
+            # the first collision. A repeated id within a single call
+            # collides with its already-committed first instance, the same
+            # way a cross-call repeat would. Each individual commit is
+            # still all-or-nothing — validation precedes any mutation, so
+            # a failing document mid-batch never leaves the index and the
+            # id maps inconsistent (#89/#139 apply per document).
+            written = 0
+            for doc in documents:
+                if doc.id in self._str_to_u64:
+                    # Checked before embedding validation: the reference
+                    # raises DuplicateDocumentError for a colliding id
+                    # regardless of the document's other fields.
+                    raise DuplicateDocumentError(
+                        f"ID '{doc.id}' already exists in the document store."
+                    )
+                if doc.embedding is None:
+                    raise ValueError(
+                        f"Document {doc.id!r} has no embedding. "
+                        "TurboQuantDocumentStore only stores documents with precomputed "
+                        "embeddings — run an embedder component before writing."
+                    )
+                self._commit_batch([doc])
+                written += 1
+            return written
+
+        # SKIP / OVERWRITE: first pass validates and resolves duplicates
+        # against the batch-so-far as well as the existing store:
+        # InMemoryDocumentStore writes into its dict as it iterates, so a
+        # repeated id *within a single call* is resolved the same way a
+        # cross-call repeat would be. Without tracking the batch, every
+        # duplicate row still gets its own vector while _str_to_u64 keeps
+        # only the last handle, orphaning the earlier vectors.
         to_write: List[Document] = []
         batch_pos: Dict[str, int] = {}  # doc.id -> index into to_write
         to_remove: List[str] = []  # existing ids to drop, deferred past add
@@ -196,14 +291,9 @@ class TurboQuantDocumentStore:
                     "embeddings — run an embedder component before writing."
                 )
             present = doc.id in self._str_to_u64 or doc.id in batch_pos
-            if policy != DuplicatePolicy.OVERWRITE and present:
-                if policy == DuplicatePolicy.FAIL:
-                    raise DuplicateDocumentError(
-                        f"ID '{doc.id}' already exists in the document store."
-                    )
-                if policy == DuplicatePolicy.SKIP:
-                    written -= 1
-                    continue
+            if policy == DuplicatePolicy.SKIP and present:
+                written -= 1
+                continue
             if policy == DuplicatePolicy.OVERWRITE:
                 if doc.id in self._str_to_u64:
                     # Defer the removal until after the add succeeds so a
@@ -218,9 +308,28 @@ class TurboQuantDocumentStore:
             batch_pos[doc.id] = len(to_write)
             to_write.append(doc)
 
-        if not to_write:
-            return written
+        if to_write:
+            self._commit_batch(to_write, to_remove)
+        return written
 
+    def _commit_batch(
+        self, to_write: List[Document], to_remove: Iterable[str] = ()
+    ) -> None:
+        """Validate ``to_write``'s embeddings, populate the id maps, then
+        add the vectors to the index (dropping ``to_remove``'s old
+        handles last, index first).
+
+        Maps BEFORE the index add: a concurrent retrieval can only learn
+        a handle from the index, so an entry that is resolvable but not
+        yet searchable is invisible to readers (issue #161). Still
+        all-or-nothing with respect to the given batch: validation
+        precedes any mutation, and if the index add fails the
+        pre-inserted map entries are unwound (restoring the previous
+        mapping of any overwritten id), so a failure leaves the store
+        exactly as it was (issue #89). The FAIL path calls this with
+        single-document batches to get per-document commit semantics.
+        Callers hold the writer lock.
+        """
         vectors = np.asarray(
             [doc.embedding for doc in to_write], dtype=np.float32
         )
@@ -246,18 +355,35 @@ class TurboQuantDocumentStore:
             )
         if not vectors.flags["C_CONTIGUOUS"]:
             vectors = np.ascontiguousarray(vectors)
+        # Cosine mode: L2-normalize so the kernel's raw score is true
+        # cosine similarity. Pure numpy on the just-built batch (no
+        # embedder call — Haystack documents arrive pre-embedded), so
+        # doing it alongside the rest of the batch prep under the
+        # caller's writer lock adds no blocking work. Zero rows pass
+        # through unchanged.
+        if self._vectors_normalized:
+            vectors = l2_normalize_rows(vectors)
 
         handles = np.array(
             [self._issue_handle() for _ in to_write], dtype=np.uint64
         )
-        self._index.add_with_ids(vectors, handles)
 
-        # The add succeeded — now it's safe to drop the old vectors for any
-        # overwritten ids. Done before the mapping loop below so _remove_one
-        # resolves the old handle, not the one we're about to assign.
-        for doc_id in to_remove:
-            self._remove_one(doc_id)
+        # Capture the previous handle of every overwritten id BEFORE the
+        # forward map is updated, so a failed index add can restore it and
+        # the old vectors can be dropped once the add succeeds. Dict
+        # rather than list: `to_remove` can name an id twice when a batch
+        # repeats an id that already exists in the store.
+        old_handles = {
+            doc_id: self._str_to_u64[doc_id]
+            for doc_id in to_remove
+            if doc_id in self._str_to_u64
+        }
 
+        # Maps BEFORE the index add: a concurrent retrieval can only learn
+        # a handle from the index, so an entry that is resolvable but not
+        # yet searchable is invisible to readers (safe) — the reverse
+        # ordering let readers surface handles that did not resolve yet
+        # (issue #161).
         for doc, handle in zip(to_write, handles):
             h = int(handle)
             self._str_to_u64[doc.id] = h
@@ -271,19 +397,43 @@ class TurboQuantDocumentStore:
                 "blob": doc.blob,
                 "sparse_embedding": doc.sparse_embedding,
             }
-        return written
+        try:
+            self._index.add_with_ids(vectors, handles)
+        except BaseException:
+            # Unwind the pre-inserted map entries (and restore the previous
+            # mapping of any overwritten id) so a failed add leaves the
+            # store exactly as it was — preserving the issue-#89 guarantee
+            # under the maps-first ordering.
+            for doc, handle in zip(to_write, handles):
+                h = int(handle)
+                self._u64_to_doc.pop(h, None)
+                if self._str_to_u64.get(doc.id) == h:
+                    self._str_to_u64.pop(doc.id, None)
+            for doc_id, old_h in old_handles.items():
+                self._str_to_u64[doc_id] = old_h
+            raise
+
+        # The add succeeded — drop the old vectors for the overwritten ids,
+        # index first so each old handle stops being searchable before it
+        # stops resolving. The forward map already points at the new
+        # handles; the old payloads live under the old handles.
+        for old_h in old_handles.values():
+            self._index.remove(old_h)
+            self._u64_to_doc.pop(old_h, None)
 
     def delete_documents(self, document_ids: List[str]) -> None:
         # Haystack's protocol says silently ignore missing ids.
-        for doc_id in document_ids:
-            self._remove_one(doc_id)
+        with self._write_lock:
+            for doc_id in document_ids:
+                self._remove_one(doc_id)
 
     # ---- Utility methods (InMemoryDocumentStore parity) ---------------
 
     def delete_all_documents(self) -> None:
         """Delete every document in the store."""
-        for doc_id in list(self._str_to_u64.keys()):
-            self._remove_one(doc_id)
+        with self._write_lock:
+            for doc_id in list(self._str_to_u64.keys()):
+                self._remove_one(doc_id)
 
     def update_by_filter(
         self, filters: Dict[str, Any], meta: Dict[str, Any]
@@ -295,31 +445,33 @@ class TurboQuantDocumentStore:
         precision anyway. Returns the number of documents updated.
         """
         self._validate_filters(filters)
-        updated = 0
-        for data in self._u64_to_doc.values():
-            if document_matches_filter(filters=filters, document=self._reconstruct(data)):
-                data["meta"].update(meta)
-                updated += 1
-        return updated
+        with self._write_lock:
+            updated = 0
+            for data in self._u64_to_doc.values():
+                if document_matches_filter(filters=filters, document=self._reconstruct(data)):
+                    data["meta"].update(meta)
+                    updated += 1
+            return updated
 
     def delete_by_filter(self, filters: Dict[str, Any]) -> int:
         """Delete every document matching ``filters``. Returns the count."""
         self._validate_filters(filters)
-        matching_ids = [
-            data["id"]
-            for data in self._u64_to_doc.values()
-            if document_matches_filter(filters=filters, document=self._reconstruct(data))
-        ]
-        for doc_id in matching_ids:
-            self._remove_one(doc_id)
-        return len(matching_ids)
+        with self._write_lock:
+            matching_ids = [
+                data["id"]
+                for data in self._u64_to_doc.values()
+                if document_matches_filter(filters=filters, document=self._reconstruct(data))
+            ]
+            for doc_id in matching_ids:
+                self._remove_one(doc_id)
+            return len(matching_ids)
 
     def count_documents_by_filter(self, filters: Dict[str, Any]) -> int:
         if filters:
             self._validate_filters(filters)
             return sum(
                 1
-                for data in self._u64_to_doc.values()
+                for data in list(self._u64_to_doc.values())
                 if document_matches_filter(filters=filters, document=self._reconstruct(data))
             )
         return self.count_documents()
@@ -331,11 +483,11 @@ class TurboQuantDocumentStore:
             self._validate_filters(filters)
             docs_meta = [
                 data["meta"]
-                for data in self._u64_to_doc.values()
+                for data in list(self._u64_to_doc.values())
                 if document_matches_filter(filters=filters, document=self._reconstruct(data))
             ]
         else:
-            docs_meta = [data["meta"] for data in self._u64_to_doc.values()]
+            docs_meta = [data["meta"] for data in list(self._u64_to_doc.values())]
 
         result: Dict[str, int] = {}
         for field in metadata_fields:
@@ -346,8 +498,8 @@ class TurboQuantDocumentStore:
 
     def get_metadata_fields_info(self) -> Dict[str, Dict[str, str]]:
         type_map: Dict[str, str] = {}
-        for data in self._u64_to_doc.values():
-            for key, value in data["meta"].items():
+        for data in list(self._u64_to_doc.values()):
+            for key, value in list(data["meta"].items()):
                 if value is None:
                     continue
                 if isinstance(value, bool):
@@ -368,7 +520,7 @@ class TurboQuantDocumentStore:
         )
         values = [
             data["meta"][key]
-            for data in self._u64_to_doc.values()
+            for data in list(self._u64_to_doc.values())
             if key in data["meta"]
             and data["meta"][key] is not None
             and isinstance(data["meta"][key], (int, float, str))
@@ -391,7 +543,7 @@ class TurboQuantDocumentStore:
         if search_term:
             docs_data = [
                 data
-                for data in self._u64_to_doc.values()
+                for data in list(self._u64_to_doc.values())
                 if data["content"] and search_term.lower() in data["content"].lower()
             ]
         else:
@@ -442,10 +594,24 @@ class TurboQuantDocumentStore:
         kernel never wastes work on non-matching documents and the result
         count is always ``min(top_k, n_matches)`` rather than ``< top_k``
         when the filter is selective.
+
+        :raises ValueError: if ``query_embedding`` is empty or does not
+            hold numbers, if its dim does not match the store's, or if
+            ``top_k`` is negative. (``top_k=-1`` is rejected here where
+            ``InMemoryDocumentStore`` returns ``n - 1`` documents — a
+            negative count is a caller bug, not a request.)
         """
         # `return_embedding` is accepted but we never have the full
         # embedding to populate; left as-is for signature parity.
         _ = return_embedding  # noqa: F841
+
+        # Up-front validation, matching the reference: an empty or
+        # non-numeric query embedding is a caller error regardless of
+        # whether the store happens to be empty (issue #301). `Real`
+        # rather than the reference's `isinstance(..., float)` so numpy
+        # scalars and ints are accepted.
+        if len(query_embedding) == 0 or not isinstance(query_embedding[0], Real):
+            raise ValueError("query_embedding should be a non-empty list of floats.")
 
         if self.count_documents() == 0:
             return []
@@ -459,6 +625,10 @@ class TurboQuantDocumentStore:
             raise ValueError(
                 f"query_embedding dim {qvec.shape[1]} does not match store dim {expected_dim}"
             )
+        # Cosine mode: normalize the query so the raw score against unit
+        # document vectors is true cosine similarity.
+        if self._vectors_normalized:
+            qvec = l2_normalize_rows(qvec)
         if not qvec.flags["C_CONTIGUOUS"]:
             qvec = np.ascontiguousarray(qvec)
 
@@ -467,23 +637,58 @@ class TurboQuantDocumentStore:
             scores, handles = self._index.search(qvec, fetch_k)
         else:
             self._validate_filters(filters)
-            # Resolve filter → handle allowlist by walking the in-memory
-            # doc table once. This is the same O(N) cost as the old
-            # post-filter pass, just moved upfront so the kernel can score
-            # only matching vectors.
-            allowed_handles = [
-                handle
-                for handle, data in self._u64_to_doc.items()
-                if document_matches_filter(filters, self._reconstruct(data))
-            ]
-            if not allowed_handles:
-                return []
-            allowlist = np.asarray(allowed_handles, dtype=np.uint64)
-            scores, handles = self._index.search(qvec, top_k, allowlist=allowlist)
+            for _attempt in range(8):
+                # Resolve filter → handle allowlist by walking the in-memory
+                # doc table once. This is the same O(N) cost as the old
+                # post-filter pass, just moved upfront so the kernel can
+                # score only matching vectors. list() snapshot: a concurrent
+                # writer must not invalidate the iteration mid-scan.
+                allowed_handles = [
+                    handle
+                    for handle, data in list(self._u64_to_doc.items())
+                    if document_matches_filter(filters, self._reconstruct(data))
+                ]
+                if not allowed_handles:
+                    return []
+                allowlist = np.asarray(allowed_handles, dtype=np.uint64)
+                try:
+                    scores, handles = self._index.search(qvec, top_k, allowlist=allowlist)
+                    break
+                except KeyError:
+                    # The allowlist went stale: a delete landed between the
+                    # snapshot above and the kernel's membership check.
+                    # Rebuild the allowlist and retry.
+                    continue
+            else:
+                # Sustained churn kept invalidating the allowlist. Fall back
+                # to an unfiltered search plus a tolerant Python-side
+                # post-filter, which cannot raise (a retrieval overlapping
+                # heavy churn may return fewer than top_k documents).
+                fetch_k = min(max(top_k * 4, 32), len(self._index) or 1)
+                scores, handles = self._index.search(qvec, fetch_k)
+                out: List[Document] = []
+                for score, handle in zip(scores[0], handles[0]):
+                    data = self._u64_to_doc.get(int(handle))
+                    if data is None:
+                        continue
+                    if not document_matches_filter(filters, self._reconstruct(data)):
+                        continue
+                    out.append(
+                        self._reconstruct(data, score=float(score), scale_score=scale_score)
+                    )
+                    if len(out) >= top_k:
+                        break
+                return out
 
-        out: List[Document] = []
+        out = []
         for score, handle in zip(scores[0], handles[0]):
-            data = self._u64_to_doc[int(handle)]
+            # Tolerant translation: a handle surfaced by the index can stop
+            # resolving if a delete completes between the kernel search and
+            # this loop (the reader-straddle). Skip it — the document is
+            # gone either way — rather than raising KeyError mid-retrieval.
+            data = self._u64_to_doc.get(int(handle))
+            if data is None:
+                continue
             out.append(self._reconstruct(data, score=float(score), scale_score=scale_score))
         return out
 
@@ -606,11 +811,15 @@ class TurboQuantDocumentStore:
 
     # Side-car schema. Bump when the on-disk shape changes; loader
     # accepts the current version plus any older versions whose missing
-    # fields we know how to reconstruct (currently v1, written before
-    # blob / sparse_embedding round-trip was added — both default to None
-    # on load).
-    _DOCSTORE_SCHEMA_VERSION = 2
-    _DOCSTORE_SCHEMA_COMPAT = (1, 2)
+    # fields we know how to reconstruct:
+    #   - v1 was written before blob / sparse_embedding round-trip was
+    #     added — both default to None on load.
+    #   - v1 and v2 predate the `vectors_normalized` field (the
+    #     similarity function only chose the scale_score formula then,
+    #     and vectors were always stored raw) — both load with
+    #     normalization off, keeping their scoring byte-identical.
+    _DOCSTORE_SCHEMA_VERSION = 3
+    _DOCSTORE_SCHEMA_COMPAT = (1, 2, 3)
 
     def save_to_disk(self, folder_path: str | Path) -> None:
         """Persist the quantized index plus the Haystack side-car to disk.
@@ -626,27 +835,36 @@ class TurboQuantDocumentStore:
         """
         folder = Path(folder_path)
         folder.mkdir(parents=True, exist_ok=True)
-        # Keys in `_u64_to_doc` are ints (u64 handles); JSON object keys
-        # must be strings. Serialize as a list of [handle, data] pairs
-        # so we don't lose type fidelity on the round-trip.
-        payload = {
-            "schema_version": self._DOCSTORE_SCHEMA_VERSION,
-            "u64_to_doc": [
-                [h, self._serialize_doc_data(d)] for h, d in self._u64_to_doc.items()
-            ],
-            "next_u64": self._next_u64,
-            "bit_width": self._bit_width,
-            "embedding_similarity_function": self.embedding_similarity_function,
-            "return_embedding": self.return_embedding,
-        }
-        # Atomic: serializes in memory first, then temp-file + replace,
-        # so a failed save can't destroy a previous store at this path.
-        atomic_save(
-            self._index,
-            folder / "index.tvim",
-            payload,
-            folder / "docstore.json",
-        )
+        # Serializes with writers: snapshotting the maps and the index
+        # concurrently with a write would persist a torn store to disk.
+        # Reads may proceed while a save runs.
+        with self._write_lock:
+            # Keys in `_u64_to_doc` are ints (u64 handles); JSON object keys
+            # must be strings. Serialize as a list of [handle, data] pairs
+            # so we don't lose type fidelity on the round-trip.
+            payload = {
+                "schema_version": self._DOCSTORE_SCHEMA_VERSION,
+                "u64_to_doc": [
+                    [h, self._serialize_doc_data(d)] for h, d in self._u64_to_doc.items()
+                ],
+                "next_u64": self._next_u64,
+                "bit_width": self._bit_width,
+                "embedding_similarity_function": self.embedding_similarity_function,
+                "return_embedding": self.return_embedding,
+                # Whether the persisted index holds L2-normalized vectors
+                # (v3+). Distinct from the similarity function: a store
+                # loaded from a pre-mode side-car keeps raw vectors even
+                # when its recorded function is "cosine".
+                "vectors_normalized": self._vectors_normalized,
+            }
+            # Atomic: serializes in memory first, then temp-file + replace,
+            # so a failed save can't destroy a previous store at this path.
+            atomic_save(
+                self._index,
+                folder / "index.tvim",
+                payload,
+                folder / "docstore.json",
+            )
 
     @classmethod
     def load_from_disk(
@@ -661,11 +879,11 @@ class TurboQuantDocumentStore:
         with open(folder / "docstore.json") as f:
             state = json.load(f)
         version = state.get("schema_version", 0)
-        if version not in cls._DOCSTORE_SCHEMA_COMPAT:
-            raise ValueError(
-                f"docstore.json has schema version {version}; "
-                f"this turbovec accepts versions {list(cls._DOCSTORE_SCHEMA_COMPAT)}"
-            )
+        check_schema_version(
+            version,
+            cls._DOCSTORE_SCHEMA_COMPAT,
+            prefix="docstore.json has schema version",
+        )
         store = cls(
             bit_width=state["bit_width"],
             embedding_similarity_function=state.get(
@@ -673,6 +891,12 @@ class TurboQuantDocumentStore:
             ),
             return_embedding=state.get("return_embedding", False),
         )
+        # v1/v2 side-cars predate mode-governed storage: their vectors
+        # were written raw regardless of the recorded similarity
+        # function, so normalization stays off for them — queries run
+        # raw and scoring is byte-identical to the store that wrote the
+        # file. v3+ restores the recorded flag.
+        store._vectors_normalized = state.get("vectors_normalized", False)
         # Reload the index — it carries dim internally (None for lazy
         # uncommitted, int otherwise).
         store._index = IdMapIndex.load(str(folder / "index.tvim"))
@@ -696,17 +920,99 @@ class TurboQuantDocumentStore:
             raise ValueError(
                 "persisted store is corrupt: duplicate document ids in the side-car"
             )
-        check_persisted_handles(store._index, store._u64_to_doc.keys(), what="document")
+        check_persisted_handles(
+            store._index,
+            store._u64_to_doc.keys(),
+            what="document",
+            next_u64=store._next_u64,
+        )
         return store
+
+    # ---- Copy & pickle ------------------------------------------------
+    #
+    # The Rust index is not directly picklable; it round-trips through
+    # the core's in-memory ``.tvim`` byte format
+    # (``IdMapIndex.to_bytes`` / ``from_bytes``). The per-store lock and
+    # the async executor are excluded from the state — neither can cross
+    # pickling — and recreated on restore; a restored/copied store always
+    # owns a fresh executor, even when the original wrapped a
+    # caller-provided one.
+    #
+    # The calibration state round-trips exactly through the copy: an
+    # uncalibrated index copies as uncalibrated, a calibrated one keeps
+    # its fitted pair. A copy is byte-for-byte what ``write`` would have
+    # produced.
+
+    @staticmethod
+    def _snapshot_doc(data: Dict[str, Any]) -> Dict[str, Any]:
+        """Copy a per-doc payload deeply enough that no in-place store
+        mutation can reach the snapshot: ``update_by_filter`` mutates the
+        payload's ``meta`` dict in place, so sharing it would let a write
+        landing after ``__getstate__`` returns tear the pickle
+        mid-serialization."""
+        out = dict(data)
+        meta = out.get("meta")
+        if isinstance(meta, dict):
+            out["meta"] = dict(meta)
+        return out
+
+    def __getstate__(self) -> Dict[str, Any]:
+        # Snapshot under the writer lock so the index bytes and the
+        # side-car maps come from one consistent store state (the same
+        # guarantee save_to_disk() gives the on-disk pair). Everything
+        # the store mutates in place is copied (the maps, the per-doc
+        # payload dicts and their meta sub-dicts) so a write landing
+        # after this returns cannot desync — or tear — the captured pair.
+        with self._write_lock:
+            state = self.__dict__.copy()
+            del state["_write_lock"]
+            del state["executor"]
+            del state["_owns_executor"]
+            state["_index"] = self._index.to_bytes()
+            state["_str_to_u64"] = dict(self._str_to_u64)
+            state["_u64_to_doc"] = {
+                h: self._snapshot_doc(d) for h, d in self._u64_to_doc.items()
+            }
+        return state
+
+    def __setstate__(self, state: Dict[str, Any]) -> None:
+        state = dict(state)
+        index_bytes = state.pop("_index")
+        self.__dict__.update(state)
+        self._index = IdMapIndex.from_bytes(index_bytes)
+        self._write_lock = threading.RLock()
+        self._owns_executor = True
+        self.executor = ThreadPoolExecutor(
+            thread_name_prefix=f"async-turbovec-docstore-executor-{id(self)}",
+            max_workers=1,
+        )
+
+    def __deepcopy__(self, memo: Dict[int, Any]) -> "TurboQuantDocumentStore":
+        new = self.__class__.__new__(self.__class__)
+        new.__setstate__(_copy.deepcopy(self.__getstate__(), memo))
+        return new
+
+    def __copy__(self) -> "TurboQuantDocumentStore":
+        # Deliberately identical to __deepcopy__: there is no meaningful
+        # shallow copy of a store. Sharing the mutable Rust index between
+        # two store objects means every mutation of one silently mutates
+        # the other (issue #149), so ``copy.copy`` returns an independent
+        # copy instead of an alias.
+        return self.__deepcopy__({})
 
     # ---- Internals ----------------------------------------------------
 
     def _remove_one(self, doc_id: str) -> bool:
-        handle = self._str_to_u64.pop(doc_id, None)
+        # Callers hold the writer lock. Index first: the handle stops
+        # being searchable before it stops resolving, so a concurrent
+        # retrieval can never surface a handle whose side-car entry is
+        # already gone.
+        handle = self._str_to_u64.get(doc_id)
         if handle is None:
             return False
-        del self._u64_to_doc[handle]
         self._index.remove(handle)
+        self._str_to_u64.pop(doc_id, None)
+        self._u64_to_doc.pop(handle, None)
         return True
 
     def _reconstruct(
@@ -718,8 +1024,12 @@ class TurboQuantDocumentStore:
         if score is not None and scale_score:
             # Match Haystack's InMemoryDocumentStore._compute_query_embedding_similarity_scores
             # (document_store.py:818-822): different formula per similarity
-            # function. turbovec uses unit-normalized vectors so the cosine
-            # branch is the natural default.
+            # function. Under the default cosine mode both sides are
+            # unit-normalized, so the raw score feeding the cosine branch
+            # really is cosine in [-1, 1]. (A store loaded from a
+            # pre-mode side-car can reach the cosine branch with raw
+            # inner products — that keeps the exact behavior it was
+            # written under; see the class docstring.)
             if self.embedding_similarity_function == "dot_product":
                 score = 1.0 / (1.0 + math.exp(-score / 100.0))
             elif self.embedding_similarity_function == "cosine":

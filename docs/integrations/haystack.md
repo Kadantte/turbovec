@@ -1,6 +1,6 @@
 # Haystack integration
 
-`turbovec.haystack.TurboQuantDocumentStore` is a Haystack 2.x [`DocumentStore`](https://docs.haystack.deepset.ai/docs/document-store) backed by an `IdMapIndex`. It implements the same public surface as `haystack.document_stores.in_memory.InMemoryDocumentStore` and can be used as a drop-in replacement wherever the in-memory store is used.
+`turbovec.haystack.TurboQuantDocumentStore` is a Haystack [`DocumentStore`](https://docs.haystack.deepset.ai/docs/document-store) backed by an `IdMapIndex`. It implements the same public surface as `haystack.document_stores.in_memory.InMemoryDocumentStore`, so anywhere that store is *written to or read from directly* it can be swapped in. The query half of a RAG pipeline is not part of that surface — see [Using in a Haystack Pipeline](#using-in-a-haystack-pipeline) for the retriever you have to bring yourself.
 
 ## Install
 
@@ -41,10 +41,17 @@ TurboQuantDocumentStore(
 | Parameter | Notes |
 |---|---|
 | `dim` | Optional. When omitted the vector dimensionality is inferred from the first `write_documents` call. |
-| `bit_width` | Quantization width per coordinate; one of `{2, 4}`. |
-| `embedding_similarity_function` | Drives the `scale_score=True` formula on retrieval. Defaults to `"cosine"` (right for unit-normalized embeddings); `"dot_product"` uses Haystack's `expit(s / 100)` formula. |
+| `bit_width` | Quantization width per coordinate; one of `{2, 3, 4}`. |
+| `embedding_similarity_function` | The store's similarity mode — see [Similarity modes](#similarity-modes). Selects both how vectors are stored (`"cosine"`, the default, normalizes; `"dot_product"` keeps them raw) and the `scale_score=True` formula on retrieval. Any other value raises `ValueError`. |
 | `async_executor` | Optional `ThreadPoolExecutor` for the `*_async` methods. If omitted, a single-threaded executor is created and cleaned up with the store. |
 | `return_embedding` | Accepted for API parity with `InMemoryDocumentStore`. The full-precision embedding is never available (quantized away), so `Document.embedding` on retrieved docs is always `None` regardless of the flag. |
+
+## Similarity modes
+
+`embedding_similarity_function` selects how scores are computed. It is fixed for the lifetime of the store:
+
+- **`"cosine"` (default).** Document embeddings are L2-normalized at write time and query embeddings at retrieval time, so raw scores are cosine similarity in `[-1, 1]` for embeddings of any magnitude, ranking matches `InMemoryDocumentStore`'s cosine branch, and `scale_score=True` maps scores into `[0, 1]` via `(s + 1) / 2` preserving order. Zero vectors are kept as-is and score `0` against everything (matching the reference, which substitutes a norm of 1 for zero-norm vectors).
+- **`"dot_product"`.** Vectors are stored and queried raw: scores are raw inner products and ranking is magnitude-aware — matching `InMemoryDocumentStore`'s dot-product branch. `scale_score=True` applies the reference's `expit(s / 100)` sigmoid.
 
 ## `DuplicatePolicy`
 
@@ -60,6 +67,8 @@ store.write_documents(docs, policy=DuplicatePolicy.OVERWRITE) # remove-then-re-a
 ```
 
 Returns the number of documents actually written (so `SKIP` may return less than `len(docs)`).
+
+Under `FAIL` (and `NONE`), documents are committed one at a time in batch order and the `DuplicateDocumentError` is raised on the first colliding id — every non-duplicate document *before* the collision stays persisted, matching `InMemoryDocumentStore`'s post-exception state exactly.
 
 ## Delete
 
@@ -96,6 +105,8 @@ results = store.embedding_retrieval(
 ```
 
 Filter evaluation is delegated to `haystack.utils.filters.document_matches_filter` — anything Haystack's own stores support, we support.
+
+`embedding_retrieval` validates `query_embedding` up front and raises `ValueError("query_embedding should be a non-empty list of floats.")` for an empty or non-numeric vector, matching `InMemoryDocumentStore`. A negative `top_k` also raises, where the reference returns `n - 1` documents.
 
 For `embedding_retrieval`, filters are resolved to an allowlist **before** scoring rather than via post-filtering. Selective filters return up to `top_k` matches from the filtered set; you never get fewer than `top_k` results just because the filter happened to exclude the top-scoring candidates.
 
@@ -144,16 +155,33 @@ Document metadata must be JSON-serializable — the same constraint `InMemoryDoc
 
 `save_to_disk` is atomic with respect to the destination: both files are written to sibling temp files and moved into place, so a failed save (e.g. non-JSON-serializable metadata) leaves a store previously saved at the same path intact.
 
+The store also supports `pickle` (e.g. for `multiprocessing` workers; the restored store owns a fresh async executor) and `copy.copy` / `copy.deepcopy` — both copies return a fully independent store (there is no shallow copy that shares the underlying index).
+
 ## Using in a Haystack Pipeline
 
 `TurboQuantDocumentStore` implements `to_dict` / `from_dict` so it can be serialized as part of a Haystack `Pipeline`. `to_dict` captures the component *config* (`dim`, `bit_width`, `embedding_similarity_function`, `return_embedding`); persisting the stored documents is the job of `save_to_disk` / `load_from_disk`.
 
-Plug into a standard RAG pipeline the same way you'd use `InMemoryDocumentStore`:
+Plug into a standard RAG pipeline, with two differences from `InMemoryDocumentStore` worth knowing before you wire it up.
+
+**No paired retriever ships.** In Haystack the query half of a pipeline is a store-specific `@component` retriever, and core's `InMemoryEmbeddingRetriever` hard-rejects any store that is not the in-memory one. turbovec does not ship a retriever, so supply your own thin component that calls `store.embedding_retrieval(...)`, or query the store directly outside the pipeline.
+
+**Reloading a serialized pipeline needs an allowlist.** `to_dict` / `from_dict` work, but on haystack-ai 3.x — permitted by the declared `haystack-ai>=2.23.0` floor — deserializing a pipeline that references an out-of-tree store raises `DeserializationError` unless the module is trusted. `InMemoryDocumentStore` is exempt because Haystack trusts its own module:
+
+```python
+Pipeline.loads(pipeline.dumps())                                    # DeserializationError
+Pipeline.loads(pipeline.dumps(), allowed_modules=["turbovec.haystack"])   # OK
+```
+
+`HAYSTACK_DESERIALIZATION_ALLOWLIST` sets the same thing process-wide.
+
+The sentence-transformers embedders live in their own integration package (`pip install sentence-transformers-haystack`, which requires `haystack-ai` 2.24 or newer):
 
 ```python
 from haystack import Pipeline
-from haystack.components.embedders import SentenceTransformersDocumentEmbedder
 from haystack.components.writers import DocumentWriter
+from haystack_integrations.components.embedders.sentence_transformers import (
+    SentenceTransformersDocumentEmbedder,
+)
 
 store = TurboQuantDocumentStore()                 # dim inferred from first batch
 indexing = Pipeline()
@@ -165,6 +193,22 @@ indexing.connect("embedder.documents", "writer.documents")
 
 indexing.run({"embedder": {"documents": my_docs}})
 ```
+
+## Thread safety
+
+The store is safe for concurrent multi-threaded use:
+
+- **Reads run concurrently and scale.** `embedding_retrieval`, `filter_documents`, the count and metadata helpers, and `storage` take no lock; the underlying index releases the GIL during scoring, so independent retrievals from multiple threads overlap and scale.
+- **Writes serialize.** `write_documents`, `delete_documents` / `delete_all_documents` / `delete_by_filter`, `update_by_filter`, and `save_to_disk` serialize on a per-store lock. The `*_async` variants delegate to the same locked bodies.
+- **A read overlapping a write sees pre- or post-write state** — never a torn one. Under heavy concurrent churn a retrieval may transiently return fewer than `top_k` documents (hits deleted mid-retrieval are skipped).
+
+What the contract does *not* cover:
+
+- **No cross-call atomicity.** A caller-side check-then-act sequence (`count_documents` then `filter_documents`) can interleave with other writers. Batch writes are not atomic with respect to readers: a retrieval overlapping an `OVERWRITE` write can briefly see a document id under both its old and new entry.
+- **`save_to_disk` serializes with writes** (so it always snapshots a consistent store); reads may proceed during a save.
+- **`to_dict` / `from_dict` and the executor lifecycle** are assumed single-threaded.
+- **Two stores writing to the same path is safe.** Concurrent `save_to_disk` calls to one destination from several threads each publish atomically and the last writer wins; a caller never sees a torn file, and never an error caused only by the other writer. Which writer wins is not defined.
+- **Multi-process access is not supported.**
 
 ## Known limitations
 

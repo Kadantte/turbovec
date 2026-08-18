@@ -5,18 +5,36 @@ Install with: ``pip install turbovec[agno]``.
 Implements Agno's ``VectorDb`` interface and matches the public surface
 of ``agno.vectordb.lancedb.LanceDb`` (the closest in-tree single-machine
 backend) so this can be swapped in wherever ``LanceDb`` is used.
+
+The ``async_*`` methods run the index work on a worker thread
+(``asyncio.to_thread``) so the event loop stays responsive while a large
+insert or search is in flight (issue #342). That is the same shape
+Agno's own sync-backed vector DBs use (``chromadb``, ``pgvector``,
+``cassandra``, ``pineconedb`` all wrap their sync bodies in
+``asyncio.to_thread``). Cancelling the awaiting task returns control to
+the caller immediately, but it does **not** decide the insert's fate: a
+worker that already started runs to completion (work inside the Rust core
+is not interruptible), while a call still queued behind a saturated
+executor is cancelled before it ever runs. A cancelled insert is
+therefore "outcome unknown" — it may have fully committed, or may never
+have begun. The one guarantee is that it is all-or-nothing: the store is
+never left torn.
 """
 
 from __future__ import annotations
 
+import asyncio
+import copy as _copy
 import json
+import threading
 from hashlib import md5
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Set, Union
 
 import numpy as np
 
-from ._persist import check_persisted_handles
+from ._persist import check_persisted_handles, check_schema_version
+from ._similarity import l2_normalize_rows
 from ._turbovec import IdMapIndex
 from ._persist import atomic_save  # isort:skip
 
@@ -36,8 +54,30 @@ except ImportError as exc:
 
 _INDEX_FILENAME = "index.tvim"
 _STORE_FILENAME = "docstore.json"
-# Bump when docstore.json shape changes; loader refuses unknown versions.
-_DOCSTORE_SCHEMA_VERSION = 1
+# Bump when docstore.json shape changes; loader accepts the current
+# version plus any older versions whose missing fields we know how to
+# reconstruct (v1 predates the `distance` field — those stores hold raw,
+# unnormalized vectors, so they load as Distance.max_inner_product,
+# which is exactly the scoring they were written under).
+_DOCSTORE_SCHEMA_VERSION = 2
+_DOCSTORE_SCHEMA_COMPAT = (1, 2)
+
+
+def _embedder_has_async(embedder: "Embedder") -> bool:
+    """True when this embedder really implements the async single-embed
+    path, rather than inheriting the base's stub.
+
+    The question has to be asked of the *embedder*, not the document.
+    Every ``agno`` ``Document`` defines ``async_embed``, so a
+    ``hasattr(doc, "async_embed")`` test is unconditionally true — it
+    would route a sync-only embedder into ``Document.async_embed``, which
+    delegates to ``Embedder.async_get_embedding_and_usage`` and raises
+    ``NotImplementedError`` on the base class. Comparing the bound
+    attribute against the base's distinguishes an override from the stub.
+    """
+    base = getattr(Embedder, "async_get_embedding_and_usage", None)
+    own = getattr(type(embedder), "async_get_embedding_and_usage", None)
+    return own is not None and own is not base
 
 
 class TurboQuantVectorDb(VectorDb):
@@ -45,10 +85,50 @@ class TurboQuantVectorDb(VectorDb):
 
     Vectors are quantized to 2-4 bits per dimension. The public surface
     mirrors ``agno.vectordb.lancedb.LanceDb`` so this is a drop-in
-    replacement wherever a single-machine LanceDb is used. Search-time
+    replacement wherever a single-machine LanceDb is used.
+
+    **Similarity modes.** ``distance=Distance.cosine`` (default)
+    L2-normalizes document embeddings at insert time and query
+    embeddings at search time, so the kernel's raw score is cosine
+    similarity in ``[-1, 1]`` and ``similarity_threshold`` filtering
+    (which compares against that cosine directly, as agno's
+    ``normalize_cosine`` and the pgvector backend both do — a negative
+    cosine clamps to 0) is meaningful for embeddings of any magnitude.
+    ``distance=Distance.max_inner_product`` stores and queries raw
+    vectors: ranking is by raw inner product (magnitude-aware) and
+    ``similarity_threshold`` values are dataset-relative — the mapped
+    score saturates at 0/1 once raw scores leave ``[-1, 1]``, so
+    calibrate thresholds against your own embedder or leave the
+    threshold unset. ``Distance.l2`` is not supported. The mode is fixed
+    at construction and recorded by :meth:`save`; loading a save whose
+    recorded mode conflicts with the constructor's raises ``ValueError``
+    (saves from before the mode existed load as raw
+    ``max_inner_product`` — the scoring they were written under — and
+    ``self.distance`` is updated to match).
+
+    Search-time
     filtering is resolved to an allowlist *before* scoring (kernel-level)
     rather than via post-filtering, so selective filters return up to
-    ``limit`` results from the filtered set instead of fewer.
+    ``limit`` results from the filtered set instead of fewer. Search
+    results are deduplicated by content (``md5(doc.content)``, first
+    occurrence kept) as the final step, matching ``LanceDb.search`` —
+    when duplicate-content hits exist, callers receive fewer than
+    ``limit`` documents.
+
+    **Thread safety.** The store is safe for concurrent multi-threaded
+    use. Reads (``search``, existence checks, ``get_count``) run
+    concurrently and scale across threads; writes (``insert``,
+    ``upsert``, ``delete_by_*``, ``update_metadata``, ``drop``,
+    ``save``) serialize on a per-store lock — the ``async_*`` variants
+    delegate to the same locked bodies. A read that overlaps a write
+    sees either the pre- or post-write state — never a torn one — and
+    under heavy concurrent churn a search may transiently return fewer
+    than ``limit`` results. There is no cross-call atomicity: a
+    caller-side check-then-act sequence (e.g. ``id_exists`` then
+    ``delete_by_id``) can still interleave with other writers.
+    Embedders and rerankers are invoked outside the store's lock and
+    must be thread-safe themselves. Multi-process access is not
+    supported.
 
     Example::
 
@@ -79,13 +159,14 @@ class TurboQuantVectorDb(VectorDb):
             and queries. ``embedder.dimensions`` must be set — it's the
             sole source of truth for the underlying quantized index's
             dimensionality.
-        :param bit_width: Quantization width (2 or 4).
+        :param bit_width: Quantization width (2, 3, or 4).
         :param search_type: Only :class:`SearchType.vector` is supported;
             other values raise :class:`ValueError`. (Keyword/hybrid search
             would require an external BM25/lexical index.)
-        :param distance: Only :class:`Distance.cosine` is supported.
-            turbovec stores unit-normalized vectors, so the kernel's raw
-            score is cosine similarity directly.
+        :param distance: :class:`Distance.cosine` (default) or
+            :class:`Distance.max_inner_product` — see the class
+            docstring. :class:`Distance.l2` raises :class:`ValueError`.
+            Fixed for the lifetime of the store.
         :param reranker: Optional Agno reranker applied to the result set
             after vector retrieval.
         :param path: Optional directory for save/load persistence. When
@@ -105,23 +186,27 @@ class TurboQuantVectorDb(VectorDb):
             )
         if embedder.dimensions is None:
             raise ValueError("Embedder.dimensions must be set.")
-        if bit_width not in (2, 4):
-            raise ValueError(f"bit_width must be 2 or 4, got {bit_width}")
+        if bit_width not in (2, 3, 4):
+            raise ValueError(f"bit_width must be 2, 3, or 4, got {bit_width}")
         if search_type != SearchType.vector:
             raise ValueError(
                 f"TurboQuantVectorDb only supports search_type=SearchType.vector; "
                 f"got {search_type}. Use LanceDb / Chroma / etc. for keyword "
                 f"or hybrid search."
             )
-        if distance != Distance.cosine:
+        if distance not in (Distance.cosine, Distance.max_inner_product):
             raise ValueError(
-                f"TurboQuantVectorDb only supports distance=Distance.cosine; "
-                f"got {distance}. turbovec stores unit-normalized vectors."
+                f"TurboQuantVectorDb supports distance=Distance.cosine or "
+                f"distance=Distance.max_inner_product; got {distance}. "
+                f"L2 distance is not supported by the underlying "
+                f"inner-product kernel."
             )
 
         self.embedder: Embedder = embedder
         self.dimensions: int = embedder.dimensions
         self.bit_width = bit_width
+        # Assigned through the validating property below, so the guard
+        # applies to runtime mutation as well as construction.
         self.search_type = search_type
         self.distance = distance
         self.reranker = reranker
@@ -146,6 +231,13 @@ class TurboQuantVectorDb(VectorDb):
         # Auxiliary indexes for O(1) protocol queries
         self._content_hashes: Set[str] = set()
         self._name_to_ids: Dict[str, Set[str]] = {}
+        # Serializes every mutation (insert / upsert / delete / update /
+        # drop / save). Readers do NOT take this lock — search stays
+        # lock-free so concurrent reads keep scaling across threads
+        # (#186); reader safety comes from mutation ordering plus
+        # tolerant handle resolution instead. RLock: upsert nests into
+        # insert and _remove_handle.
+        self._write_lock = threading.RLock()
 
     # ---- handle allocation ------------------------------------------------
 
@@ -162,21 +254,33 @@ class TurboQuantVectorDb(VectorDb):
         If ``path`` was set on the constructor and a previous save exists
         under it, ``create()`` loads that save; otherwise it instantiates
         a fresh empty index sized to ``embedder.dimensions``.
+
+        Raises:
+            FileNotFoundError: if the folder holds only *part* of a save
+                (one of ``index.tvim`` / ``docstore.json``). Starting
+                fresh there would look empty and the next ``save()``
+                would overwrite the surviving file, so a partial store is
+                a hard error instead (issue #328).
         """
-        if self._index is not None:
-            return
-        # Try loading from path first if one was set; fall through to a
-        # fresh index if the path doesn't contain a previous save.
-        if self.path is not None and Path(self.path).is_dir():
-            try:
-                self._load_from(Path(self.path))
+        with self._write_lock:
+            if self._index is not None:
                 return
-            except FileNotFoundError:
-                pass
-        self._index = IdMapIndex(self.dimensions, self.bit_width)
+            # Only a folder with neither artifact is a genuinely fresh
+            # path; anything else must load, and any load failure
+            # propagates rather than defaulting to an empty index.
+            if self.path is not None and Path(self.path).is_dir():
+                folder = Path(self.path)
+                if (folder / _INDEX_FILENAME).exists() or (
+                    folder / _STORE_FILENAME
+                ).exists():
+                    self._load_from(folder)
+                    return
+            self._index = IdMapIndex(self.dimensions, self.bit_width)
 
     async def async_create(self) -> None:
-        self.create()
+        # create() can load a persisted index off disk — real I/O plus a
+        # full deserialize, so it does not belong on the loop thread.
+        await asyncio.to_thread(self.create)
 
     def drop(self) -> None:
         """Drop the underlying index. After this call ``exists()`` returns
@@ -186,19 +290,21 @@ class TurboQuantVectorDb(VectorDb):
         # fresh instead of reloading — and resurrecting — the dropped
         # data (issue #169). Matches LanceDb's drop_table, which deletes
         # the on-disk table.
-        if self.path is not None:
-            folder = Path(self.path)
-            for filename in (_INDEX_FILENAME, _STORE_FILENAME):
-                (folder / filename).unlink(missing_ok=True)
-        self._index = None
-        self._str_to_u64.clear()
-        self._u64_to_doc.clear()
-        self._next_u64 = 0
-        self._content_hashes.clear()
-        self._name_to_ids.clear()
+        with self._write_lock:
+            if self.path is not None:
+                folder = Path(self.path)
+                for filename in (_INDEX_FILENAME, _STORE_FILENAME):
+                    (folder / filename).unlink(missing_ok=True)
+            self._index = None
+            self._str_to_u64.clear()
+            self._u64_to_doc.clear()
+            self._next_u64 = 0
+            self._content_hashes.clear()
+            self._name_to_ids.clear()
 
     async def async_drop(self) -> None:
-        self.drop()
+        # drop() unlinks the persisted artifacts: filesystem work.
+        await asyncio.to_thread(self.drop)
 
     def exists(self) -> bool:
         """True iff the underlying index has been created via ``create()``
@@ -208,6 +314,8 @@ class TurboQuantVectorDb(VectorDb):
         return self._index is not None
 
     async def async_exists(self) -> bool:
+        # O(1) attribute read — offloading it would cost more than it
+        # saves, and it cannot block the loop measurably.
         return self.exists()
 
     def delete(self) -> bool:
@@ -229,6 +337,7 @@ class TurboQuantVectorDb(VectorDb):
         return len(self._index)
 
     async def async_get_count(self) -> int:
+        # O(1) len() — see async_exists.
         return self.get_count()
 
     # ---- VectorDb protocol: existence checks ------------------------------
@@ -241,6 +350,7 @@ class TurboQuantVectorDb(VectorDb):
     async def async_name_exists(self, name: str) -> bool:
         # LanceDb raises NotImplementedError here; we have a trivial sync
         # backing call, so we return the real answer. Intentional deviation.
+        # A single dict lookup — see async_exists; not worth a thread hop.
         return self.name_exists(name)
 
     def id_exists(self, id: str) -> bool:
@@ -325,9 +435,38 @@ class TurboQuantVectorDb(VectorDb):
                 if j < len(embeddings):
                     doc.embedding = embeddings[j]
                     doc.usage = usages[j] if j < len(usages) else None
+        elif _embedder_has_async(self.embedder):
+            # No async batch path — the default for every shipped agno
+            # embedder, since `Embedder.enable_batch` defaults False.
+            # Gather the per-document async embeds rather than calling
+            # the blocking sync path on the event-loop thread, which
+            # stalled the loop for the whole embed and ran the documents
+            # one at a time (#496). This is what LanceDb.async_insert
+            # does.
+            await asyncio.gather(
+                *(doc.async_embed(embedder=self.embedder) for doc in to_embed)
+            )
         else:
-            # Embedder has no async batch path — fall back to sync.
-            self._embed_missing(to_embed)
+            # An embedder or document without an async path at all: keep
+            # the sync fallback, but off the event loop.
+            await asyncio.to_thread(self._embed_missing, to_embed)
+
+    def _require_initialized(self) -> None:
+        """Raise unless create() has run.
+
+        Called before any embedding work, not after it: embedding is the
+        expensive part of a write (a paid API call, GPU time), and a write
+        into an uninitialized store is doomed from the start. `insert()`
+        already failed at this boundary; `async_insert`, `upsert` and
+        `async_upsert` embedded first and only discovered it when they
+        delegated here (#473).
+        """
+        if self._index is None:
+            # Match LanceDb's "table not initialized" handling: do not
+            # silently auto-create. Callers must invoke create() first.
+            raise RuntimeError(
+                "TurboQuantVectorDb not initialized — call create() before insert()."
+            )
 
     def insert(
         self,
@@ -337,12 +476,7 @@ class TurboQuantVectorDb(VectorDb):
     ) -> None:
         if not documents:
             return
-        if self._index is None:
-            # Match LanceDb's "table not initialized" handling: do not
-            # silently auto-create. Callers must invoke create() first.
-            raise RuntimeError(
-                "TurboQuantVectorDb not initialized — call create() before insert()."
-            )
+        self._require_initialized()
 
         # Merge `filters` into each document's metadata (matches LanceDb).
         if filters:
@@ -383,29 +517,107 @@ class TurboQuantVectorDb(VectorDb):
             )
         if not vectors.flags["C_CONTIGUOUS"]:
             vectors = np.ascontiguousarray(vectors)
+        # Cosine mode: L2-normalize outside the lock (pure computation,
+        # like the embedding step) so the kernel's raw score is true
+        # cosine similarity. Zero rows pass through unchanged.
+        if self.distance == Distance.cosine:
+            vectors = l2_normalize_rows(vectors)
 
-        handles = np.array(
-            [self._issue_handle() for _ in documents], dtype=np.uint64
-        )
-        self._index.add_with_ids(vectors, handles)
-
-        for doc, handle in zip(documents, handles):
+        # Build every side-car payload BEFORE mutating any state (pure
+        # computation, no store reads).
+        prepared = []
+        for doc in documents:
             cleaned = doc.content.replace("\x00", "�") if doc.content else ""
             doc_id = self._derive_doc_id(doc, content_hash, cleaned)
-            h = int(handle)
-            self._str_to_u64.setdefault(doc_id, set()).add(h)
-            self._u64_to_doc[h] = {
-                "id": doc_id,
-                "name": doc.name,
-                "content": cleaned,
-                "meta_data": dict(doc.meta_data) if doc.meta_data else {},
-                "usage": doc.usage,
-                "content_id": doc.content_id,
-                "content_hash": content_hash,
-            }
-            self._content_hashes.add(content_hash)
-            if doc.name:
-                self._name_to_ids.setdefault(doc.name, set()).add(doc_id)
+            prepared.append(
+                (
+                    doc_id,
+                    doc.name,
+                    {
+                        "id": doc_id,
+                        "name": doc.name,
+                        "content": cleaned,
+                        "meta_data": dict(doc.meta_data) if doc.meta_data else {},
+                        "usage": doc.usage,
+                        "content_id": doc.content_id,
+                        "content_hash": content_hash,
+                    },
+                )
+            )
+
+        with self._write_lock:
+            # Re-check under the lock: a concurrent drop() may have nulled
+            # the index between the check at the top and here.
+            if self._index is None:
+                raise RuntimeError(
+                    "TurboQuantVectorDb not initialized — call create() before insert()."
+                )
+            handles = np.array(
+                [self._issue_handle() for _ in documents], dtype=np.uint64
+            )
+
+            # Capture the payload of any handle we are about to overwrite
+            # BEFORE the maps-first write, so a failed index add can restore
+            # it. A live handle can only be reissued from a corrupt
+            # `next_u64` watermark, but the unwind must not destroy its
+            # victim when that happens (issue #321).
+            old = [
+                (int(h), self._u64_to_doc[int(h)])
+                for h in handles
+                if int(h) in self._u64_to_doc
+            ]
+
+            # Maps BEFORE the index add: a concurrent search can only learn
+            # a handle from the index, so an entry that is resolvable but
+            # not yet searchable is invisible to readers (safe) — the
+            # reverse ordering let readers surface handles that did not
+            # resolve yet (issue #161).
+            for (doc_id, name, payload), handle in zip(prepared, handles):
+                h = int(handle)
+                self._str_to_u64.setdefault(doc_id, set()).add(h)
+                self._u64_to_doc[h] = payload
+                self._content_hashes.add(content_hash)
+                if name:
+                    self._name_to_ids.setdefault(name, set()).add(doc_id)
+            try:
+                self._index.add_with_ids(vectors, handles)
+            except BaseException:
+                # Unwind the pre-inserted entries (and restore the payload
+                # of any overwritten handle) so a failed add leaves the
+                # store exactly as it was — preserving the issue-#89
+                # guarantee under the maps-first ordering. `_unlink_payload`
+                # drops the side-index entries only where no surviving
+                # handle still needs them, so pre-existing docs sharing an
+                # id / name / content_hash keep theirs.
+                inserted = [
+                    (int(handle), self._u64_to_doc.pop(int(handle), None))
+                    for handle in handles
+                ]
+                # Restore victims first: `_unlink_payload` decides what to
+                # keep by scanning the surviving payloads, so they must be
+                # back in `_u64_to_doc` before it runs.
+                for h, victim in old:
+                    self._u64_to_doc[h] = victim
+                for h, data in inserted:
+                    if data is not None:
+                        self._unlink_payload(h, data)
+                # Re-link the victims' side-index entries: unlinking the
+                # new payload above can have dropped an entry the victim
+                # shares (same id, name, or content_hash). Re-adding is
+                # idempotent.
+                for h, victim in old:
+                    victim_id = victim.get("id")
+                    if victim_id is not None:
+                        self._str_to_u64.setdefault(victim_id, set()).add(h)
+                        victim_name = victim.get("name")
+                        if victim_name:
+                            self._name_to_ids.setdefault(victim_name, set()).add(
+                                victim_id
+                            )
+                    victim_hash = victim.get("content_hash")
+                    if victim_hash:
+                        self._content_hashes.add(victim_hash)
+                raise
 
     async def async_insert(
         self,
@@ -415,9 +627,15 @@ class TurboQuantVectorDb(VectorDb):
     ) -> None:
         if not documents:
             return
+        # Before embedding, not after: insert() would raise anyway, but
+        # only once the embedder had already run (#473).
+        self._require_initialized()
         await self._embed_missing_async(documents)
-        # Now every doc should have an embedding; insert delegates to sync.
-        self.insert(content_hash, documents, filters)
+        # Now every doc should have an embedding; insert delegates to
+        # sync — on a worker thread, so the loop is free for the whole
+        # write (#342). One call for the entire locked body: an await
+        # inside it would break insert's atomicity.
+        await asyncio.to_thread(self.insert, content_hash, documents, filters)
 
     def upsert_available(self) -> bool:
         return True
@@ -432,17 +650,28 @@ class TurboQuantVectorDb(VectorDb):
         # stored under this content_hash with the incoming batch. Not
         # "replace by derived doc_id" — that's a different contract.
         #
+        # Embed up front so the embedder (a user component) runs outside
+        # the writer lock; insert() then finds nothing left to embed.
+        if documents:
+            # Same boundary as insert(), before the embedder runs (#473).
+            # Gated on there being documents so an empty upsert keeps its
+            # existing behaviour exactly.
+            self._require_initialized()
+            self._embed_missing(documents)
         # Capture the existing generation's handles, run the insert, and
         # only then drop the old vectors — so a failed insert (dim
         # mismatch, non-finite embeddings) never destroys the data being
         # replaced (issue #89). We delete by captured handle rather than
         # re-querying by content_hash, because insert() re-derives ids
         # under the SAME content_hash and would otherwise clobber the
-        # just-inserted rows.
-        old_handles = self._handles_for_content_hash(content_hash)
-        self.insert(content_hash, documents, filters)
-        for handle in old_handles:
-            self._remove_handle(handle)
+        # just-inserted rows. The lock spans capture + insert + remove so
+        # concurrent upserts of the same content_hash stay
+        # last-writer-wins with no stale generations (issue #146).
+        with self._write_lock:
+            old_handles = self._handles_for_content_hash(content_hash)
+            self.insert(content_hash, documents, filters)
+            for handle in old_handles:
+                self._remove_handle(handle)
 
     async def async_upsert(
         self,
@@ -458,8 +687,14 @@ class TurboQuantVectorDb(VectorDb):
         # generations accumulated (issue #146). Delegating preserves the
         # insert-before-delete ordering (issue #89) and makes concurrent
         # async upserts last-writer-wins — identical to sync semantics.
+        # The delegation runs on a worker thread (#342); that adds no
+        # suspension point *inside* the locked body, so the issue-#146
+        # reasoning above is unaffected.
+        if documents:
+            # See `upsert` — fail before the embedder runs (#473).
+            self._require_initialized()
         await self._embed_missing_async(documents)
-        self.upsert(content_hash, documents, filters)
+        await asyncio.to_thread(self.upsert, content_hash, documents, filters)
 
     def _handles_for_content_hash(self, content_hash: str) -> List[int]:
         """Internal handles of every document currently stored under this
@@ -476,13 +711,24 @@ class TurboQuantVectorDb(VectorDb):
         handles intact — including ones that share this document's derived
         id (two distinct documents can map to the same doc_id, matching
         LanceDb). Cleans the id, name, and content_hash side-indexes only
-        where no surviving handle still needs them."""
+        where no surviving handle still needs them.
+
+        Callers hold the writer lock. Index first: the handle stops being
+        searchable before it stops resolving, so a concurrent search can
+        never surface a handle whose side-car entry is already gone."""
         if self._index is None:
             return
-        data = self._u64_to_doc.pop(handle, None)
+        data = self._u64_to_doc.get(handle)
         if data is None:
             return
         self._index.remove(handle)
+        self._u64_to_doc.pop(handle, None)
+        self._unlink_payload(handle, data)
+
+    def _unlink_payload(self, handle: int, data: Dict[str, Any]) -> None:
+        """Drop ``handle``'s entries from the id / name / content_hash
+        side-indexes, keeping any entry a surviving handle still needs.
+        ``data`` is the payload already popped from ``_u64_to_doc``."""
         doc_id = data.get("id")
         # Drop just this handle from the id's handle set; remove the id
         # entirely only once no handle remains under it.
@@ -550,16 +796,61 @@ class TurboQuantVectorDb(VectorDb):
         if not isinstance(filters, dict) or not filters:
             return None
         items = list(filters.items())
+        # list() snapshot: this runs on the (lock-free) search path, so a
+        # concurrent writer must not invalidate the iteration mid-scan.
         return [
             handle
-            for handle, data in self._u64_to_doc.items()
+            for handle, data in list(self._u64_to_doc.items())
             if self._meta_matches(data, items)
         ]
 
     def _scaled_similarity(self, raw: float) -> float:
-        """Map cosine similarity in ``[-1, 1]`` to ``[0, 1]``. Clamped to
-        absorb the small overshoot caused by quantization noise."""
+        """Map the kernel's raw score to the ``[0, 1]`` similarity agno's
+        ``similarity_threshold`` is defined against.
+
+        The mapping is per-distance, because agno defines the two
+        differently and ``similarity_threshold`` is compared against
+        whichever one is in play:
+
+        * ``Distance.cosine`` — agno's ``normalize_cosine`` is
+          ``max(0, min(1, 1 - distance))``, i.e. the raw cosine itself.
+          The pgvector backend, the only other agno store implementing
+          ``similarity_threshold``, enforces it as ``cos >= threshold``.
+          Both sides are unit vectors in this mode, so ``raw`` is already
+          true cosine and the clamp only absorbs quantization noise.
+        * ``Distance.max_inner_product`` — agno's
+          ``normalize_max_inner_product`` is ``(ip + 1) / 2``. ``raw`` is
+          an unbounded inner product, so values outside ``[-1, 1]``
+          saturate at 0/1 and thresholds are dataset-relative (see the
+          class docstring).
+
+        Using the inner-product mapping for cosine admitted documents
+        agno's contract rejects: it keeps iff ``(cos + 1) / 2 >= t``,
+        i.e. ``cos >= 2t - 1``, so a threshold of 0.9 let everything down
+        to 0.80 through (#503).
+        """
+        if self.distance == Distance.cosine:
+            return max(0.0, min(1.0, raw))
         return max(0.0, min(1.0, (raw + 1.0) / 2.0))
+
+    @staticmethod
+    def _dedup_by_content(results: List[Document]) -> List[Document]:
+        """Collapse duplicate-content hits, keeping the first occurrence.
+
+        Matches LanceDb.search's final step: after filtering and rerank,
+        the result list is deduplicated by ``md5(doc.content)``. LanceDb
+        fetches ``limit`` results and *then* dedups, so callers can
+        receive fewer than ``limit`` documents when duplicates exist —
+        we deliberately replicate that rather than over-fetching to
+        refill the result set (issue #136)."""
+        seen_hashes: Set[str] = set()
+        unique_results: List[Document] = []
+        for doc in results:
+            doc_hash = md5(doc.content.encode()).hexdigest()
+            if doc_hash not in seen_hashes:
+                seen_hashes.add(doc_hash)
+                unique_results.append(doc)
+        return unique_results
 
     def _build_results(
         self, scores: np.ndarray, handles: np.ndarray
@@ -592,6 +883,66 @@ class TurboQuantVectorDb(VectorDb):
             )
         return results
 
+    def _retrieve(
+        self,
+        qvec: np.ndarray,
+        limit: int,
+        filters: Optional[Union[Dict[str, Any], List[Any]]],
+    ) -> List[Document]:
+        """Kernel search + tolerant result construction, shared by
+        :meth:`search` and :meth:`async_search`. Runs lock-free."""
+        # Local reference: a concurrent drop() nulls self._index, and a
+        # lock-free reader must not trip over that mid-search.
+        index = self._index
+        if index is None:
+            return []
+        # Cosine mode: normalize the query so the kernel's raw score
+        # against unit document vectors is true cosine similarity.
+        if self.distance == Distance.cosine:
+            qvec = l2_normalize_rows(qvec)
+        allowed_handles = self._resolve_filter_to_handles(filters)
+        if allowed_handles is None:
+            # Unfiltered.
+            k = min(limit, len(index))
+            scores, handles = index.search(qvec, k)
+            return self._build_results(scores, handles)
+
+        for _attempt in range(8):
+            if not allowed_handles:
+                return []
+            allowlist = np.asarray(allowed_handles, dtype=np.uint64)
+            try:
+                scores, handles = index.search(qvec, limit, allowlist=allowlist)
+                return self._build_results(scores, handles)
+            except KeyError:
+                # The allowlist went stale: a delete landed between
+                # resolving it and the kernel's membership check. Rebuild
+                # the allowlist and retry.
+                allowed_handles = self._resolve_filter_to_handles(filters)
+                continue
+
+        # Sustained churn kept invalidating the allowlist. Fall back to an
+        # unfiltered search plus a tolerant Python-side post-filter, which
+        # cannot raise (a search overlapping heavy churn may return fewer
+        # than `limit` hits).
+        items = list(filters.items())
+        fetch_k = min(max(limit * 4, 32), len(index) or 1)
+        scores, handles = index.search(qvec, fetch_k)
+        keep_scores: List[float] = []
+        keep_handles: List[int] = []
+        for score, handle in zip(scores[0], handles[0]):
+            data = self._u64_to_doc.get(int(handle))
+            if data is None or not self._meta_matches(data, items):
+                continue
+            keep_scores.append(float(score))
+            keep_handles.append(int(handle))
+            if len(keep_handles) >= limit:
+                break
+        return self._build_results(
+            np.asarray([keep_scores], dtype=np.float32),
+            np.asarray([keep_handles], dtype=np.uint64),
+        )
+
     def search(
         self,
         query: str,
@@ -616,21 +967,7 @@ class TurboQuantVectorDb(VectorDb):
         if not qvec.flags["C_CONTIGUOUS"]:
             qvec = np.ascontiguousarray(qvec)
 
-        allowed_handles = self._resolve_filter_to_handles(filters)
-        if allowed_handles is None:
-            # Unfiltered.
-            k = min(limit, len(self._index))
-            scores, handles = self._index.search(qvec, k)
-        else:
-            if not allowed_handles:
-                return []
-            allowlist = np.asarray(allowed_handles, dtype=np.uint64)
-            scores, handles = self._index.search(qvec, limit, allowlist=allowlist)
-
-        results = self._build_results(scores, handles)
-        if self.reranker is not None and results:
-            results = self.reranker.rerank(query=query, documents=results)
-        return results
+        return self._search_and_rank(query, qvec, limit, filters)
 
     async def async_search(
         self,
@@ -655,20 +992,51 @@ class TurboQuantVectorDb(VectorDb):
         if not qvec.flags["C_CONTIGUOUS"]:
             qvec = np.ascontiguousarray(qvec)
 
-        allowed_handles = self._resolve_filter_to_handles(filters)
-        if allowed_handles is None:
-            k = min(limit, len(self._index))
-            scores, handles = self._index.search(qvec, k)
-        else:
-            if not allowed_handles:
-                return []
-            allowlist = np.asarray(allowed_handles, dtype=np.uint64)
-            scores, handles = self._index.search(qvec, limit, allowlist=allowlist)
+        # Retrieve + rerank + dedup on a worker thread so the loop stays
+        # free (#342). Kept as one call so the retrieve/rerank/dedup
+        # ordering that matches LanceDb.search (issue #136) is preserved.
+        return await asyncio.to_thread(self._search_and_rank, query, qvec, limit, filters)
 
-        results = self._build_results(scores, handles)
+    def _search_and_rank(
+        self,
+        query: str,
+        qvec: np.ndarray,
+        limit: int,
+        filters: Optional[Union[Dict[str, Any], List[Any]]],
+    ) -> List[Document]:
+        """Shared tail of ``search`` / ``async_search``: retrieve, then
+        rerank, then dedup by content — that exact order matches
+        LanceDb.search (issue #136)."""
+        results = self._retrieve(qvec, limit, filters)
         if self.reranker is not None and results:
             results = self.reranker.rerank(query=query, documents=results)
-        return results
+        return self._dedup_by_content(results)
+
+    @property
+    def search_type(self) -> SearchType:
+        return self._search_type
+
+    @search_type.setter
+    def search_type(self, value: SearchType) -> None:
+        """Reject an unsupported search type on assignment, not only in
+        ``__init__``.
+
+        agno's ``Knowledge.search`` sets this attribute directly before
+        searching — ``self.vector_db.search_type = SearchType(search_type)``
+        — without consulting ``get_supported_search_types()``. As a plain
+        attribute that mutation silently succeeded and the store then
+        served vector-only results for a hybrid or keyword request, while
+        reporting ``search_type == hybrid`` afterwards (#502). Raising
+        here makes the unsupported request loud at the point it is made,
+        and matches what the constructor already does.
+        """
+        if value != SearchType.vector:
+            raise ValueError(
+                f"TurboQuantVectorDb only supports search_type=SearchType.vector; "
+                f"got {value}. Use LanceDb / Chroma / etc. for keyword "
+                f"or hybrid search."
+            )
+        self._search_type = value
 
     def get_supported_search_types(self) -> List[SearchType]:
         # Only vector. Keyword and hybrid would require an external BM25
@@ -682,15 +1050,16 @@ class TurboQuantVectorDb(VectorDb):
     def delete_by_id(self, id: str) -> bool:
         if self._index is None:
             return False
-        handles = self._str_to_u64.get(id)
-        if not handles:
-            return False
-        # Remove every vector sharing this id — a non-unique derived doc_id
-        # can map to several handles. _remove_handle maintains the id, name,
-        # and content_hash side-indexes per handle.
-        for handle in list(handles):
-            self._remove_handle(handle)
-        return True
+        with self._write_lock:
+            handles = self._str_to_u64.get(id)
+            if not handles:
+                return False
+            # Remove every vector sharing this id — a non-unique derived doc_id
+            # can map to several handles. _remove_handle maintains the id, name,
+            # and content_hash side-indexes per handle.
+            for handle in list(handles):
+                self._remove_handle(handle)
+            return True
 
     def delete_by_name(self, name: str) -> bool:
         if self._index is None:
@@ -704,10 +1073,11 @@ class TurboQuantVectorDb(VectorDb):
         # delete_by_id would key on the derived doc_id, which excludes `name`,
         # so it would also delete a differently-named doc that happens to
         # share the id. LanceDb deletes rows matching the predicate directly.
-        handles = [h for h, d in self._u64_to_doc.items() if d.get("name") == name]
-        for handle in handles:
-            self._remove_handle(handle)
-        return bool(handles)
+        with self._write_lock:
+            handles = [h for h, d in self._u64_to_doc.items() if d.get("name") == name]
+            for handle in handles:
+                self._remove_handle(handle)
+            return bool(handles)
 
     def delete_by_metadata(self, metadata: Dict[str, Any]) -> bool:
         """Delete every document whose ``meta_data`` has all of
@@ -725,14 +1095,15 @@ class TurboQuantVectorDb(VectorDb):
         # Remove the matching handles directly (see delete_by_name): the
         # derived doc_id ignores metadata, so delete_by_id would over-delete
         # distinct docs that collide on the id.
-        handles = [
-            h
-            for h, data in self._u64_to_doc.items()
-            if self._meta_matches(data, items)
-        ]
-        for handle in handles:
-            self._remove_handle(handle)
-        return bool(handles)
+        with self._write_lock:
+            handles = [
+                h
+                for h, data in self._u64_to_doc.items()
+                if self._meta_matches(data, items)
+            ]
+            for handle in handles:
+                self._remove_handle(handle)
+            return bool(handles)
 
     def delete_by_content_id(self, content_id: str) -> bool:
         if self._index is None:
@@ -745,14 +1116,15 @@ class TurboQuantVectorDb(VectorDb):
         # Remove the matching handles directly (see delete_by_name): the
         # derived doc_id ignores content_id, so delete_by_id would over-delete
         # distinct docs that collide on the id.
-        handles = [
-            h
-            for h, data in self._u64_to_doc.items()
-            if data.get("content_id") == content_id
-        ]
-        for handle in handles:
-            self._remove_handle(handle)
-        return bool(handles)
+        with self._write_lock:
+            handles = [
+                h
+                for h, data in self._u64_to_doc.items()
+                if data.get("content_id") == content_id
+            ]
+            for handle in handles:
+                self._remove_handle(handle)
+            return bool(handles)
 
     def update_metadata(self, content_id: str, metadata: Dict[str, Any]) -> None:
         """Merge ``metadata`` into both ``meta_data`` and the ``filters``
@@ -766,18 +1138,19 @@ class TurboQuantVectorDb(VectorDb):
         # doc stored without one — no-op instead (issue #169).
         if content_id is None:
             return
-        for data in self._u64_to_doc.values():
-            if data.get("content_id") == content_id:
-                meta = dict(data.get("meta_data") or {})
-                meta.update(metadata)
-                data["meta_data"] = meta
-                filters = data.get("filters")
-                if isinstance(filters, dict):
-                    filters = dict(filters)
-                    filters.update(metadata)
-                    data["filters"] = filters
-                else:
-                    data["filters"] = dict(metadata)
+        with self._write_lock:
+            for data in self._u64_to_doc.values():
+                if data.get("content_id") == content_id:
+                    meta = dict(data.get("meta_data") or {})
+                    meta.update(metadata)
+                    data["meta_data"] = meta
+                    filters = data.get("filters")
+                    if isinstance(filters, dict):
+                        filters = dict(filters)
+                        filters.update(metadata)
+                        data["filters"] = filters
+                    else:
+                        data["filters"] = dict(metadata)
 
     # ---- Persistence (JSON side-car) --------------------------------------
 
@@ -804,23 +1177,30 @@ class TurboQuantVectorDb(VectorDb):
             )
         folder = Path(path)
         folder.mkdir(parents=True, exist_ok=True)
-        payload = {
-            "schema_version": _DOCSTORE_SCHEMA_VERSION,
-            # Round-trip int handles via list-of-pairs (JSON keys must be
-            # strings, but our handles are ints).
-            "u64_to_doc": [[h, d] for h, d in self._u64_to_doc.items()],
-            "next_u64": self._next_u64,
-            "bit_width": self.bit_width,
-            "dimensions": self.dimensions,
-        }
-        # Atomic: serializes in memory first, then temp-file + replace,
-        # so a failed save can't destroy a previous store at this path.
-        atomic_save(
-            self._index,
-            folder / _INDEX_FILENAME,
-            payload,
-            folder / _STORE_FILENAME,
-        )
+        # Serializes with writers: snapshotting the maps and the index
+        # concurrently with a write would persist a torn store to disk.
+        # Reads may proceed while a save runs.
+        with self._write_lock:
+            payload = {
+                "schema_version": _DOCSTORE_SCHEMA_VERSION,
+                # Round-trip int handles via list-of-pairs (JSON keys must be
+                # strings, but our handles are ints).
+                "u64_to_doc": [[h, d] for h, d in self._u64_to_doc.items()],
+                "next_u64": self._next_u64,
+                "bit_width": self.bit_width,
+                "dimensions": self.dimensions,
+                # Recorded so a later create()/load restores the mode the
+                # vectors were written under (v2+).
+                "distance": self.distance.value,
+            }
+            # Atomic: serializes in memory first, then temp-file + replace,
+            # so a failed save can't destroy a previous store at this path.
+            atomic_save(
+                self._index,
+                folder / _INDEX_FILENAME,
+                payload,
+                folder / _STORE_FILENAME,
+            )
 
     def _load_from(self, folder: Path) -> None:
         side_car = folder / _STORE_FILENAME
@@ -832,43 +1212,157 @@ class TurboQuantVectorDb(VectorDb):
         with open(side_car) as f:
             state = json.load(f)
         version = state.get("schema_version", 0)
-        if version != _DOCSTORE_SCHEMA_VERSION:
-            raise ValueError(
-                f"{_STORE_FILENAME} has schema_version {version}; this "
-                f"turbovec expects {_DOCSTORE_SCHEMA_VERSION}"
-            )
+        check_schema_version(
+            version,
+            _DOCSTORE_SCHEMA_COMPAT,
+            prefix=f"{_STORE_FILENAME} has schema_version",
+        )
         if state.get("dimensions") != self.dimensions:
             raise ValueError(
                 f"persisted dimensions={state.get('dimensions')} does not "
                 f"match this store's embedder dimensions={self.dimensions}"
             )
+        # Similarity mode of the persisted vectors. The construct-then-
+        # create() API shape means the store already has a mode when the
+        # load runs, so a *recorded* mode that conflicts with it is an
+        # error — silently adopting either side would surprise someone.
+        # A v1 side-car (written before the mode existed) records no
+        # mode but holds raw, unnormalized vectors: adopt
+        # Distance.max_inner_product — the scoring those stores were
+        # written under — and update `self.distance` so introspection
+        # reflects how the store actually scores.
+        recorded = state.get("distance")
+        if recorded is not None:
+            if recorded != self.distance.value:
+                raise ValueError(
+                    f"persisted store at {folder} was saved with "
+                    f"distance={recorded!r}, but this store was constructed "
+                    f"with distance={self.distance.value!r}. Construct the "
+                    f"store with the matching distance to load it."
+                )
+            distance = self.distance
+        else:
+            distance = Distance.max_inner_product
 
-        self._index = IdMapIndex.load(str(index_file))
-        self._u64_to_doc = {int(h): d for h, d in state["u64_to_doc"]}
-        self._next_u64 = int(state["next_u64"])
+        # This is the only in-place load among the four integrations (the
+        # others are classmethods returning a fresh object), so it is the
+        # only one that can leave a caller holding a half-loaded store.
+        # Everything below is therefore built into locals and committed in
+        # one block at the end: the validation after the rebuild still
+        # raises, and a store whose load raised is one this method never
+        # touched (#380).
+        index = IdMapIndex.load(str(index_file))
+        u64_to_doc = {int(h): d for h, d in state["u64_to_doc"]}
+        next_u64 = int(state["next_u64"])
 
         # Rebuild reverse indexes from the loaded payload. doc_id is
         # non-unique, so accumulate handles into a set per id rather than a
         # dict comprehension (which would drop all but the last handle and
         # re-orphan the very vectors issue #104 fixed).
-        self._str_to_u64 = {}
-        for handle, data in self._u64_to_doc.items():
-            self._str_to_u64.setdefault(data["id"], set()).add(handle)
-        self._content_hashes = set()
-        self._name_to_ids = {}
-        for data in self._u64_to_doc.values():
+        str_to_u64: Dict[str, Set[int]] = {}
+        for handle, data in u64_to_doc.items():
+            str_to_u64.setdefault(data["id"], set()).add(handle)
+        content_hashes: Set[str] = set()
+        name_to_ids: Dict[str, Set[str]] = {}
+        for data in u64_to_doc.values():
             ch = data.get("content_hash")
             if ch:
-                self._content_hashes.add(ch)
+                content_hashes.add(ch)
             name = data.get("name")
             if name:
-                self._name_to_ids.setdefault(name, set()).add(data["id"])
+                name_to_ids.setdefault(name, set()).add(data["id"])
 
         # Reject a side-car whose handle set desynced from the .tvim index
         # (partial copy, stale backup, hand edit) with a clean ValueError
         # here rather than misbehaving later — matching the other
         # integrations' load paths (issue #115).
-        check_persisted_handles(self._index, self._u64_to_doc.keys(), what="document")
+        check_persisted_handles(
+            index,
+            u64_to_doc.keys(),
+            what="document",
+            next_u64=next_u64,
+        )
+
+        # Commit point: nothing above can raise any more.
+        self.distance = distance
+        self._index = index
+        self._u64_to_doc = u64_to_doc
+        self._next_u64 = next_u64
+        self._str_to_u64 = str_to_u64
+        self._content_hashes = content_hashes
+        self._name_to_ids = name_to_ids
+
+    # ---- Copy & pickle ----------------------------------------------------
+    #
+    # The Rust index is not directly picklable; it round-trips through
+    # the core's in-memory ``.tvim`` byte format
+    # (``IdMapIndex.to_bytes`` / ``from_bytes``). The per-store lock is
+    # excluded from the state — locks cannot cross pickling — and
+    # recreated on restore. The embedder and reranker are pickled by
+    # value like any other attribute; their picklability is the
+    # caller's concern.
+    #
+    # The calibration state round-trips exactly through the copy: an
+    # uncalibrated index copies as uncalibrated, a calibrated one keeps
+    # its fitted pair. A copy is byte-for-byte what ``write`` would have
+    # produced.
+
+    @staticmethod
+    def _snapshot_doc(data: Dict[str, Any]) -> Dict[str, Any]:
+        """Copy a per-doc payload deeply enough that no in-place store
+        mutation can reach the snapshot: ``update_metadata`` mutates the
+        payload dict (and its ``meta_data`` / ``filters`` sub-dicts) in
+        place, so sharing them would let a write landing after
+        ``__getstate__`` returns tear the pickle mid-serialization."""
+        out = dict(data)
+        for key in ("meta_data", "filters"):
+            value = out.get(key)
+            if isinstance(value, dict):
+                out[key] = dict(value)
+        return out
+
+    def __getstate__(self) -> Dict[str, Any]:
+        # Snapshot under the writer lock so the index bytes and the
+        # side-car maps come from one consistent store state (the same
+        # guarantee save() gives the on-disk pair). Everything the store
+        # mutates in place is copied (per-id handle sets, the per-doc
+        # payload dicts and their metadata sub-dicts) so a write landing
+        # after this returns cannot desync — or tear — the captured pair.
+        with self._write_lock:
+            state = self.__dict__.copy()
+            del state["_write_lock"]
+            # A store that hasn't seen create() — or was drop()ped — has
+            # no index; None round-trips that state.
+            state["_index"] = self._index.to_bytes() if self._index is not None else None
+            state["_str_to_u64"] = {k: set(v) for k, v in self._str_to_u64.items()}
+            state["_u64_to_doc"] = {
+                h: self._snapshot_doc(d) for h, d in self._u64_to_doc.items()
+            }
+            state["_content_hashes"] = set(self._content_hashes)
+            state["_name_to_ids"] = {k: set(v) for k, v in self._name_to_ids.items()}
+        return state
+
+    def __setstate__(self, state: Dict[str, Any]) -> None:
+        state = dict(state)
+        index_bytes = state.pop("_index")
+        self.__dict__.update(state)
+        self._index = (
+            IdMapIndex.from_bytes(index_bytes) if index_bytes is not None else None
+        )
+        self._write_lock = threading.RLock()
+
+    def __deepcopy__(self, memo: Dict[int, Any]) -> "TurboQuantVectorDb":
+        new = self.__class__.__new__(self.__class__)
+        new.__setstate__(_copy.deepcopy(self.__getstate__(), memo))
+        return new
+
+    def __copy__(self) -> "TurboQuantVectorDb":
+        # Deliberately identical to __deepcopy__: there is no meaningful
+        # shallow copy of a store. Sharing the mutable Rust index between
+        # two store objects means every mutation of one silently mutates
+        # the other (issue #149), so ``copy.copy`` returns an independent
+        # copy instead of an alias.
+        return self.__deepcopy__({})
 
 
 __all__ = ["TurboQuantVectorDb"]

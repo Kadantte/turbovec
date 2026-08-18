@@ -37,7 +37,20 @@ from turbovec import IdMapIndex
 vector_store = TurboQuantVectorStore(index=IdMapIndex(1536, 4))
 ```
 
-`bit_width` is `2` or `4` and is fixed once the index is created.
+`bit_width` is one of `{2, 3, 4}` and is fixed once the index is created.
+
+## Similarity modes
+
+The `similarity` keyword (on the constructor and `from_params`) selects how the `similarities` returned by `query` are computed. It is fixed for the lifetime of the store:
+
+- **`"cosine"` (default).** Node embeddings are L2-normalized at add time and query embeddings at query time, so `result.similarities` are true cosine similarities in `[-1, 1]` and ranking matches `SimpleVectorStore` regardless of embedding magnitude — safe to feed into similarity-cutoff postprocessors. Zero vectors are kept as-is and score `0` against everything.
+- **`"dot_product"`.** Vectors are stored and queried raw: `result.similarities` are raw inner products and ranking is magnitude-aware.
+
+```python
+vector_store = TurboQuantVectorStore(similarity="dot_product")
+```
+
+The `similarity` keyword is a turbovec extension: `SimpleVectorStore` computes cosine unconditionally, so code written against the reference behaves identically under the default.
 
 ## The two `delete` signatures
 
@@ -127,9 +140,11 @@ result = vector_store.query(VectorStoreQuery(
 
 Supported operators on `MetadataFilter`: `EQ`, `NE`, `GT`, `LT`, `GTE`, `LTE`, `IN`, `NIN`, `TEXT_MATCH`, `TEXT_MATCH_INSENSITIVE`, `CONTAINS`, `ANY`, `ALL`, `IS_EMPTY`. Conditions: `AND`, `OR`, `NOT`. Nested `MetadataFilters` work.
 
-Filter semantics match `SimpleVectorStore`'s reference implementation — notably, every operator except `IS_EMPTY` returns `False` when the filter key is missing from the document's metadata, and `TEXT_MATCH` is case-sensitive (use `TEXT_MATCH_INSENSITIVE` for a case-insensitive substring match).
+Filter semantics match `SimpleVectorStore`'s reference implementation — notably, every operator except `IS_EMPTY` returns `False` when the filter key is missing from the document's metadata, and `TEXT_MATCH` is case-insensitive (it lowercases both sides, as `TEXT_MATCH_INSENSITIVE` does).
 
 Filters are resolved to a handle allowlist **before** scoring. Selective filters return up to `similarity_top_k` matches from the filtered set; you never get fewer just because the filter happened to exclude the top-scoring candidates.
+
+An **empty** `node_ids` (or `doc_ids`) list restricts nothing — it behaves like omitting the argument. This follows the framework's own calling convention: `VectorStoreIndex.as_retriever` passes `node_ids=list(index_struct.nodes_dict.values())`, and for a `stores_text=True` store like this one that list is always empty — it means "unrestricted", and treating it as match-nothing would make every retriever query return zero results. `get_nodes` / `delete_nodes` are different: there `node_ids` *is* the selection, so an explicit empty list selects nothing.
 
 ## Get nodes
 
@@ -139,7 +154,7 @@ nodes = vector_store.get_nodes(filters=filters)
 nodes = vector_store.get_nodes(node_ids=["chunk-1", "chunk-2"], filters=filters)  # intersect
 ```
 
-Returns a `List[BaseNode]` reconstructed from the side-car. Missing `node_id`s are silently skipped.
+Returns a `List[BaseNode]` reconstructed from the side-car. Missing `node_id`s are silently skipped. `node_ids` is the explicit selection: an empty list selects nothing and returns `[]` (same for `delete_nodes`, where an empty list is a no-op).
 
 ## Upsert semantics
 
@@ -170,6 +185,15 @@ await vector_store.adelete_nodes(node_ids=[...])
 await vector_store.aclear()
 ```
 
+They run the index work on a worker thread (`asyncio.to_thread`), so the event loop stays responsive while a large add or query is in flight. `BasePydanticVectorStore`'s defaults call straight into the sync body, which would block the loop for the operation's full duration.
+
+Cancellation is only partial, and the distinction matters:
+
+- `asyncio.wait_for`, `task.cancel()`, or a client disconnect returns control to the awaiting caller promptly — that part now works, where previously the coroutine ran to completion and the timeout never fired.
+- It does **not** decide what happened to the add. If the worker thread had already started, it runs the call to completion — work inside the Rust core is not interruptible at all — and the add commits in full. If the executor was saturated, the call is cancelled before it ever starts and nothing is added. **A cancelled `async_add` is "outcome unknown": it may have fully committed, or may never have begun.** Re-adding the same `node_id` is an overwrite, so retrying is safe either way.
+- What *is* guaranteed: the outcome is all-or-nothing. The store is never left in a torn state.
+- Timing out does not make the work go away: the loop's shutdown (`asyncio.run` on the way out, or `loop.shutdown_default_executor()`) waits for the worker thread, so a process that exits right after a short timeout can still block for the rest of the in-flight call.
+
 ## Persist / load
 
 ### Direct (file-stem) interface
@@ -183,6 +207,8 @@ vector_store = TurboQuantVectorStore.from_persist_path("./store/vectors.json")
 `persist_path` is treated as a path *stem* — the binary index and JSON side-car are written next to each other as `{stem}.tvim` and `{stem}.nodes.json`. The extension on `persist_path` (e.g. `.json`, as LlamaIndex's StorageContext default uses) is replaced. Node metadata must be JSON-serializable. If the `{stem}.nodes.json` side-car is out of sync with its `{stem}.tvim` index (a partial copy, a stale backup, tampering), `from_persist_path` raises a `ValueError` immediately rather than failing later with a `KeyError` at query time.
 
 `persist` is atomic with respect to the destination: both files are written to sibling temp files and moved into place, so a failed persist (e.g. non-JSON-serializable metadata) leaves a store previously persisted at the same stem intact.
+
+The similarity mode is recorded in `{stem}.nodes.json` and restored by `from_persist_path`. A store persisted before the mode field existed holds raw, unnormalized vectors, so it loads in `"dot_product"` mode — exactly the scoring it was written under — with no migration needed.
 
 ### Via `StorageContext`
 
@@ -200,16 +226,35 @@ storage_context = StorageContext.from_defaults(
 )
 ```
 
-`from_persist_dir(persist_dir, namespace="default", fs=None)` constructs the namespaced filename (`{persist_dir}/{namespace}__vector_store.json`) and delegates to `from_persist_path`. Multiple namespaced stores can share a persist directory.
+`from_persist_dir(persist_dir, namespace="default", fs=None)` constructs the namespaced filename (`{persist_dir}/{namespace}__vector_store.json`) and delegates to `from_persist_path`. Multiple namespaced stores can share a persist directory — including dotted namespaces (`v1.2`, `v1.3`), which map to distinct file pairs (`v1.2__vector_store.tvim` / `v1.2__vector_store.nodes.json`, and so on). `namespace` names a store *within* `persist_dir`, so it must be non-empty and must not contain path separators, `..`, or `:` (a Windows drive-relative name like `C:foo` would escape `persist_dir`); such a value raises `ValueError`. Any other string (alphanumerics, dash, underscore, dots) is accepted.
+
+A store persisted by an older turbovec under a dotted namespace sits on disk under a truncated filename (`v1.tvim` for namespace `v1.2`). Loading finds it via a legacy-filename fallback — used only when the correct filename is absent — and the next `persist` writes the correct filenames.
 
 ### Config-only round-trip
 
 ```python
-config = vector_store.to_dict()                                   # {"bit_width": 4, "dim": 1536}
+config = vector_store.to_dict()                # {"bit_width": 4, "dim": 1536, "similarity": "cosine"}
 fresh = TurboQuantVectorStore.from_dict(config)                   # empty store with the same config
 ```
 
 `to_dict` / `from_dict` serialize only the store's configuration. Node data round-trips through `persist` / `from_persist_path`.
+
+The store also supports `pickle` with full data fidelity (e.g. for `multiprocessing` workers) and `copy.copy` / `copy.deepcopy` — both copies return a fully independent store (there is no shallow copy that shares the underlying index).
+
+## Thread safety
+
+The store is safe for concurrent multi-threaded use:
+
+- **Reads run concurrently and scale.** `query` and `get_nodes` take no lock; the underlying index releases the GIL during scoring, so independent queries from multiple threads overlap and scale.
+- **Writes serialize.** `add`, `delete`, `delete_nodes`, `clear`, and `persist` serialize on a per-store lock. The `async_add` / `a*` variants delegate to the same locked bodies, so concurrent adds issue unique handles — no batch is ever rejected or lost to a handle collision.
+- **A read overlapping a write sees pre- or post-write state** — never a torn one. Under heavy concurrent churn a query may transiently return fewer than `similarity_top_k` results (hits deleted mid-query are skipped).
+
+What the contract does *not* cover:
+
+- **No cross-call atomicity.** A caller-side check-then-act sequence (`get_nodes` then `delete_nodes`) can interleave with other writers. Batch writes are not atomic with respect to readers: a query overlapping a re-`add` of an existing `node_id` can briefly see that id under both its old and new entry.
+- **`persist` serializes with writes** (so it always snapshots a consistent store); reads may proceed during a persist.
+- **Two stores writing to the same path is safe.** Concurrent `persist` calls to one destination from several threads each publish atomically and the last writer wins; a caller never sees a torn file, and never an error caused only by the other writer. Which writer wins is not defined.
+- **Multi-process access is not supported.**
 
 ## Known limitations
 

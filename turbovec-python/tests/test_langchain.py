@@ -47,6 +47,17 @@ def test_from_texts_infers_dim_and_indexes():
     assert store._index.bit_width == 4
 
 
+def test_from_texts_accepts_bit_width_3():
+    # bit_width contract is {2, 3, 4}, matching the core IdMapIndex.
+    emb = StubEmbeddings(dim=64)
+    store = TurboQuantVectorStore.from_texts(
+        ["alpha", "beta", "gamma"], emb, bit_width=3
+    )
+    assert store._index.bit_width == 3
+    results = store.similarity_search("alpha", k=1)
+    assert results[0].page_content == "alpha"
+
+
 def test_similarity_search_returns_documents():
     emb = StubEmbeddings(dim=64)
     store = TurboQuantVectorStore.from_texts(["a", "b", "c"], emb, bit_width=4)
@@ -411,6 +422,25 @@ def test_load_rejects_unknown_schema_version(tmp_path):
     with open(tmp_path / "docstore.json") as f:
         data = json.load(f)
     data["schema_version"] = 99
+    with open(tmp_path / "docstore.json", "w") as f:
+        json.dump(data, f)
+    with pytest.raises(ValueError, match="schema version"):
+        TurboQuantVectorStore.load(tmp_path, emb)
+
+
+def test_load_rejects_a_float_schema_version(tmp_path):
+    # `version not in _DOCSTORE_SCHEMA_COMPAT` compares with `==`, and
+    # `2.0 == 2` in Python, so a side-car written by a non-Python producer
+    # (JSON has a single number type) used to be accepted on a version
+    # field it does not actually match (#350).
+    import json
+
+    emb = StubEmbeddings(dim=64)
+    store = TurboQuantVectorStore.from_texts(["x"], emb, bit_width=4)
+    store.dump(tmp_path)
+    with open(tmp_path / "docstore.json") as f:
+        data = json.load(f)
+    data["schema_version"] = float(data["schema_version"])
     with open(tmp_path / "docstore.json", "w") as f:
         json.dump(data, f)
     with pytest.raises(ValueError, match="schema version"):
@@ -982,6 +1012,114 @@ def test_aadd_texts_none_id_replaced_with_uuid():
     assert None not in store._docs
 
 
+@pytest.mark.parametrize(
+    "bad_id, type_name",
+    [
+        (2, "int"),
+        (2.5, "float"),
+        (True, "bool"),
+        (b"raw", "bytes"),
+        (("t",), "tuple"),
+    ],
+)
+def test_add_texts_rejects_nonstr_id(bad_id, type_name):
+    # Any non-str, non-None id must be rejected loudly at the add boundary
+    # with an error naming the offending id, its type, and its position —
+    # never accepted and later corrupted by JSON key coercion (issue #124).
+    # bool is a subclass of int and must be rejected too.
+    emb = StubEmbeddings(dim=64)
+    store = TurboQuantVectorStore(embedding=emb)
+    with pytest.raises(TypeError, match=rf"ids\[0\].*{type_name}"):
+        store.add_texts(["a"], ids=[bad_id])
+    assert store._docs == {}
+    assert store._str_to_u64 == {}
+
+
+def test_add_texts_nonstr_id_mid_batch_leaves_store_unchanged():
+    # A non-str id anywhere in a mixed batch must abort the whole add
+    # before any mutation — valid ids earlier in the batch must not have
+    # been stored, and pre-existing state must be untouched (issue #124).
+    emb = StubEmbeddings(dim=64)
+    store = TurboQuantVectorStore.from_texts(
+        ["alpha", "beta"], emb, ids=["a", "b"], metadatas=[{"k": 1}, {"k": 2}]
+    )
+    index_len_before = len(store._index)
+    docs_before = dict(store._docs)
+    str_to_u64_before = dict(store._str_to_u64)
+    u64_to_str_before = dict(store._u64_to_str)
+    next_u64_before = store._next_u64
+    search_before = [
+        (d.id, round(s, 5)) for d, s in store.similarity_search_with_score("alpha", k=2)
+    ]
+
+    with pytest.raises(TypeError, match=r"ids\[1\].*\bint\b"):
+        store.add_texts(["gamma", "delta"], ids=["ok", 3])
+
+    assert len(store._index) == index_len_before
+    assert store._docs == docs_before
+    assert store._str_to_u64 == str_to_u64_before
+    assert store._u64_to_str == u64_to_str_before
+    assert store._next_u64 == next_u64_before
+    assert [
+        (d.id, round(s, 5)) for d, s in store.similarity_search_with_score("alpha", k=2)
+    ] == search_before
+    assert [d.id for d in store.get_by_ids(["a", "b", "ok"])] == ["a", "b"]
+
+
+def test_int_str_id_collision_is_unreachable(tmp_path):
+    # The original issue-#124 corruption: int id 2 coexisting with str id
+    # "2" is two documents in memory but json.dump coerces the int key to
+    # "2", producing a duplicate JSON key that json.load collapses —
+    # silent data loss plus an unloadable side-car. With non-str ids
+    # rejected at add, that state can never be constructed.
+    emb = StubEmbeddings(dim=64)
+    store = TurboQuantVectorStore(embedding=emb)
+    store.add_texts(["strdoc"], ids=["2"])
+    with pytest.raises(TypeError, match=r"ids\[0\].*\bint\b"):
+        store.add_texts(["intdoc"], ids=[2])
+
+    # The store still holds exactly the one str-id document and
+    # round-trips it intact.
+    assert set(store._docs) == {"2"}
+    store.dump(tmp_path)
+    reloaded = TurboQuantVectorStore.load(tmp_path, emb)
+    assert set(reloaded._docs) == {"2"}
+    assert [d.page_content for d in reloaded.get_by_ids(["2"])] == ["strdoc"]
+
+
+def test_aadd_texts_rejects_nonstr_id():
+    import asyncio
+
+    emb = StubEmbeddings(dim=64)
+    store = TurboQuantVectorStore(embedding=emb)
+    with pytest.raises(TypeError, match=r"ids\[0\].*\bint\b"):
+        asyncio.run(store.aadd_texts(["a"], ids=[2]))
+    assert store._docs == {}
+
+
+def test_add_documents_and_from_texts_reject_nonstr_id():
+    # add_documents and from_texts route through add_texts, so the same
+    # boundary rejection must fire there too.
+    emb = StubEmbeddings(dim=64)
+    store = TurboQuantVectorStore(embedding=emb)
+    with pytest.raises(TypeError, match=r"ids\[0\].*\bint\b"):
+        store.add_documents([Document(page_content="a")], ids=[7])
+    assert store._docs == {}
+    with pytest.raises(TypeError, match=r"ids\[1\].*\bfloat\b"):
+        TurboQuantVectorStore.from_texts(["a", "b"], emb, ids=["x", 1.5])
+
+
+def test_add_texts_str_ids_and_none_still_accepted():
+    # Happy-path pin: plain str ids and per-entry None (-> UUID) are the
+    # only accepted forms and keep working unchanged.
+    emb = StubEmbeddings(dim=64)
+    store = TurboQuantVectorStore(embedding=emb)
+    out = store.add_texts(["a", "b"], ids=["x", None])
+    assert out[0] == "x"
+    assert isinstance(out[1], str) and out[1] != "x"
+    assert set(store._docs) == set(out)
+
+
 def test_add_texts_tuple_ids_returns_list():
     # add_texts documents a list[str] return; a tuple of ids must come back
     # as a fresh list, not the caller's tuple (issue #126).
@@ -1132,3 +1270,187 @@ def test_delete_accepts_numpy_array_and_generator_ids():
     # Empty array is a no-op, not a crash.
     store.delete(np.array([]))
     assert sorted(store._docs) == ["d"]
+
+
+def test_similarity_search_with_score_by_vector_matches_by_vector_and_scores():
+    # Issue #301: `similarity_search_with_score_by_vector` is public and
+    # non-deprecated on the InMemoryVectorStore reference but absent
+    # here, so user code got AttributeError rather than NotImplementedError.
+    emb = StubEmbeddings(dim=64)
+    store = TurboQuantVectorStore.from_texts(
+        ["apple", "banana", "cherry"], emb, ids=["a", "b", "c"]
+    )
+    qvec = emb.embed_query("banana")
+
+    pairs = store.similarity_search_with_score_by_vector(qvec, k=2)
+    assert len(pairs) == 2
+    assert [d.id for d, _ in pairs] == [
+        d.id for d in store.similarity_search_by_vector(qvec, k=2)
+    ]
+    assert pairs[0][0].id == "b"
+    assert pairs[0][1] > pairs[1][1]
+    assert all(isinstance(s, float) for _, s in pairs)
+
+    # Same scores as the text-query path for the same vector.
+    by_text = store.similarity_search_with_score("banana", k=2)
+    assert [d.id for d, _ in by_text] == [d.id for d, _ in pairs]
+    for (_, a), (_, b) in zip(by_text, pairs):
+        assert a == pytest.approx(b)
+
+    # Filters are honoured.
+    filtered = store.similarity_search_with_score_by_vector(
+        qvec, k=3, filter=lambda d: d.id in {"a", "c"}
+    )
+    assert {d.id for d, _ in filtered} == {"a", "c"}
+
+
+def test_asimilarity_search_with_score_by_vector_matches_sync():
+    import asyncio
+
+    emb = StubEmbeddings(dim=64)
+    store = TurboQuantVectorStore.from_texts(
+        ["apple", "banana", "cherry"], emb, ids=["a", "b", "c"]
+    )
+    qvec = emb.embed_query("banana")
+    got = asyncio.run(store.asimilarity_search_with_score_by_vector(qvec, k=2))
+    want = store.similarity_search_with_score_by_vector(qvec, k=2)
+    assert [d.id for d, _ in got] == [d.id for d, _ in want]
+
+
+def test_load_rejects_a_rewound_next_u64_watermark(tmp_path):
+    # Issue #321: the watermark check lives in `_persist` so all four
+    # integrations inherit it — this pins the langchain load path.
+    import json
+
+    emb = StubEmbeddings(dim=64)
+    store = TurboQuantVectorStore.from_texts(["a", "b", "c"], emb, ids=["a", "b", "c"])
+    store.dump(tmp_path)
+
+    side_car = tmp_path / "docstore.json"
+    state = json.loads(side_car.read_text())
+    assert state["next_u64"] >= 3
+    state["next_u64"] = 0
+    side_car.write_text(json.dumps(state))
+
+    with pytest.raises(ValueError, match="next_u64"):
+        TurboQuantVectorStore.load(tmp_path, emb)
+
+
+# ---- #381: a dict filter entry requires the key to be present ---------
+
+
+def test_dict_filter_none_value_requires_the_key_to_be_present():
+    # `doc.metadata.get(k)` returns None both for "absent" and for
+    # "present and None", so `filter={"g": None}` used to return every
+    # document without a `g` key at all. The dict form is turbovec's own
+    # extension — the reference InMemoryVectorStore accepts callables only
+    # — so it should mean what the equivalent hand-written predicate
+    # means, not something a user cannot opt out of.
+    emb = StubEmbeddings(dim=64)
+    store = TurboQuantVectorStore.from_texts(
+        ["has-none", "no-key", "has-value"],
+        emb,
+        metadatas=[{"g": None}, {"other": 1}, {"g": 5}],
+        ids=["has-none", "no-key", "has-value"],
+        bit_width=4,
+    )
+
+    matched = store.similarity_search("has-none", k=10, filter={"g": None})
+    assert [d.id for d in matched] == ["has-none"]
+
+    # The dict form must agree with the predicate a user would write for
+    # the same intent.
+    equivalent = store.similarity_search(
+        "has-none", k=10,
+        filter=lambda doc: "g" in doc.metadata and doc.metadata["g"] is None,
+    )
+    assert {d.id for d in matched} == {d.id for d in equivalent}
+
+    # Absence is still expressible — via the callable form, which is the
+    # only form the reference store has.
+    absent = store.similarity_search(
+        "no-key", k=10, filter=lambda doc: "g" not in doc.metadata
+    )
+    assert [d.id for d in absent] == ["no-key"]
+
+
+def test_dict_filter_presence_requirement_holds_for_every_value_type():
+    # Not None-specific: a multi-key dict where one key is missing from a
+    # document must exclude that document whatever the filter value is.
+    emb = StubEmbeddings(dim=64)
+    store = TurboQuantVectorStore.from_texts(
+        ["both", "partial"],
+        emb,
+        metadatas=[{"a": 1, "b": None}, {"a": 1}],
+        ids=["both", "partial"],
+        bit_width=4,
+    )
+    got = store.similarity_search("both", k=10, filter={"a": 1, "b": None})
+    assert [d.id for d in got] == ["both"]
+
+
+# ---- #350: a lossy side-car fails the dump loudly ---------------------
+
+
+def test_dump_rejects_non_str_metadata_keys(tmp_path):
+    # End-to-end through a store: `{1: ..., "1": ...}` used to be written
+    # as a single `"1"` entry with dump() returning success, losing the
+    # int-keyed value with no signal at all.
+    emb = StubEmbeddings(dim=64)
+    store = TurboQuantVectorStore.from_texts(
+        ["a"], emb, metadatas=[{1: "int-one", "1": "str-one"}], bit_width=4
+    )
+    folder = tmp_path / "store"
+    with pytest.raises(TypeError, match="not str"):
+        store.dump(folder)
+    # Nothing persisted — no half-written store to load later.
+    assert list(folder.iterdir()) == []
+
+
+def test_dump_rejects_non_finite_metadata_floats(tmp_path):
+    # A NaN score (a realistic output of a scoring pipeline) used to write
+    # a bare `NaN` token: invalid JSON that jq silently rewrites to null.
+    emb = StubEmbeddings(dim=64)
+    store = TurboQuantVectorStore.from_texts(
+        ["a"], emb, metadatas=[{"score": float("nan")}], bit_width=4
+    )
+    folder = tmp_path / "store"
+    with pytest.raises(ValueError, match="NaN"):
+        store.dump(folder)
+    assert list(folder.iterdir()) == []
+
+
+def test_dump_of_nan_metadata_leaves_no_file_to_misread(tmp_path):
+    # The pre-fix write was not merely lossy, it was *not JSON*: a bare
+    # `NaN` token that jq rewrites to null and serde_json/JSON.parse
+    # reject. Assert on the observable that matters to a non-Python
+    # consumer — no such file exists to be misread — and that a store
+    # sanitised the documented way (None for "no value") saves and
+    # reloads cleanly.
+    import json
+
+    emb = StubEmbeddings(dim=64)
+    bad = TurboQuantVectorStore.from_texts(
+        ["a"], emb, metadatas=[{"score": float("nan")}], bit_width=4
+    )
+    folder = tmp_path / "store"
+    with pytest.raises(ValueError):
+        bad.dump(folder)
+    assert not (folder / "docstore.json").exists()
+
+    good = TurboQuantVectorStore.from_texts(
+        ["a"], emb, metadatas=[{"score": None}], ids=["doc-a"], bit_width=4
+    )
+    good.dump(folder)
+    text = (folder / "docstore.json").read_text()
+    # `parse_constant` fires only on NaN/Infinity/-Infinity, so a strict
+    # reader accepts this file where it would have rejected the one above.
+    json.loads(text, parse_constant=_fail_on_non_json_token)
+    reloaded = TurboQuantVectorStore.load(folder, emb)
+    assert reloaded.get_by_ids(["doc-a"])[0].metadata == {"score": None}
+
+
+def _fail_on_non_json_token(name):
+    # `json.loads` accepts NaN/Infinity by default; this makes the reader
+    # as strict as RFC 8259 (and as strict as serde_json or JSON.parse).
+    raise AssertionError(f"side-car holds the non-JSON token {name}")

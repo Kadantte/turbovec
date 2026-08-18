@@ -149,9 +149,25 @@ fn search_scores_are_sorted_descending() {
 
             for qi in 0..4 {
                 let scores = res.scores_for_query(qi);
+                // Every returned score must be finite: `n >= k` here, so
+                // no NEG_INFINITY heap padding may leak into the results
+                // (a heap under-fill or kernel-tail bug would surface as
+                // a non-finite score). Mirrors the finiteness checks the
+                // id_map tests already apply.
+                assert!(
+                    scores.iter().all(|s| s.is_finite()),
+                    "non-finite score leaked: bits={} n={} qi={} scores={:?}",
+                    bits,
+                    n,
+                    qi,
+                    scores
+                );
+                // Strict descending order — no escape hatch for
+                // non-finite entries, which the finiteness assertion
+                // above has already ruled out.
                 for w in scores.windows(2) {
                     assert!(
-                        w[0] >= w[1] || !w[1].is_finite(),
+                        w[0] >= w[1],
                         "scores not sorted desc: bits={} n={} qi={} window={:?}",
                         bits,
                         n,
@@ -160,6 +176,65 @@ fn search_scores_are_sorted_descending() {
                     );
                 }
             }
+        }
+    }
+}
+
+#[test]
+fn search_k_exceeding_len_clamps_to_len() {
+    // `search(k > n_vectors)` with `0 < n < k` on the unmasked path:
+    // the effective k is `min(k, n)`, so with n=3 and k=10 each query
+    // must get back exactly 3 results — distinct, in-range, finite —
+    // and `SearchResults::k` must report the clamped value 3, not the
+    // requested 10.
+    let dim = 512;
+    let n = 3;
+    let k = 10;
+    let nq = 2;
+    let data = gaussian_normalized(n, dim, 0x0EFF_EC7); // "effect(ive k)"
+    let mut idx = TurboQuantIndex::new(dim, 4).unwrap();
+    idx.add(&data);
+    assert_eq!(idx.len(), n);
+
+    let queries = gaussian_normalized(nq, dim, 0x0EFF_EC8);
+    let res = idx.search(&queries, k);
+
+    assert_eq!(res.nq, nq);
+    assert_eq!(res.k, n, "SearchResults::k must be clamped to len()");
+    assert_eq!(res.indices.len(), nq * n);
+    assert_eq!(res.scores.len(), nq * n);
+
+    for qi in 0..nq {
+        let indices = res.indices_for_query(qi);
+        assert_eq!(indices.len(), n);
+        // All slots in 0..n, and all distinct — with k > n every stored
+        // vector appears exactly once, no duplicates or padding slots.
+        let mut seen = vec![false; n];
+        for &slot in indices {
+            assert!(
+                (0..n as i64).contains(&slot),
+                "qi={} returned out-of-range slot {}",
+                qi,
+                slot
+            );
+            assert!(
+                !std::mem::replace(&mut seen[slot as usize], true),
+                "qi={} returned duplicate slot {}",
+                qi,
+                slot
+            );
+        }
+        // Scores stay finite and sorted — no NEG_INFINITY heap padding
+        // leaks even though the heap was sized for k=10 candidates.
+        let scores = res.scores_for_query(qi);
+        assert!(
+            scores.iter().all(|s| s.is_finite()),
+            "qi={} non-finite score in {:?}",
+            qi,
+            scores
+        );
+        for w in scores.windows(2) {
+            assert!(w[0] >= w[1], "qi={} scores not sorted desc: {:?}", qi, scores);
         }
     }
 }
@@ -268,5 +343,115 @@ fn concurrent_search_matches_serial() {
     }
     for h in handles {
         h.join().expect("worker panicked");
+    }
+}
+
+#[test]
+fn wide_single_thread_batch_scores_every_query() {
+    // Regression for the thread-aware batch width (H124): single-threaded
+    // batch searches widen to a 10-query batch when that saves a pass over
+    // the code array, but only the permute-dot (4-bit vector-major) kernel
+    // carries 10 query lanes. On 2/3-bit vector-major indexes the batch
+    // lands in the 8-wide VNNI kernel instead, which scored lanes 0..8 and
+    // silently dropped queries 8 and 9 of every batch — they came back as
+    // NEG_INFINITY scores with id-0 padding. The width is now gated on the
+    // permute-dot kernel actually taking the batch.
+    //
+    // A 1-thread pool with nq ∈ {10, 50} makes 10 the pass-saving width
+    // (nq.div_ceil(10) < nq.div_ceil(8)); every query at every bit width
+    // must come back fully scored. The other batched tests all use nq <= 8
+    // and the ambient multi-thread pool, where the width is always 8 —
+    // which is exactly how this went unseen. Runs on every arch; the
+    // kernel it guards is x86 VBMI+VNNI.
+    let dim = 512;
+    let n = 500;
+    let k = 5;
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(1)
+        .build()
+        .unwrap();
+
+    for bits in [2usize, 3, 4] {
+        let data = gaussian_normalized(n, dim, 0x81AC_4E55 ^ bits as u64);
+        let mut idx = TurboQuantIndex::new(dim, bits).unwrap();
+        idx.add(&data);
+
+        for nq in [10usize, 50] {
+            let q = &data[..nq * dim];
+            let res = pool.install(|| idx.search(q, k));
+
+            for qi in 0..nq {
+                let ids = res.indices_for_query(qi);
+                let scores = res.scores_for_query(qi);
+                assert_eq!(
+                    ids.len(),
+                    k,
+                    "short result set: bits={bits} nq={nq} qi={qi}"
+                );
+                // A dropped query lane surfaces as NEG_INFINITY padding.
+                assert!(
+                    scores.iter().all(|s| s.is_finite()),
+                    "dropped query lane: bits={bits} nq={nq} qi={qi} scores={scores:?}"
+                );
+                // Queries are the stored vectors themselves; even at 2 bits
+                // the self-match sits comfortably inside the top 5 at
+                // dim=512 (the dedicated 2-bit test above holds it to the
+                // top 3).
+                assert!(
+                    ids.contains(&(qi as i64)),
+                    "self-match missing: bits={bits} nq={nq} qi={qi} top{k}={ids:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn multi_batch_accumulator_flush_at_high_dim() {
+    // #307(3): every other searching test tops out at dim=512, i.e.
+    // n_byte_groups = 256 = FLUSH_EVERY exactly, so `n_batches == 1` on
+    // every arch and the flush/accumulate-reset logic never runs a second
+    // time. dim 1024 and 2048 at 4-bit give 2 and 4 batches.
+    //
+    // This is also the test for the u16-overflow argument behind
+    // `max_lut = 127`: without a flush every 256 groups a 512-group scan
+    // accumulates up to 512*254 = 130048 into a u16 lane, which wraps and
+    // destroys the self-match below.
+    let bits = 4;
+    for &dim in &[1024usize, 2048] {
+        assert!(dim / 2 > 256, "dim={dim} must exceed one FLUSH_EVERY batch");
+        for &n in &[64usize, 100] {
+            let data = gaussian_normalized(n, dim, 0xF105_4000 ^ dim as u64 ^ n as u64);
+            let mut idx = TurboQuantIndex::new(dim, bits).unwrap();
+            idx.add(&data);
+
+            // nq=1 and nq=4 take different NEON/AVX2 kernels (single-query
+            // block-parallel vs 4-query fused), each with its own batch loop.
+            for &nq in &[1usize, 4, 8] {
+                let q = &data[..nq * dim];
+                let res = idx.search(q, 5);
+
+                for qi in 0..nq {
+                    assert_eq!(
+                        res.indices_for_query(qi)[0],
+                        qi as i64,
+                        "self-match failed across a batch flush: dim={dim} n={n} nq={nq} qi={qi}"
+                    );
+                    let scores = res.scores_for_query(qi);
+                    assert!(
+                        scores.iter().all(|s| s.is_finite()),
+                        "non-finite score: dim={dim} n={n} nq={nq} qi={qi} {scores:?}"
+                    );
+                    // A wrapped u16 accumulator produces a wildly off-scale
+                    // self-score; the true value sits near cosine 1.0.
+                    assert!(
+                        (scores[0] - 1.0).abs() < 0.25,
+                        "self-score {} off scale (wrap or missed flush?): \
+                         dim={dim} n={n} nq={nq} qi={qi}",
+                        scores[0]
+                    );
+                }
+            }
+        }
     }
 }
