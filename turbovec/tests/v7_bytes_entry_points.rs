@@ -1,8 +1,13 @@
-//! A v7 sync container handed to a byte/reader entry point must say so,
-//! not report "wrong magic" (#486). v7 is deliberately not supported
-//! there: it needs random access, and `to_bytes` only emits v6.
+//! The byte and path entry points must agree, whichever way an index
+//! travels.
+//!
+//! This file was written when v7 was refused here (#486) — the reasoning
+//! being that it needs random access and `to_bytes` only emitted v6.
+//! Both halves of that are gone: the v7 parser works from a slice, and
+//! every entry point now emits v7. What is left worth pinning is the
+//! parity itself.
 
-use turbovec::{IdMapIndex, TurboQuantIndex};
+use turbovec::TurboQuantIndex;
 
 const DIM: usize = 64;
 
@@ -22,46 +27,14 @@ fn dir(name: &str) -> std::path::PathBuf {
     p
 }
 
+
+
+/// A file loaded from a path and the same bytes loaded directly must
+/// produce the same index, and re-serializing either must reproduce the
+/// same image.
 #[test]
-fn a_synced_tv_file_rejected_by_from_bytes_names_the_reason() {
-    let d = dir("tv");
-    let path = d.join("i.tv");
-    let mut i = TurboQuantIndex::new(DIM, 4).unwrap();
-    i.add(&rows(64, 1));
-    i.sync(&path).unwrap();
-
-    // The same file opens fine by path.
-    assert_eq!(TurboQuantIndex::load(&path).unwrap().len(), 64);
-
-    let bytes = std::fs::read(&path).unwrap();
-    let err = TurboQuantIndex::from_bytes(&bytes).unwrap_err().to_string();
-    assert!(err.contains("v7 sync container"), "unhelpful: {err}");
-    assert!(err.contains("load("), "should point at load(path): {err}");
-    assert!(!err.contains("wrong magic"), "still the generic message: {err}");
-    let _ = std::fs::remove_dir_all(&d);
-}
-
-#[test]
-fn a_synced_tvim_file_rejected_by_from_bytes_names_the_reason() {
-    let d = dir("tvim");
-    let path = d.join("i.tvim");
-    let mut i = IdMapIndex::new(DIM, 4).unwrap();
-    i.add_with_ids(&rows(64, 2), &(0..64u64).collect::<Vec<_>>()).unwrap();
-    i.sync(&path).unwrap();
-    assert_eq!(IdMapIndex::load(&path).unwrap().len(), 64);
-
-    let bytes = std::fs::read(&path).unwrap();
-    let err = IdMapIndex::from_bytes(&bytes).unwrap_err().to_string();
-    assert!(err.contains("v7 sync container"), "unhelpful: {err}");
-    assert!(!err.contains("wrong magic"), "still the generic message: {err}");
-    let _ = std::fs::remove_dir_all(&d);
-}
-
-/// The parity that is actually promised — v6 output — still holds both
-/// ways, so the narrowed claim is not narrower than reality.
-#[test]
-fn v6_output_still_round_trips_through_both_entry_points() {
-    let d = dir("v6");
+fn path_and_byte_entry_points_agree_on_a_v7_image() {
+    let d = dir("parity");
     let path = d.join("i.tv");
     let mut i = TurboQuantIndex::new(DIM, 4).unwrap();
     i.add(&rows(64, 3));
@@ -73,5 +46,6 @@ fn v6_output_still_round_trips_through_both_entry_points() {
         .to_bytes();
     assert_eq!(by_path, by_bytes);
     assert_eq!(TurboQuantIndex::from_bytes(&i.to_bytes()).unwrap().to_bytes(), by_path);
+    assert_eq!(&by_path[..4], b"TV7\0", "every entry point emits v7");
     let _ = std::fs::remove_dir_all(&d);
 }

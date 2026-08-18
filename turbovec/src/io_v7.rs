@@ -87,7 +87,16 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 pub(crate) const V7_MAGIC: &[u8; 4] = b"TV7\0";
-pub(crate) const V7_VERSION: u8 = 1;
+/// v7 revision.
+///
+/// Bumped to 2 when snapshots gained [`UNCLAIMED_NONCE`]: revision 1
+/// gave the nonce field one meaning (this file's identity) and revision
+/// 2 gives zero a second (nobody is syncing to this file). A revision-1
+/// reader would bind a cursor to a zero-nonce snapshot and could then
+/// patch an unrelated snapshot that also reads zero — exactly the
+/// foreign-writer case the nonce exists to catch. The version byte is
+/// what stops it from trying.
+pub(crate) const V7_VERSION: u8 = 2;
 const BLOCK: usize = 32;
 
 /// A commit header carries at most this many pending redo ops (and at
@@ -409,6 +418,10 @@ impl Geo {
     fn hdr_at(&self, slot: usize) -> usize {
         self.sb_len() + slot * self.hdr_len()
     }
+    /// [`Self::hdr_at`] for the length probe on the load path.
+    fn hdr_at_for_len(&self, slot: usize) -> usize {
+        self.hdr_at(slot)
+    }
     /// Test-only view of a header slot's offset (the rot harness needs
     /// the newest header's byte range).
     #[cfg(test)]
@@ -430,6 +443,11 @@ impl Geo {
     }
     pub fn unit_at(&self, block: usize) -> usize {
         self.hdr_at(2) + block * self.unit_len()
+    }
+    /// Bytes one full image of `n_vectors` rows occupies: superblock,
+    /// both header slots at their fixed reserve, then whole blocks.
+    pub fn full_len(&self, n_vectors: usize) -> usize {
+        self.unit_at(n_vectors / BLOCK)
     }
 
 }
@@ -867,14 +885,13 @@ pub(crate) fn run_sync(path: &Path, plan: &SyncPlan) -> io::Result<SyncCursor> {
 /// fsync posture). Streamed unit by unit through a buffered writer, so
 /// peak extra memory is one write buffer plus one unit — never a second
 /// image of the index.
-pub(crate) fn write_full(
-    path: &Path,
-    src: &SyncSource<'_>,
-    calib_gen: u64,
-) -> io::Result<SyncCursor> {
+/// Stream one full v7 image into `w`: superblock, both header slots at
+/// their fixed reserve, then whole block units.
+///
+/// Shared by the file writer and by the in-memory form, so a `.tv` file
+/// and the bytes `to_bytes` hands back are the same image byte for byte.
+fn write_image<W: Write>(w: &mut W, src: &SyncSource<'_>, gen: u64, nonce: u64) -> io::Result<()> {
     let geo = src.geo();
-    let gen = 0u64;
-    let nonce = crate::io::file_nonce();
     let n_blocks = src.n_vectors / BLOCK;
     // Slot 0 carries generation 0 (no pending ops); slot 1 starts
     // invalid (zeroed, CRC cannot match).
@@ -885,21 +902,116 @@ pub(crate) fn write_full(
         &[],
         (&[], 0..0, delta_digest(gen, &[])),
     );
+    w.write_all(&superblock(src, nonce))?;
+    w.write_all(&h)?;
+    w.write_all(&vec![0u8; geo.hdr_len() - h.len()])?;
+    w.write_all(&vec![0u8; geo.hdr_len()])?;
+    for b in 0..n_blocks {
+        w.write_all(&unit_bytes(src, b))?;
+    }
+    Ok(())
+}
+
+/// The nonce of an **unclaimed** image: one no index is syncing to.
+///
+/// A nonce answers one question for `sync`: "is the file at this path
+/// still the one I last committed to, or did somebody replace it?"
+/// Generations cannot answer it — every full write starts at 0 — so a
+/// random value identifies the file's lineage.
+///
+/// That question only arises for a file some index is *syncing*. A
+/// snapshot — `write`, `write_to_writer`, `to_bytes` — is not a sync
+/// destination, so it is stamped `UNCLAIMED` and its bytes are a pure
+/// function of index state: two images of equal indexes are identical,
+/// and `to_bytes` matches the file `write` produces byte for byte.
+///
+/// `sync` claims a file by full-writing it with a random nonce, and
+/// [`load`] refuses to bind a cursor to an unclaimed file — so the first
+/// sync to a snapshot full-writes and claims it, exactly as it already
+/// does for any path it is not bound to. That keeps every foreign-writer
+/// check intact: no file that is being synced ever carries this value.
+pub(crate) const UNCLAIMED_NONCE: u64 = 0;
+
+/// One full v7 image as bytes — the same image [`write_full`] lands on
+/// disk, built in memory instead.
+/// Stream one unclaimed image into `w` — the snapshot form, for a sink
+/// the caller owns. Unit-by-unit, so a large index does not need a
+/// second copy of itself in memory just to reach a writer.
+pub(crate) fn stream_image<W: Write>(w: &mut W, src: &SyncSource<'_>) -> io::Result<()> {
+    write_image(w, src, 0, UNCLAIMED_NONCE)
+}
+
+pub(crate) fn image_bytes(src: &SyncSource<'_>) -> Vec<u8> {
+    let geo = src.geo();
+    let mut buf = Vec::with_capacity(geo.full_len(src.n_vectors));
+    write_image(&mut buf, src, 0, UNCLAIMED_NONCE).expect("writing to a Vec<u8> cannot fail");
+    buf
+}
+
+/// Bytes one full v7 image occupies, without building it.
+pub(crate) fn image_len(src: &SyncSource<'_>) -> usize {
+    src.geo().full_len(src.n_vectors)
+}
+
+/// The whole file for generation 0, staged through a temp and renamed:
+/// creation and compaction both go through this, and it is the fallback
+/// whenever an incremental plan is not the right shape. Claims the file
+/// with a fresh nonce — see [`UNCLAIMED_NONCE`] for what that means and
+/// for the snapshot form that does not.
+pub(crate) fn write_full(
+    path: &Path,
+    src: &SyncSource<'_>,
+    calib_gen: u64,
+) -> io::Result<SyncCursor> {
+    write_full_with_durability(path, src, calib_gen, crate::io::Durability::Durable)
+}
+
+/// [`write_full`] with the fsync made optional.
+///
+/// `Fast` keeps the temp-file + atomic-rename protocol — the destination
+/// can never hold a torn image and a previous file survives a crash —
+/// and skips only the fsync, so a power loss shortly after a completed
+/// write may lose the new file. Same trade `write_with_durability` has
+/// always offered.
+pub(crate) fn write_full_with_durability(
+    path: &Path,
+    src: &SyncSource<'_>,
+    calib_gen: u64,
+    durability: crate::io::Durability,
+) -> io::Result<SyncCursor> {
+    write_full_inner(path, src, calib_gen, durability, crate::io::file_nonce())
+}
+
+/// [`write_full_with_durability`] leaving the file unclaimed — the
+/// snapshot `write` produces, byte-identical to [`image_bytes`].
+pub(crate) fn write_snapshot(
+    path: &Path,
+    src: &SyncSource<'_>,
+    durability: crate::io::Durability,
+) -> io::Result<()> {
+    write_full_inner(path, src, 0, durability, UNCLAIMED_NONCE).map(|_| ())
+}
+
+fn write_full_inner(
+    path: &Path,
+    src: &SyncSource<'_>,
+    calib_gen: u64,
+    durability: crate::io::Durability,
+    nonce: u64,
+) -> io::Result<SyncCursor> {
+    let gen = 0u64;
 
     crate::io::sweep_stale_tmps(path);
     let (f, tmp) = crate::io::create_tmp(path)?;
     let result = (|| {
         let mut w = std::io::BufWriter::with_capacity(1 << 20, &f);
-        w.write_all(&superblock(src, nonce))?;
-        w.write_all(&h)?;
-        w.write_all(&vec![0u8; geo.hdr_len() - h.len()])?;
-        w.write_all(&vec![0u8; geo.hdr_len()])?;
-        for b in 0..n_blocks {
-            w.write_all(&unit_bytes(src, b))?;
-        }
+        write_image(&mut w, src, gen, nonce)?;
         w.flush()?;
         drop(w);
-        fsync_commit(&f)
+        match durability {
+            crate::io::Durability::Durable => fsync_commit(&f),
+            crate::io::Durability::Fast => Ok(()),
+        }
     })();
     let result = result.and_then(|()| {
         drop(f);
@@ -909,7 +1021,13 @@ pub(crate) fn write_full(
         let _ = std::fs::remove_file(&tmp);
         return Err(e);
     }
-    crate::io::sync_parent_dir_after_commit(path);
+    // Only when the caller asked for durability: the parent-dir fsync is
+    // part of what `Fast` exists to skip, and on a network or slow
+    // filesystem it is the expensive half. The v6 writer guarded it the
+    // same way.
+    if durability == crate::io::Durability::Durable {
+        crate::io::sync_parent_dir_after_commit(path);
+    }
     Ok(SyncCursor {
         gen,
         n_synced: src.n_vectors as u64,
@@ -1089,7 +1207,95 @@ fn parse_header_at(
 /// the crash protocol needs; detecting later external damage is out of
 /// scope, as it is for v6.
 pub(crate) fn load(path: &Path, expect_calib_gen: u64, expect_kind: u8) -> io::Result<V7Load> {
-    let mut raw = std::fs::read(path)?;
+    // Allocate for what the file DECLARES, capped by what it actually
+    // holds — never for its apparent length. An image's size is fixed by
+    // its geometry and row count, so a padded or sparse file is bytes
+    // nobody asked for, and reading it wholesale made memory track the
+    // file rather than the index. That is the v6 defect #487 fixed, and
+    // v7 inherited it when it became the only format. Trailing bytes are
+    // ignored, as they were before.
+    let f = File::open(path)?;
+    let on_disk = f.metadata()?.len();
+    let want = declared_len(&f).unwrap_or(on_disk).min(on_disk);
+    let mut raw = vec![
+        0u8;
+        usize::try_from(want).map_err(|_| io::Error::new(
+            io::ErrorKind::InvalidData,
+            "file too large for this platform"
+        ))?
+    ];
+    crate::io::read_exact_at(&f, &mut raw, 0)?;
+    load_image(raw, expect_calib_gen, expect_kind, &path.display().to_string())
+}
+
+/// Bytes a complete image of this file's geometry and row count occupies,
+/// read from the superblock and the two header slots.
+///
+/// `None` whenever the prefix is not self-consistent: the parser then
+/// sees the whole file and produces its own, better message rather than
+/// a truncation artefact of a guess made here.
+fn declared_len(f: &File) -> Option<u64> {
+    let mut sb = [0u8; 64];
+    crate::io::read_exact_at(f, &mut sb, 0).ok()?;
+    if &sb[0..4] != V7_MAGIC || sb[4] != V7_VERSION {
+        return None;
+    }
+    let bit_width = sb[5] as usize;
+    let kind = sb[6];
+    if !(2..=4).contains(&bit_width) || kind > 1 {
+        return None;
+    }
+    let dim = u32::from_le_bytes(sb[7..11].try_into().ok()?) as usize;
+    if dim != 0 && (!dim.is_multiple_of(8) || dim > crate::MAX_DIM) {
+        return None;
+    }
+    // `n_calib` sits after the codebook, whose length follows bit_width.
+    let n_levels = 1usize << bit_width;
+    let n_calib_at = 23 + (2 * n_levels - 1) * 4;
+    let mut n_calib_bytes = [0u8; 4];
+    crate::io::read_exact_at(f, &mut n_calib_bytes, n_calib_at as u64).ok()?;
+    let n_calib = u32::from_le_bytes(n_calib_bytes) as usize;
+    if n_calib != 0 && n_calib != dim {
+        return None;
+    }
+    let geo = Geo { kind, dim, bit_width, n_calib };
+
+    // The row count lives in a header slot (gen, then n). Take the larger
+    // of the two slots: whichever the loader ends up adopting, the image
+    // it needs is no bigger than this.
+    let mut n = 0u64;
+    for slot in 0..2 {
+        let mut buf = [0u8; 16];
+        if crate::io::read_exact_at(f, &mut buf, geo.hdr_at_for_len(slot) as u64).is_err() {
+            return None;
+        }
+        n = n.max(u64::from_le_bytes(buf[8..16].try_into().ok()?));
+    }
+    // Checked throughout: a tampered header can claim any n at all, and
+    // this probe must not overflow computing a size for it — the parser
+    // is what refuses an absurd count, with a message. Falling back to
+    // `None` here just means reading the file as-is and letting it.
+    let blocks = n / BLOCK as u64;
+    let units = (geo.unit_len() as u64).checked_mul(blocks)?;
+    (geo.unit_at(0) as u64).checked_add(units)
+}
+
+/// [`load`] over an image already in memory.
+///
+/// The path loader has always read the whole file up front and then
+/// indexed around inside that buffer — v7's two header slots and block
+/// units need random access to a *slice*, not to a seekable file. So a
+/// byte image loads by exactly the same code, which is what lets
+/// `from_bytes` accept v7.
+///
+/// `src` names the image in diagnostics (a path, or something like
+/// "the byte image" for `from_bytes`).
+pub(crate) fn load_image(
+    mut raw: Vec<u8>,
+    expect_calib_gen: u64,
+    expect_kind: u8,
+    src: &str,
+) -> io::Result<V7Load> {
     if raw.len() < 11 || &raw[..4] != V7_MAGIC {
         return Err(bad("not a v7 file"));
     }
@@ -1112,8 +1318,28 @@ pub(crate) fn load(path: &Path, expect_calib_gen: u64, expect_kind: u8) -> io::R
         }));
     }
     let dim = read_u32(&raw, 7)? as usize;
-    if dim == 0 || !dim.is_multiple_of(8) || dim > crate::MAX_DIM {
+    // dim 0 is the lazy sentinel: an index constructed without a
+    // dimension that has never seen an add or a calibrate, so no
+    // dimension is committed yet. It is only legal with no rows — the
+    // geometry of a row is undefined without a dim — and it reloads as
+    // the same lazy index. v6 carried the same sentinel; keeping it means
+    // saving a store before its first write still works.
+    if dim != 0 && (!dim.is_multiple_of(8) || dim > crate::MAX_DIM) {
         return Err(bad(format!("dim {dim} invalid")));
+    }
+    // Before anything driven by `dim` runs — the codebook solve below is
+    // O(dim) and was where an absurd declared dim turned a load into a
+    // hang. A complete image reserves MAX_OPS redo slots, each at least
+    // one row wide, so a file smaller than that cannot be one whatever
+    // else its header says. Cheap, and it does not depend on the size
+    // guard above being the only thing that noticed.
+    let min_header = MAX_OPS.saturating_mul(dim.saturating_mul(bit_width) / 8);
+    if raw.len() < min_header {
+        return Err(bad(format!(
+            "truncated file: a {dim}-dim {bit_width}-bit image reserves at least \
+             {min_header} bytes of header, but the file is {} bytes",
+            raw.len(),
+        )));
     }
     let nonce = read_u64_at(&raw, 11)?;
     let file_max_ops = read_u32(&raw, 19)? as usize;
@@ -1125,13 +1351,21 @@ pub(crate) fn load(path: &Path, expect_calib_gen: u64, expect_kind: u8) -> io::R
 
     // Codebook must match the canonical one, same as the v6 loader
     // (#320): a drifted codebook silently mis-scores.
-    let (canon_b, canon_c) = crate::codebook::codebook(bit_width, dim);
+    let n_levels = 1usize << bit_width;
     let mut off = 23;
-    for want in canon_b.iter().chain(canon_c.iter()) {
-        if read_f32(&raw, off)? != *want {
-            return Err(bad("embedded codebook drifted from the canonical one"));
+    if dim == 0 {
+        // The lazy sentinel embeds no codebook — one is solved per
+        // dimension, and this image has no dimension and no rows. Skip
+        // the bytes; there is nothing a drifted codebook could mis-score.
+        off += (2 * n_levels - 1) * 4;
+    } else {
+        let (canon_b, canon_c) = crate::codebook::codebook(bit_width, dim);
+        for want in canon_b.iter().chain(canon_c.iter()) {
+            if read_f32(&raw, off)? != *want {
+                return Err(bad("embedded codebook drifted from the canonical one"));
+            }
+            off += 4;
         }
-        off += 4;
     }
     let n_calib = read_u32(&raw, off)? as usize;
     off += 4;
@@ -1197,13 +1431,20 @@ pub(crate) fn load(path: &Path, expect_calib_gen: u64, expect_kind: u8) -> io::R
             "{}: the newest commit (generation {}) is incomplete — its sync did \
              not finish — so generation {} was loaded instead; changes made after \
              that commit are lost",
-            path.display(),
+            src,
             newest.expect("checked"),
             chosen.gen,
         ));
     }
     let gen = chosen.gen;
     let n_vectors = chosen.n;
+    // The lazy sentinel is only legal with no rows: without a committed
+    // dimension a row has no geometry.
+    if dim == 0 && n_vectors != 0 {
+        return Err(bad(format!(
+            "dim 0 with {n_vectors} rows: no dimension committed"
+        )));
+    }
 
     // --- gather the units, in place -----------------------------------
     // The read buffer becomes the cache: each block's codes roll
@@ -1397,7 +1638,17 @@ pub(crate) fn cursor_state(
     // 0 — so the superblock nonce is checked first: a different nonce
     // is a different file (another writer's, or another index type's),
     // whatever its generation says.
-    if u64::from_le_bytes(head[11..19].try_into().unwrap()) != cursor.nonce {
+    let file_nonce = u64::from_le_bytes(head[11..19].try_into().unwrap());
+    if file_nonce != cursor.nonce {
+        // An *unclaimed* file is not another writer's sync destination —
+        // nobody is syncing to it, by definition. It is a snapshot that
+        // `write` dropped over this path, including possibly one this
+        // very index wrote. Rebuilding is right there; erroring would
+        // leave a `sync -> write -> sync` sequence permanently stuck.
+        // A different *claimed* nonce is still foreign and still refused.
+        if file_nonce == UNCLAIMED_NONCE {
+            return Ok(CursorState::Replaced);
+        }
         return Ok(CursorState::Foreign);
     }
     // The nonce matched, so this is the file this cursor wrote and the
