@@ -162,26 +162,6 @@ fn make_sparse(path: &std::path::Path, len: u64) {
 
 const PADDED: u64 = 256 * 1024 * 1024;
 
-#[test]
-fn a_v6_index_padded_into_a_sparse_file_costs_its_content_not_its_length() {
-    let path = temp("v6padded");
-    let mut idx = TurboQuantIndex::new(DIM, 4).unwrap();
-    idx.add(&rows(64, 90));
-    idx.write(&path).unwrap();
-    let content = std::fs::metadata(&path).unwrap().len() as i64;
-    make_sparse(&path, PADDED);
-
-    let (loaded, peak) = peak_bytes(|| TurboQuantIndex::load(&path).unwrap());
-    assert_eq!(loaded.len(), 64, "the padded file must still load correctly");
-
-    // Unfixed: the tail is sized from the whole remainder and then copied
-    // again, so peak is ~2x the padding (8.2 GB for a 4 GiB file).
-    assert!(
-        peak < content * 64 + (1 << 20),
-        "load of a {PADDED}-byte sparse file with {content} bytes of content \
-         peaked at {peak} bytes"
-    );
-}
 
 #[test]
 fn a_foreign_file_is_rejected_without_reading_it() {
@@ -201,22 +181,6 @@ fn a_foreign_file_is_rejected_without_reading_it() {
     );
 }
 
-#[test]
-fn a_padded_id_map_file_costs_its_content_not_its_length() {
-    let path = temp("tvimpadded");
-    let mut idx = turbovec::IdMapIndex::new(DIM, 4).unwrap();
-    idx.add_with_ids(&rows(64, 91), &(0u64..64).collect::<Vec<_>>()).unwrap();
-    idx.write(&path).unwrap();
-    let content = std::fs::metadata(&path).unwrap().len() as i64;
-    make_sparse(&path, PADDED);
-
-    let (loaded, peak) = peak_bytes(|| turbovec::IdMapIndex::load(&path).unwrap());
-    assert_eq!(loaded.len(), 64, "the padded file must still load correctly");
-    assert!(
-        peak < content * 64 + (1 << 20),
-        "load of a padded .tvim with {content} bytes of content peaked at {peak} bytes"
-    );
-}
 
 /// #501: a small add onto a tight buffer must not transiently allocate a
 /// second full copy of the codes.
@@ -249,5 +213,34 @@ fn a_small_add_after_a_load_does_not_transiently_double_the_codes() {
         "a one-row add after a load peaked at {peak} bytes against a {file}-byte index"
     );
     assert_eq!(loaded.len(), 20_001);
+    std::fs::remove_dir_all(path.parent().unwrap()).ok();
+}
+
+/// #487 for v7: a padded or sparse file must cost its declared content,
+/// not its apparent length.
+///
+/// v6 carried this bound and v7 inherited the defect when it became the
+/// only format — `load` read the whole file before any structural check,
+/// so a 97 KB index padded to 256 MiB allocated 256 MiB. `write` always
+/// emits an exact-length file, so this only bites on files turbovec did
+/// not write; a sparse file makes a huge apparent length nearly free.
+#[test]
+fn a_padded_v7_file_costs_its_content_not_its_length() {
+    let path = temp("v7padded");
+    let mut idx = TurboQuantIndex::new(DIM, 4).unwrap();
+    idx.add(&rows(64, 92));
+    idx.write(&path).unwrap();
+    let content = std::fs::metadata(&path).unwrap().len() as i64;
+
+    let f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+    f.set_len(256 * 1024 * 1024).unwrap();
+    drop(f);
+
+    let (loaded, peak) = peak_bytes(|| TurboQuantIndex::load(&path).unwrap());
+    assert_eq!(loaded.len(), 64, "the padded file must still load");
+    assert!(
+        peak < content * 4 + (1 << 20),
+        "load of a 256 MiB sparse file holding {content} bytes peaked at {peak}"
+    );
     std::fs::remove_dir_all(path.parent().unwrap()).ok();
 }

@@ -392,9 +392,41 @@ fn a_file_swapped_underneath_a_bound_index_is_refused_then_recoverable() {
     assert_eq!(TurboQuantIndex::load(&path).unwrap().to_bytes(), adopted.to_bytes());
 }
 
-/// Alternating the two writers at one path: `write` lays down a v6 file
-/// where a sync container was, and `sync` must rebuild rather than
-/// treat the foreign bytes as a container to append into.
+
+/// An index rebuilt from its own serialized bytes is unbound, so its
+/// first sync must write a whole container rather than assume it owns
+/// whatever is at the path.
+#[test]
+fn an_index_restored_from_bytes_syncs_over_a_stranger_safely() {
+    let dir = temp_dir("frombytes");
+    let path = dir.join("index.tv");
+
+    let mut donor = TurboQuantIndex::new(DIM, 4).unwrap();
+    donor.calibrate(&rows(1024, 80)).unwrap();
+    donor.add(&rows(90, 81));
+    donor.sync(&path).unwrap();
+
+    let mut restored = TurboQuantIndex::from_bytes(&donor.to_bytes()).unwrap();
+    assert_eq!(restored.to_bytes(), donor.to_bytes());
+    restored.add(&rows(5, 82));
+    restored.sync(&path).expect("an unbound index must write the container whole");
+    assert_eq!(TurboQuantIndex::load(&path).unwrap().to_bytes(), restored.to_bytes());
+
+    // And it is bound afterwards: the next sync is incremental and still
+    // round-trips.
+    restored.swap_remove(2);
+    restored.add(&rows(40, 83));
+    restored.sync(&path).unwrap();
+    assert_eq!(TurboQuantIndex::load(&path).unwrap().to_bytes(), restored.to_bytes());
+}
+
+/// Alternating `sync` and `write` at one path, round after round.
+///
+/// Both now produce v7, so nothing "mixes formats" any more — but this
+/// is exactly the sequence the unclaimed-nonce rule exists for: `write`
+/// drops an unclaimed snapshot over a path this index is syncing, and
+/// the next `sync` must rebuild and re-claim rather than report a
+/// foreign writer. Ported rather than dropped for that reason.
 #[test]
 fn alternating_write_and_sync_at_one_path_never_mixes_the_formats() {
     let dir = temp_dir("alternate");
@@ -423,31 +455,4 @@ fn alternating_write_and_sync_at_one_path_never_mixes_the_formats() {
         idx.swap_remove(round as usize);
         idx.add(&rows(3, 70 + round));
     }
-}
-
-/// An index rebuilt from its own serialized bytes is unbound, so its
-/// first sync must write a whole container rather than assume it owns
-/// whatever is at the path.
-#[test]
-fn an_index_restored_from_bytes_syncs_over_a_stranger_safely() {
-    let dir = temp_dir("frombytes");
-    let path = dir.join("index.tv");
-
-    let mut donor = TurboQuantIndex::new(DIM, 4).unwrap();
-    donor.calibrate(&rows(1024, 80)).unwrap();
-    donor.add(&rows(90, 81));
-    donor.sync(&path).unwrap();
-
-    let mut restored = TurboQuantIndex::from_bytes(&donor.to_bytes()).unwrap();
-    assert_eq!(restored.to_bytes(), donor.to_bytes());
-    restored.add(&rows(5, 82));
-    restored.sync(&path).expect("an unbound index must write the container whole");
-    assert_eq!(TurboQuantIndex::load(&path).unwrap().to_bytes(), restored.to_bytes());
-
-    // And it is bound afterwards: the next sync is incremental and still
-    // round-trips.
-    restored.swap_remove(2);
-    restored.add(&rows(40, 83));
-    restored.sync(&path).unwrap();
-    assert_eq!(TurboQuantIndex::load(&path).unwrap().to_bytes(), restored.to_bytes());
 }
