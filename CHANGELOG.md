@@ -13,6 +13,34 @@ appears under each surface it touches.
 
 ### turbovec — Rust crate
 
+#### Added
+
+- **`turbovec::convert` converts an index file between every format
+  turbovec has written.** v5, v6 and v7 in any direction, for both `.tv`
+  and `.tvim`, so a file written by an older build can be brought forward
+  — or taken back, for a rollback or to reproduce a bug against an older
+  reader. `read` decodes any of them into a version-neutral `Image`,
+  `write` re-encodes it as any version, `convert_file` does both through
+  a temp file and an atomic rename, and `version_of` reports what a file
+  is without decoding it. `cargo run --example convert -- <in> <out> v6`
+  is the same thing from a shell.
+
+  This is the one place that still understands v5 and v6; everything else
+  reads and writes v7 only. Converting is a re-container, not a
+  re-quantize: the stored codes, scales, calibration and ids are carried
+  across untouched, so search results are identical whatever route a file
+  took. v7 output goes through the shipping writer, so a converted file
+  is byte-identical to one this build would have produced.
+
+  What does not survive going down a version is v7's incremental state —
+  the generation, the pending redo ops and the file's sync claim —
+  because v5 and v6 are flat snapshots with no commit history. The lazy
+  sentinel does survive: all three versions spell "no dimension
+  committed" as `dim == 0` with no rows, which is what the release
+  before v7 wrote for a store saved before its first add. Files older
+  than v5 remain undecodable and are named as such rather than guessed
+  at.
+
 #### Changed
 
 - **v7 is the only format turbovec reads or writes.** `write`,
